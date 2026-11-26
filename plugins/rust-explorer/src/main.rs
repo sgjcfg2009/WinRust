@@ -95,6 +95,7 @@ struct State { list: HWND, tab: HWND, edit: HWND, dir: PathBuf, rows: Vec<Row>, 
 thread_local! {
     static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, dir: PathBuf::new(), rows: vec![], thumbs: false, himl: 0, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 } });
     static UNDO: RefCell<Vec<UndoOp>> = const { RefCell::new(Vec::new()) };
+    static PENDING_PICK: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 static SORT_COL: AtomicUsize = AtomicUsize::new(0);
 static SORT_ASC: AtomicBool = AtomicBool::new(true);
@@ -780,13 +781,15 @@ unsafe fn more_menu(h: HWND) {
 fn start_target() -> (PathBuf, Option<String>) {
     let mut a = env::args().skip(1);
     let mut p = a.next().unwrap_or_default();
-    if p.to_lowercase().starts_with("/select,") || p.to_lowercase().starts_with("--select") {
-        p = p.get(8..).unwrap_or("").trim_start_matches(',').to_string();
+    let pl = p.to_lowercase();
+    let select_mode = pl.starts_with("/select,") || pl.starts_with("--select");
+    if select_mode {
+        p = p.get(8..).unwrap_or("").trim_start_matches(',').trim().to_string();
         if p.is_empty() { p = a.next().unwrap_or_default(); }
     }
-    let p = PathBuf::from(p.trim_matches('"'));
+    let p = PathBuf::from(p.trim().trim_matches('"'));
     if p.as_os_str().is_empty() { return (PathBuf::from(THIS_PC_KEY), None); }
-    match (p.is_file(), p.parent()) {
+    match (select_mode || p.is_file(), p.parent()) {
         (true, Some(d)) => (d.to_path_buf(), p.file_name().map(|n| n.to_string_lossy().into_owned())),
         _ => (p, None),
     }
@@ -795,11 +798,16 @@ fn start_target() -> (PathBuf, Option<String>) {
 fn shell_select(h: isize, p: PathBuf) {
     let h = h as HWND;
     let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return };
-    if !cur_dir().as_os_str().eq_ignore_ascii_case(dir.as_os_str()) { load(h, dir.to_path_buf()); }
-    select_row(&name.to_string_lossy());
+    let name_s = name.to_string_lossy().into_owned();
+    let has_row = ST.with_borrow(|st| st.rows.iter().any(|r| r.name.eq_ignore_ascii_case(&name_s)));
+    if !cur_dir().as_os_str().eq_ignore_ascii_case(dir.as_os_str()) || !has_row {
+        load(h, dir.to_path_buf());
+    }
+    select_row(&name_s);
     unsafe {
         if IsIconic(h) != 0 { ShowWindow(h, SW_RESTORE); }
         SetForegroundWindow(h);
+        SetFocus(ST.with_borrow(|st| st.list));
     }
 }
 
@@ -813,6 +821,7 @@ fn select_row(name: &str) {
         it.state = LVIS_SELECTED | LVIS_FOCUSED;
         put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
         put(list, LVM_ENSUREVISIBLE, i, 0);
+        SetFocus(list);
     }
 }
 
@@ -934,6 +943,7 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
 static WATCH_WAKE: AtomicUsize = AtomicUsize::new(0);
 static WATCH_DIR: std::sync::Mutex<PathBuf> = std::sync::Mutex::new(PathBuf::new());
 static WATCH_INIT: std::sync::Once = std::sync::Once::new();
+static WATCH_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn watch_set(h: HWND, dir: &Path) {
     use windows_sys::Win32::{
@@ -984,8 +994,15 @@ fn watch_set(h: HWND, dir: &Path) {
                 loop {
                     let r = WaitForMultipleObjects(2, handles.as_ptr(), 0, u32::MAX);
                     if r == 1 {
-                        std::thread::sleep(std::time::Duration::from_millis(80));
-                        PostMessageW(hw as HWND, WM_APP, 0, 0);
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                        while WaitForSingleObject(ch, 0) == 0 {
+                            if FindNextChangeNotification(ch) == 0 {
+                                break;
+                            }
+                        }
+                        if !WATCH_PENDING.swap(true, Relaxed) {
+                            PostMessageW(hw as HWND, WM_APP, 0, 0);
+                        }
                         if FindNextChangeNotification(ch) == 0 {
                             break;
                         }
@@ -1004,7 +1021,18 @@ fn watch_set(h: HWND, dir: &Path) {
 }
 
 fn load(h: HWND, dir: PathBuf) {
+    WATCH_PENDING.store(false, Relaxed);
     let Some(rows) = rows_of(&dir) else { return };
+    let same_dir = !desk() && cur_dir() == dir;
+    if same_dir {
+        let unchanged = ST.with_borrow(|st| {
+            st.rows.len() == rows.len()
+                && st.rows.iter().zip(&rows).all(|(a, b)| a.name == b.name && a.dir == b.dir && a.size == b.size && a.time == b.time && a.hdr == b.hdr)
+        });
+        if unchanged {
+            return;
+        }
+    }
     if !desk() { unsafe { SetWindowTextW(h, w(&dir.to_string_lossy()).as_ptr()) }; }
     let (list, tab, edit, active, n) = ST.with_borrow_mut(|st| {
         if let Some(t) = st.tabs.get_mut(st.active) { *t = dir.clone(); }
@@ -1018,7 +1046,9 @@ fn load(h: HWND, dir: PathBuf) {
     tab_text(tab, active, &label(&dir), false);
     ui::nav_dirty();
     reset_thumbs();
-    put(list, LVM_DELETEALLITEMS, 0, 0);
+    if !same_dir {
+        put(list, LVM_DELETEALLITEMS, 0, 0);
+    }
     if !desk() {
         ui::reset_pc();
         unsafe {
@@ -1036,7 +1066,8 @@ fn load(h: HWND, dir: PathBuf) {
     } else if dir == Path::new(THIS_PC_KEY) {
         put(list, LVM_SETITEMCOUNT, 0, 0);
     } else {
-        put(list, LVM_SETITEMCOUNT, n, 0);
+        put(list, LVM_SETITEMCOUNT, n, if same_dir { 0x0002 } else { 0 });
+        unsafe { ui::fit_columns(list) };
     }
     sync_cut_visuals();
     watch_set(h, &dir);
@@ -1083,6 +1114,7 @@ fn search(h: HWND, q: &str) {
     reset_thumbs();
     put(list, LVM_DELETEALLITEMS, 0, 0);
     put(list, LVM_SETITEMCOUNT, n, 0);
+    unsafe { ui::fit_columns(list) };
 }
 
 fn flip_layout(q: &str) -> String {
@@ -2210,10 +2242,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     put(list, LVM_SETICONSPACING, 0, ((THUMB as isize + 34) << 16) | (THUMB as isize + 24));
                     let _ = TX.set(sh::start_thumbs(h as isize));
                     ST.with_borrow_mut(|st| st.himl = himl as isize);
-                    col(list, 0, "Name", ui::sc(360), false);
-                    col(list, 1, "Date modified", ui::sc(160), false);
-                    col(list, 2, "Type", ui::sc(140), false);
-                    col(list, 3, "Size", ui::sc(96), true);
+                    col(list, 0, "Name", ui::sc(10), false);
+                    col(list, 1, "Date modified", ui::sc(10), false);
+                    col(list, 2, "Type", ui::sc(10), false);
+                    col(list, 3, "Size", ui::sc(10), true);
                     ui::style_list(list);
                 }
                 ST.with_borrow_mut(|st| { st.list = list; st.tab = tab; st.edit = edit; st.tabs = vec![PathBuf::new()]; });
@@ -2223,7 +2255,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
     if desk() { let _ = sh::register_drop(h as _, h as isize); }
                 let (start, pick) = if desk() { (sh::desktop_dirs().into_iter().next().unwrap_or_default(), None) } else { start_target() };
                 load(h, start);
-                if let Some(name) = pick { select_row(&name); }
+                if let Some(name) = pick {
+                    select_row(&name);
+                    PENDING_PICK.set(Some(name));
+                }
     if desk() {
                     use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos};
                     let mut dirs: Vec<PathBuf> = [&FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents, &FOLDERID_Pictures, &FOLDERID_Music, &FOLDERID_Videos].iter().filter_map(|id| sh::known_dir(id)).collect();
@@ -2285,6 +2320,11 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     desk::size_workerw(cw, ch);
                 } else {
                     ui::layout_children(cw, ch);
+                    if ch > 0 {
+                        if let Some(name) = PENDING_PICK.take() {
+                            select_row(&name);
+                        }
+                    }
                     InvalidateRect(h, ptr::null(), 0);
                 }
                 0
@@ -2541,7 +2581,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_SETFOCUS => { SetFocus(ST.with_borrow(|st| st.list)); 0 }
-            WM_APP => { reload_select_new(h); 0 }
+            WM_APP => { WATCH_PENDING.store(false, Relaxed); reload_select_new(h); 0 }
             shellwin::WM_SHELL_SELECT => { shell_select(h as isize, *Box::from_raw(lp as *mut PathBuf)); 0 }
             WM_JOB => {
                 let err = *Box::from_raw(wp as *mut Option<String>);
@@ -2662,9 +2702,10 @@ fn main() {
             let d = CreateWindowExW(WS_EX_TOOLWINDOW, pm.as_ptr(), w("rs-desktop").as_ptr(), WS_POPUP, vx, vy, vw, vh, 0 as _, 0 as _, inst, ptr::null());
             SetWindowPos(d, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         } else {
-            let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-            let dw = ui::sc(1000).min((sw * 88 / 100).max(600));
-            let dh = ui::sc(660).min((sh * 85 / 100).max(420));
+            let wa = winrust_common::ui::work_area();
+            let (sw, sh) = ((wa.right - wa.left).max(600), (wa.bottom - wa.top).max(420));
+            let dw = (sw * 76 / 100).clamp(600, ui::sc(1120).min(sw));
+            let dh = (sh * 78 / 100).clamp(420, ui::sc(740).min(sh));
             let win = CreateWindowExW(0, cls.as_ptr(), ptr::null(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, dw, dh, 0 as _, 0 as _, inst, ptr::null());
             match saved_place() {
                 Some((max, r)) => {
@@ -2675,6 +2716,9 @@ fn main() {
                     SetWindowPlacement(win, &wp);
                 }
                 None => { ShowWindow(win, SW_SHOWNORMAL); }
+            }
+            if let Some(name) = PENDING_PICK.take() {
+                select_row(&name);
             }
         }
         let mut msg = std::mem::zeroed();

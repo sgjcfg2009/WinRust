@@ -440,8 +440,28 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
 pub unsafe fn fit_columns(list: HWND) {
     let mut cr: RECT = std::mem::zeroed();
     GetClientRect(list, &mut cr);
-    let rest: i32 = (1..4).map(|k| SendMessageW(list, LVM_GETCOLUMNWIDTH, k, 0) as i32).sum();
-    SendMessageW(list, LVM_SETCOLUMNWIDTH, 0, (cr.right - rest - sc(4)).max(sc(180)) as isize);
+    let w = (cr.right - sc(4)).max(0);
+    if w <= 0 { return; }
+    let (c1, c2, c3) = if w >= sc(560) {
+        let c1 = (w * 20 / 100).clamp(sc(120), sc(170));
+        let c2 = (w * 17 / 100).clamp(sc(100), sc(150));
+        let c3 = (w * 12 / 100).clamp(sc(72), sc(105));
+        (c1, c2, c3)
+    } else {
+        (w * 22 / 100, w * 18 / 100, w * 14 / 100)
+    };
+    let c0 = (w - c1 - c2 - c3).max(sc(80).min(w));
+    let sum = c0 + c1 + c2 + c3;
+    let c0 = if sum > w { (c0 - (sum - w)).max(0) } else { c0 };
+    SendMessageW(list, WM_SETREDRAW, 0, 0);
+    SendMessageW(list, LVM_SETCOLUMNWIDTH, 0, c0 as isize);
+    SendMessageW(list, LVM_SETCOLUMNWIDTH, 1, c1 as isize);
+    SendMessageW(list, LVM_SETCOLUMNWIDTH, 2, c2 as isize);
+    SendMessageW(list, LVM_SETCOLUMNWIDTH, 3, c3 as isize);
+    if ST.with(|c| c.try_borrow().is_ok_and(|s| !s.thumbs)) {
+        ShowScrollBar(list, 0, 0);
+    }
+    SendMessageW(list, WM_SETREDRAW, 1, 0);
 }
 
 unsafe fn redraw_row(list: HWND, i: isize) {
@@ -756,6 +776,10 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
         redraw_row(h, ROWHOT.replace(-1));
     } else if m == WM_SETFOCUS || m == WM_KILLFOCUS {
         InvalidateRect(h, ptr::null(), 0);
+    } else if m == WM_SIZE && !crate::desk() {
+        let r = DefSubclassProc(h, m, wp, lp);
+        fit_columns(h);
+        return r;
     }
     if m == WM_NOTIFY {
         let nm = &*(lp as *const NMCUSTOMDRAW);

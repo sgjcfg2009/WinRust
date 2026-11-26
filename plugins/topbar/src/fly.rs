@@ -1791,9 +1791,8 @@ unsafe fn paint(hw: HWND, k: Kind) {
             } else {
                 g(Act::Mute, qr(14, y + 2, 48, y + 38), pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6));
             }
-            SelectObject(dc, f_glyph);
-            let vol_off = muted || vol <= 0;
-            text(dc, if vol_off { icons::VOLUME_MUTE } else { icons::VOLUME_HIGH }, qr(14, y, 48, y + 40), if muted { BAD } else { pal().text }, DT_CENTER);
+            let mrc = qr(14, y, 48, y + 40);
+            volume_glyph(dc, (mrc.left + mrc.right) / 2, (mrc.top + mrc.bottom) / 2, qsc(16), vol, muted, if muted { BAD } else { pal().text });
             track(dc, rs.iter().find(|(_, a)| *a == Act::VolSlide).unwrap().0, if muted || vol < 0 { 0.0 } else { vol as f32 / 100.0 }, ulw);
             let out_rc = rs.iter().find(|(_, a)| *a == Act::AudioOut).unwrap().0;
             if ulw {

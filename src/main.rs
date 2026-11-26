@@ -157,20 +157,21 @@ static MSG: Mutex<(String, bool)> = Mutex::new((String::new(), true));
 thread_local! { static SETTINGS: Cell<Option<usize>> = const { Cell::new(None) }; }
 thread_local! { static HOVER: Cell<Option<usize>> = const { Cell::new(None) }; }
 
-fn elevate_self(args: &[String]) -> bool {
-    if winrust_common::proc::elevated() || env::var_os("WINRUST_ELEVATE_TRIED").is_some() {
+fn elevate_self(args: &[String], tried: bool) -> bool {
+    if winrust_common::proc::elevated() || tried {
         return false;
     }
-    unsafe { env::set_var("WINRUST_ELEVATE_TRIED", "1") };
     let Ok(exe) = env::current_exe() else { return false };
-    let params = args.iter().map(|a| {
+    let mut all = vec!["--elevate-tried".to_string()];
+    all.extend(args.iter().cloned());
+    let params = all.iter().map(|a| {
         if a.contains(' ') || a.contains('\t') || a.contains('"') {
             format!("\"{}\"", a.replace('"', "\\\""))
         } else {
             a.clone()
         }
     }).collect::<Vec<_>>().join(" ");
-    let params_w = (!params.is_empty()).then(|| wide(&params));
+    let params_w = wide(&params);
     let dir_w = exe.parent().map(|p| wide(&p.to_string_lossy()));
     #[link(name = "ole32")]
     unsafe extern "system" {
@@ -182,7 +183,7 @@ fn elevate_self(args: &[String]) -> bool {
             null_mut(),
             wide("runas").as_ptr(),
             wide(&exe.to_string_lossy()).as_ptr(),
-            params_w.as_ref().map_or(null(), |w| w.as_ptr()),
+            params_w.as_ptr(),
             dir_w.as_ref().map_or(null(), |w| w.as_ptr()),
             SW_SHOWNORMAL,
         ) as isize
@@ -192,8 +193,10 @@ fn elevate_self(args: &[String]) -> bool {
 
 fn main() {
     winrust_common::install_panic_hook("installer");
-    let args: Vec<String> = env::args().skip(1).collect();
-    if elevate_self(&args) {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let tried = raw_args.iter().any(|a| a == "--elevate-tried");
+    let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--elevate-tried").collect();
+    if elevate_self(&args, tried) {
         return;
     }
     if winrust_common::proc::elevated() {

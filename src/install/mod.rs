@@ -64,14 +64,35 @@ pub(crate) fn put(src: &Path, dst: &Path) -> Result<(), String> {
 
 pub(crate) fn write_payload(name: &str, dst: &Path) -> Result<(), String> {
     if let Some(dir) = dst.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if fs::create_dir_all(dir).is_err() {
+            grant_admin_full(dir);
+            fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
     }
-    if let Some(src) = disk_payload().map(|p| p.join(name)).filter(|p| p.is_file()) {
-        log(&format!("{name}: from {}", src.display()));
-        return put(&src, dst);
-    }
+    let disk_src = disk_payload().map(|p| p.join(name)).filter(|p| p.is_file());
     let bytes = PAYLOAD.iter().find(|(m, _)| *m == name).ok_or_else(|| format!("{name} is missing from the build"))?.1;
-    retry_io(dst, || fs::write(dst, bytes))
+    let write_once = || -> Result<(), String> {
+        if let Some(ref src) = disk_src {
+            log(&format!("{name}: from {}", src.display()));
+            put(src, dst)
+        } else {
+            retry_io(dst, || fs::write(dst, bytes))
+        }
+    };
+    if write_once().is_ok() {
+        return Ok(());
+    }
+    clear_readonly(dst);
+    grant_admin_full(dst);
+    if let Some(dir) = dst.parent() {
+        grant_admin_full(dir);
+    }
+    let _ = unlock_file_holders(dst);
+    if write_once().is_ok() {
+        return Ok(());
+    }
+    let _ = move_aside_for_reboot(dst);
+    write_once()
 }
 
 pub(crate) fn kill_procs(names: &[&str]) {
@@ -272,7 +293,10 @@ fn unlock_file_holders(path: &Path) -> Vec<String> {
 }
 
 fn grant_admin_full(path: &Path) {
-    let _ = run("icacls.exe", &[&path.to_string_lossy(), "/grant", "*S-1-5-32-544:F", "/Q"]);
+    let p = path.to_string_lossy();
+    let _ = run("takeown.exe", &["/F", &p, "/A"]);
+    let _ = run("icacls.exe", &[&p, "/remove:d", "*S-1-5-32-544", "/Q"]);
+    let _ = run("icacls.exe", &[&p, "/grant", "*S-1-5-32-544:F", "/Q"]);
 }
 
 fn move_aside_for_reboot(path: &Path) -> Result<(), String> {
@@ -308,12 +332,22 @@ fn move_aside_for_reboot(path: &Path) -> Result<(), String> {
         }
     }
     grant_admin_full(path);
+    if let Some(parent) = path.parent() {
+        grant_admin_full(parent);
+    }
     clear_readonly(path);
     if fs::remove_file(path).is_ok() {
         return Ok(());
     }
     if move_file_win32(path, &staged).is_ok() {
         let _ = delete_on_reboot(&staged);
+        return Ok(());
+    }
+    if move_file_win32(path, &local_stale).is_ok() {
+        let _ = delete_on_reboot(&local_stale);
+        return Ok(());
+    }
+    if delete_on_reboot(path) {
         return Ok(());
     }
     let code = e2.err().or(e1.err()).unwrap_or(0);

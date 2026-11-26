@@ -14,7 +14,14 @@ pub(crate) fn rx_dir() -> PathBuf {
 pub(crate) const RX_STATE: &str = r"HKLM\SOFTWARE\plugin-launcher\rust-explorer";
 pub(crate) const WINLOGON_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon";
 pub(crate) const RX_SWITCH: &str = r"HKCU\Software\rs-shell";
-pub(crate) const RX_FOLDERS: [&str; 3] = [r"HKCU\Software\Classes\Directory\shell\open", r"HKCU\Software\Classes\Folder\shell\open", r"HKCU\Software\Classes\Drive\shell\open"];
+pub(crate) const RX_FOLDERS: [&str; 6] = [
+    r"HKCU\Software\Classes\Directory\shell\open",
+    r"HKCU\Software\Classes\Directory\shell\explore",
+    r"HKCU\Software\Classes\Folder\shell\open",
+    r"HKCU\Software\Classes\Folder\shell\explore",
+    r"HKCU\Software\Classes\Drive\shell\open",
+    r"HKCU\Software\Classes\Drive\shell\explore",
+];
 
 const RX_SVCS: [(&str, u32); 5] = [("PcaSvc", 4), ("InventorySvc", 4), ("lfsvc", 4), ("cbdhsvc", 4), ("DoSvc", 3)];
 const SPLIT_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control";

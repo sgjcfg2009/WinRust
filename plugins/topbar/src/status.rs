@@ -315,9 +315,11 @@ pub(crate) unsafe fn volume_glyph(dc: HDC, cx: i32, cy: i32, s: i32, vol: i32, m
             GdipDrawLine(g, p, mx - d, fy - d, mx + d, fy + d);
             GdipDrawLine(g, p, mx + d, fy - d, mx - d, fy + d);
         } else {
+            let off = mix(pal().dim, pal().bg, 0.45);
             let waves = if vol <= 0 { 0 } else if vol < 34 { 1 } else if vol < 67 { 2 } else { 3 };
-            for i in 0..waves {
+            for i in 0..3 {
                 let r = (2.6 + 2.1 * i as f32) * u;
+                windows_sys::Win32::Graphics::GdiPlus::GdipSetPenColor(p, argb(if i < waves { c } else { off }));
                 GdipDrawArc(g, p, x2 - r * 0.35, fy - r, 2.0 * r, 2.0 * r, -48.0, 96.0);
             }
         }

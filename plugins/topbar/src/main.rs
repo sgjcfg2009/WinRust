@@ -1411,10 +1411,12 @@ fn layout(w: i32) -> Layout {
     let small = small_bar();
     let gap = sc(if small { 2 } else { 4 });
     let clock = (w - sc(if small { 84 } else { 94 }), w - sc(if small { 6 } else { 8 }));
-    let bat_w = if BAT.get().0 >= 0 { if small { 24 } else { 28 } } else { 0 };
-    let sys_w = if small { 52 + bat_w } else { 60 + bat_w };
-    let sys = (clock.0 - sc(2) - sc(sys_w), clock.0 - sc(2));
-    let apps = (sys.0 - sc(if small { 20 } else { 24 }) * tray_count() as i32, sys.0);
+    let bat_w = if BAT.get().0 >= 0 { if small { 28 } else { 32 } } else { 0 };
+    let sys_w = if small { 56 + bat_w } else { 64 + bat_w };
+    let sys = (clock.0 - sc(4) - sc(sys_w), clock.0 - sc(4));
+    let tray_step = sc(if small { 20 } else { 24 });
+    let apps_r = sys.0 - sc(4);
+    let apps = (apps_r - tray_step * tray_count() as i32, apps_r);
     let margin = (w - apps.0) + sc(8);
     let n = BTNS.with_borrow(|b| b.len()) as i32;
     let bw = (((w - 2 * margin + gap) / n.max(1)) - gap).clamp(sc(16), sc(40 + [-10, 0, 8][i18n::style::bar_size() as usize % 3]));
@@ -1442,16 +1444,19 @@ unsafe fn hit(hwnd: HWND, x: i32, y: i32) -> i32 {
     if x >= l.sys.0 {
         let d = x - l.sys.0;
         let small = small_bar();
-        return if d < sc(if small { 26 } else { 30 }) {
+        return if d < sc(if small { 28 } else { 32 }) {
             WIFI_I
-        } else if d < sc(if small { 52 } else { 60 }) {
+        } else if d < sc(if small { 56 } else { 64 }) {
             VOL_I
         } else {
             BAT_I
         };
     }
-    if x >= l.apps.0 {
+    if x >= l.apps.0 && x < l.apps.1 {
         return TAPP + (x - l.apps.0) / sc(if small_bar() { 20 } else { 24 });
+    }
+    if x >= l.apps.1 {
+        return NONE;
     }
     let n = BTNS.with_borrow(|b| b.len()) as i32;
     let d = x - l.x0;
@@ -2555,16 +2560,17 @@ unsafe fn paint(hwnd: HWND) {
     let grp = RECT { left: l.sys.0, top, right: l.sys.1, bottom: bot };
     let sys_hot = matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick);
     glow(dc, sys_hot, grp, pal().hover, rr(8));
-    let mut x = grp.left + sc(6);
+    let mut x = grp.left + sc(if small { 7 } else { 8 });
     net_icon(dc, x + sc(if small { 9 } else { 10 }), mid, sc(if small { 16 } else { 18 }), f_glyph);
-    x += sc(if small { 22 } else { 25 });
+    x += sc(if small { 25 } else { 28 });
     let (vol, muted) = VOL.get();
     let vw = sc(if small { 20 } else { 24 });
     volume_glyph(dc, x + vw / 2, mid, sc(if small { 16 } else { 18 }), vol, muted, if muted { BAD } else { pal().text });
-    x += sc(if small { 22 } else { 26 });
+    x += sc(if small { 26 } else { 30 });
     let (pct, ac) = BAT.get();
     if pct >= 0 {
-        let (bw, bh, by) = (sc(if small { 18 } else { 20 }), sc(if small { 9 } else { 10 }), mid - sc(5));
+        let (bw, bh) = (sc(if small { 18 } else { 20 }), sc(if small { 10 } else { 11 }));
+        let by = mid - bh / 2;
         draw_battery(dc, x, by, bw, bh, pct, ac, if sys_hot { pal().hover } else { pal().bg }, 1);
     }
 
@@ -3252,9 +3258,9 @@ unsafe fn tip_cx(l: &Layout, h: i32) -> i32 {
         GEAR => if vert() { sc(GEAR_X.0 + GEAR_X.1 / 2) } else { sc(120) },
         CLOCK => (l.clock.0 + l.clock.1) / 2,
         SHOWDESK => l.clock.1 + sc(3),
-        WIFI_I => l.sys.0 + sc(16),
-        VOL_I => l.sys.0 + sc(38),
-        BAT_I => l.sys.0 + sc(90),
+        WIFI_I => l.sys.0 + sc(18),
+        VOL_I => l.sys.0 + sc(46),
+        BAT_I => l.sys.0 + sc(76),
         t if (TAPP..TAPP + 100).contains(&t) => l.apps.0 + (t - TAPP) * sc(24) + sc(12),
         i => slot_x(l, i) + l.bw / 2,
     }

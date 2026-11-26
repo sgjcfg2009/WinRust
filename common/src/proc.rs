@@ -120,21 +120,25 @@ pub fn cmdline(pid: u32) -> Option<String> {
 }
 
 pub fn enable_debug_privilege() {
-    const SE_DEBUG: [u16; 17] = [
-        b'S' as u16, b'e' as u16, b'D' as u16, b'e' as u16, b'b' as u16, b'u' as u16,
-        b'g' as u16, b'P' as u16, b'r' as u16, b'i' as u16, b'v' as u16, b'i' as u16,
-        b'l' as u16, b'e' as u16, b'g' as u16, b'e' as u16, 0,
+    const PRIVS: [&str; 4] = [
+        "SeDebugPrivilege",
+        "SeTakeOwnershipPrivilege",
+        "SeBackupPrivilege",
+        "SeRestorePrivilege",
     ];
     unsafe {
         let mut tok = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut tok) == 0 || tok.is_null() {
             return;
         }
-        let mut tp: TOKEN_PRIVILEGES = std::mem::zeroed();
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        if LookupPrivilegeValueW(null(), SE_DEBUG.as_ptr(), &mut tp.Privileges[0].Luid) != 0 {
-            AdjustTokenPrivileges(tok, 0, &tp, 0, null_mut(), null_mut());
+        for name in PRIVS {
+            let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            let mut tp: TOKEN_PRIVILEGES = std::mem::zeroed();
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if LookupPrivilegeValueW(null(), w.as_ptr(), &mut tp.Privileges[0].Luid) != 0 {
+                AdjustTokenPrivileges(tok, 0, &tp, 0, null_mut(), null_mut());
+            }
         }
         CloseHandle(tok);
     }
@@ -245,16 +249,22 @@ pub fn kill_shell_explorers() {
 
 pub fn elevated() -> bool {
     use windows_sys::Win32::{
-        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenIntegrityLevel},
+        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenElevationType, TokenIntegrityLevel},
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn IsUserAnAdmin() -> i32;
+    }
     let (mut t, mut e, mut n) = (null_mut(), TOKEN_ELEVATION { TokenIsElevated: 0 }, 0u32);
     unsafe {
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut t) == 0 || t.is_null() {
-            return false;
+            return IsUserAnAdmin() != 0;
         }
         let ok = GetTokenInformation(t, TokenElevation, &mut e as *mut _ as _, size_of::<TOKEN_ELEVATION>() as u32, &mut n);
-        if ok == 0 || e.TokenIsElevated == 0 {
+        let (mut et, mut etn) = (0u32, 0u32);
+        let default_admin = GetTokenInformation(t, TokenElevationType, &mut et as *mut _ as _, 4, &mut etn) != 0 && et == 1 && IsUserAnAdmin() != 0;
+        if (ok == 0 || e.TokenIsElevated == 0) && !default_admin {
             CloseHandle(t);
             return false;
         }

@@ -137,7 +137,7 @@ fn item_path(pidl: *const ITEMIDLIST, dir: &str) -> Option<PathBuf> {
             p
         })
     };
-    joined.filter(|p| p.parent().is_some_and(|d| d.as_os_str().eq_ignore_ascii_case(dir))).or_else(|| name(pidl))
+    joined.filter(|p| p.parent().is_some_and(|d| d.as_os_str().eq_ignore_ascii_case(Path::new(dir).as_os_str()))).or_else(|| name(pidl))
 }
 
 impl IWebBrowser_Impl for Browser_Impl {
