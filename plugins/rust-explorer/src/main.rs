@@ -263,7 +263,8 @@ fn paste(h: HWND, dir: &PathBuf) {
     if zipx::split_zip(dir).is_some() { return; }
     let Some((paths, cut)) = sh::clip_get() else { return };
     let fast = jobs::can_fast_copy(&paths, dir) && !(cut && paths.iter().all(|p| jobs::same_volume(p, dir))) && jobs::writable(dir);
-    if fast && !jobs::busy() {
+    let sync = !(fast && !jobs::busy());
+    if !sync {
         jobs::copy(h as isize, paths, dir.clone(), cut);
     } else {
         let _ = sh::fileop(h, if cut { sh::Op::Move } else { sh::Op::Copy }, &paths, dir);
@@ -271,6 +272,9 @@ fn paste(h: HWND, dir: &PathBuf) {
     if cut {
         sh::clip_clear();
         sync_cut_visuals();
+    }
+    if sync {
+        reload_select_new(h);
     }
 }
 
@@ -672,7 +676,7 @@ unsafe fn bg_menu(h: HWND) {
         0x7009 => { SORT_COL.store(1, Relaxed); SORT_ASC.store(true, Relaxed); if desk() { let _ = fs::remove_file(desk::pos_file()); } }
         0x7012 => { SORT_COL.store(2, Relaxed); SORT_ASC.store(true, Relaxed); if desk() { let _ = fs::remove_file(desk::pos_file()); } }
         0x700A => {}
-        0x700B => paste(h, &dir),
+        0x700B => { paste(h, &dir); return; }
         0x700C => created = new_entry(&dir, "New folder", true),
         0x700D => created = new_entry(&dir, "New Text Document.txt", false),
         0x7013 => {
@@ -1111,6 +1115,57 @@ fn reset_thumbs() {
     GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let himl = ST.with_borrow(|st| st.himl);
     unsafe { ImageList_Remove(himl as _, -1) };
+}
+
+fn reload_select_new(h: HWND) {
+    let (old, prev_sel) = ST.with_borrow(|st| {
+        let old: std::collections::HashSet<String> = st.rows.iter()
+            .filter(|r| !r.hdr)
+            .map(|r| r.name.to_lowercase())
+            .collect();
+        let mut prev_sel = std::collections::HashSet::new();
+        if !st.list.is_null() {
+            let mut idx = put(st.list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
+            while idx >= 0 {
+                if let Some(r) = st.rows.get(idx as usize).filter(|r| !r.hdr) {
+                    prev_sel.insert(r.name.to_lowercase());
+                }
+                idx = put(st.list, LVM_GETNEXTITEM, idx as usize, LVNI_SELECTED as isize);
+            }
+        }
+        (old, prev_sel)
+    });
+    reload(h);
+    let (list, picks, keep) = ST.with_borrow(|st| {
+        let picks: Vec<usize> = st.rows.iter().enumerate()
+            .filter(|(_, r)| !r.hdr && !old.contains(&r.name.to_lowercase()))
+            .map(|(i, _)| i)
+            .collect();
+        let keep: Vec<usize> = if picks.is_empty() && !prev_sel.is_empty() {
+            st.rows.iter().enumerate()
+                .filter(|(_, r)| !r.hdr && prev_sel.contains(&r.name.to_lowercase()))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (st.list, picks, keep)
+    });
+    let target = if !picks.is_empty() { &picks } else { &keep };
+    if !target.is_empty() && !list.is_null() {
+        unsafe {
+            let mut it: LVITEMW = std::mem::zeroed();
+            it.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+            put(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize);
+            it.state = LVIS_SELECTED | LVIS_FOCUSED;
+            for &i in target {
+                put(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+            }
+            if !picks.is_empty() {
+                put(list, LVM_ENSUREVISIBLE, picks[0], 0);
+            }
+        }
+    }
 }
 
 fn reload(h: HWND) { load(h, cur_dir()); }
@@ -2253,7 +2308,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         let (list, dir, paths) = selected();
                         match wp {
                             10 | 11 if !paths.is_empty() => match real_paths(&paths) { Ok(p) => { if sh::clip_set(h, &p, wp == 10 && !in_zip()).is_ok() { sync_cut_visuals(); } } Err(e) => warn(h, &e) },
-                            12 => { paste(h, &dir); reload(h); }
+                            12 => paste(h, &dir),
                             13 if !in_zip() => {
                                 let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
                                 if i >= 0 { SetFocus(list); put(list, LVM_EDITLABELW, i as usize, 0); }
@@ -2417,7 +2472,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 put(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize);
                                 return 0;
                             }
-                            0x56 if ctrl => paste(h, &dir),
+                            0x56 if ctrl => { paste(h, &dir); return 0; }
                             0x5A if ctrl => {
                                 if let Some(op) = UNDO.with_borrow_mut(|u| u.pop()) {
                                     match op {
@@ -2486,12 +2541,12 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_SETFOCUS => { SetFocus(ST.with_borrow(|st| st.list)); 0 }
-            WM_APP => { reload(h); 0 }
+            WM_APP => { reload_select_new(h); 0 }
             shellwin::WM_SHELL_SELECT => { shell_select(h as isize, *Box::from_raw(lp as *mut PathBuf)); 0 }
             WM_JOB => {
                 let err = *Box::from_raw(wp as *mut Option<String>);
                 RemovePropW(h, w("WinRustProgress").as_ptr());
-                reload(h);
+                reload_select_new(h);
                 ui::status_dirty(h);
                 if let Some(e) = err { MessageBoxW(h, w(&e).as_ptr(), w("WinRust Explorer").as_ptr(), MB_ICONWARNING); }
                 0

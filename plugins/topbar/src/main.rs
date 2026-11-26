@@ -877,7 +877,12 @@ unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> i32 {
     DwmGetWindowAttribute(h, 14, &mut cloaked as *mut _ as *mut _, 4);
     let mut cls = [0u16; 32];
     let n = GetClassNameW(h, cls.as_mut_ptr(), 32).max(0) as usize;
-    let ours = eq_ascii(&cls[..n], "topbar");
+    let ours = eq_ascii(&cls[..n], "topbar")
+        || eq_ascii(&cls[..n], "topbar_fly")
+        || eq_ascii(&cls[..n], "Progman")
+        || eq_ascii(&cls[..n], "WorkerW")
+        || eq_ascii(&cls[..n], "Shell_TrayWnd")
+        || eq_ascii(&cls[..n], "Shell_SecondaryTrayWnd");
     if IsWindowVisible(h) != 0 && GetWindow(h, GW_OWNER).is_null() && cloaked == 0 && !ours && GetWindowTextLengthW(h) > 0 && (ex & WS_EX_TOOLWINDOW == 0 || ex & WS_EX_APPWINDOW != 0) {
         (*(lp as *mut Vec<HWND>)).push(h);
     }
@@ -2589,11 +2594,122 @@ unsafe fn keys(vks: &[u16]) {
         let mut i: INPUT = zeroed();
         i.r#type = INPUT_KEYBOARD;
         i.Anonymous.ki.wVk = vk;
-        i.Anonymous.ki.dwFlags = if up { KEYEVENTF_KEYUP } else { 0 };
+        let ext = if matches!(vk, 0x25..=0x28 | 0x2C | 0x5B | 0x5C) { 0x0001 } else { 0 };
+        i.Anonymous.ki.dwFlags = ext | if up { KEYEVENTF_KEYUP } else { 0 };
         SendInput(1, &i, size_of::<INPUT>() as i32);
     };
     vks.iter().for_each(|&v| send(v, false));
     vks.iter().rev().for_each(|&v| send(v, true));
+}
+
+thread_local! {
+    static VDESKS: std::cell::RefCell<(usize, Vec<Vec<HWND>>)> = std::cell::RefCell::new((0, vec![vec![]]));
+}
+
+pub(crate) fn vdesk_info() -> (usize, usize) {
+    VDESKS.with(|v| {
+        let d = v.borrow();
+        (d.0 + 1, d.1.len())
+    })
+}
+
+unsafe fn vdesk_switch(desks: &mut Vec<Vec<HWND>>, cur: &mut usize, next: usize) {
+    if *cur == next || next >= desks.len() {
+        return;
+    }
+    let mut vis: Vec<HWND> = Vec::new();
+    EnumWindows(Some(collect), &mut vis as *mut Vec<HWND> as LPARAM);
+    let mut hidden = Vec::new();
+    for w in vis {
+        if IsWindow(w) != 0 {
+            ShowWindow(w, SW_HIDE);
+            if IsWindowVisible(w) == 0 {
+                hidden.push(w);
+            }
+        }
+    }
+    desks[*cur] = hidden;
+    *cur = next;
+    let mut fg: HWND = null_mut();
+    for w in desks[*cur].drain(..) {
+        if IsWindow(w) != 0 {
+            ShowWindow(w, 8);
+            if fg.is_null() && IsIconic(w) == 0 {
+                fg = w;
+            }
+        }
+    }
+    if !fg.is_null() {
+        force_fg(fg);
+    }
+}
+
+pub(crate) unsafe fn vdesk_action(act: u8) {
+    if EXPLORER_UP.load(Relaxed) {
+        match act {
+            0 => keys(&[VK_CONTROL, VK_LWIN, VK_LEFT]),
+            1 => keys(&[VK_CONTROL, VK_LWIN, b'D' as u16]),
+            2 => keys(&[VK_CONTROL, VK_LWIN, VK_RIGHT]),
+            _ => keys(&[VK_CONTROL, VK_LWIN, VK_F4]),
+        }
+        return;
+    }
+    VDESKS.with(|v| {
+        let mut d = v.borrow_mut();
+        let d = &mut *d;
+        let (cur, desks) = (&mut d.0, &mut d.1);
+        match act {
+            0 if desks.len() > 1 => {
+                let next = (*cur + desks.len() - 1) % desks.len();
+                vdesk_switch(desks, cur, next);
+            }
+            1 => {
+                let next = desks.len();
+                desks.push(Vec::new());
+                vdesk_switch(desks, cur, next);
+            }
+            2 if desks.len() > 1 => {
+                let next = (*cur + 1) % desks.len();
+                vdesk_switch(desks, cur, next);
+            }
+            3 if desks.len() > 1 => {
+                let old = *cur;
+                desks.remove(old);
+                *cur = old.saturating_sub(1);
+                let mut fg: HWND = null_mut();
+                for w in desks[*cur].drain(..) {
+                    if IsWindow(w) != 0 {
+                        ShowWindow(w, 8);
+                        if fg.is_null() && IsIconic(w) == 0 {
+                            fg = w;
+                        }
+                    }
+                }
+                if !fg.is_null() {
+                    force_fg(fg);
+                }
+            }
+            _ => {}
+        }
+    });
+    refresh_windows();
+    let bar = BAR.load(Relaxed) as HWND;
+    if !bar.is_null() {
+        InvalidateRect(bar, null(), 0);
+    }
+}
+
+unsafe fn vdesk_restore_all() {
+    VDESKS.with(|v| {
+        let mut d = v.borrow_mut();
+        for list in &mut d.1 {
+            for w in list.drain(..) {
+                ShowWindow(w, 8);
+            }
+        }
+        d.0 = 0;
+        d.1.truncate(1);
+    });
 }
 
 unsafe fn close_window(w: HWND) {
@@ -2978,7 +3094,7 @@ unsafe fn start_menu() {
             "!run" => run_box(),
             "!taskmgr" => open_taskmgr(),
             "!desktop" => winrust_common::desktop::toggle(),
-            "!taskview" => keys(&[VK_LWIN, VK_TAB]),
+            "!taskview" => if EXPLORER_UP.load(Relaxed) { keys(&[VK_LWIN, VK_TAB]); } else { fly::toggle(fly::Kind::Desktops); },
             "!lock" => quiet(Command::new("rundll32.exe").args(["user32.dll,LockWorkStation"])),
             "!sleep" => fly::sleep_now(),
             "!restart" => quiet(Command::new("shutdown").args(["/r", "/t", "0"])),
@@ -3221,7 +3337,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         ALT_TAB => alt_tab(wp == 1),
         WIN_NUM => win_num(wp),
         WIN_X => start_menu(),
-        WIN_TAB => fly::toggle(fly::Kind::Desktops),
+        WIN_TAB => if wp == 0 { fly::toggle(fly::Kind::Desktops); } else { vdesk_action((wp - 1) as u8); },
         NEXT_LANG => next_lang(hwnd, wp == 1),
         ALT_UP if wp == 2 => alt_close(),
         ALT_UP => alt_done(wp == 1),
@@ -3318,6 +3434,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DISPLAYCHANGE => place(hwnd),
         WM_DESTROY => {
+            vdesk_restore_all();
             let mut ab: APPBARDATA = zeroed();
             ab.cbSize = size_of::<APPBARDATA>() as u32;
             ab.hWnd = hwnd;

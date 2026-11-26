@@ -1330,12 +1330,7 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
         }
         Act::Desk(i) => {
             close();
-            match i {
-                0 => keys(&[VK_CONTROL, VK_LWIN, VK_LEFT]),
-                1 => keys(&[VK_CONTROL, VK_LWIN, b'D' as u16]),
-                2 => keys(&[VK_CONTROL, VK_LWIN, VK_RIGHT]),
-                _ => keys(&[VK_CONTROL, VK_LWIN, VK_F4]),
-            }
+            vdesk_action(i);
         }
     }
 }
@@ -2111,8 +2106,10 @@ unsafe fn paint(hw: HWND, k: Kind) {
         }
         Kind::Desktops => {
             let card = i18n::style::card();
+            let (cur, total) = vdesk_info();
+            let title = if total > 1 { format!("Desktop {cur} / {total}") } else { "Desktops".into() };
             SelectObject(dc, f_txt);
-            text(dc, "Desktops", r(16, 12, w - 16, 34), pal().text, DT_LEFT);
+            text(dc, &title, r(16, 12, w - 16, 34), pal().text, DT_LEFT);
             SelectObject(dc, f_small);
             text(dc, "Win+Tab", r(16, 14, w - 16, 34), pal().dim, DT_RIGHT);
             let btns = [

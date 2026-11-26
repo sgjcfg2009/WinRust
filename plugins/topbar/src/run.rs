@@ -54,8 +54,22 @@ pub(crate) unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LR
         if k.flags & LLKHF_INJECTED == 0 {
             let held = |vk: u16| GetAsyncKeyState(vk as i32) < 0;
             let vk = k.vkCode;
-            if matches!(vk, 0x2C | 0x53 | 0x31..=0x39 | 0x20 | 0x52 | 0x09 | 0x58) {
+            if matches!(vk, 0x2C | 0x53 | 0x31..=0x39 | 0x20 | 0x52 | 0x09 | 0x58 | 0x25 | 0x27 | 0x44 | 0x73) {
                 let win = held(VK_LWIN) || held(VK_RWIN);
+                if !exp_up && win && held(VK_CONTROL) && !held(VK_MENU) && !held(VK_SHIFT) && matches!(vk as u16, 0x25 | 0x27 | 0x44 | 0x73) {
+                    if down {
+                        WIN_ALONE.store(false, Relaxed);
+                        keys(&[0xE8]);
+                        let act = match vk as u16 {
+                            0x25 => 1,
+                            0x44 => 2,
+                            0x27 => 3,
+                            _ => 4,
+                        };
+                        PostMessageW(bar, WIN_TAB, act, 0);
+                    }
+                    return 1;
+                }
                 let snip_key = !exp_up && vk == VK_SNAPSHOT as u32;
                 let win_shift_s = vk == b'S' as u32 && down && win && held(VK_SHIFT);
                 if snip_key || win_shift_s {
