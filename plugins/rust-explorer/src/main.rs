@@ -2193,6 +2193,144 @@ unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
     }
 }
 
+const WM_SHUTDOWN_DLG: u32 = WM_APP + 20;
+static SHUTDOWN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+const SHUTDOWN_OPTS: [(&str, &str); 5] = [
+    ("Shut down", "Closes all apps and turns off the PC."),
+    ("Restart", "Closes all apps, turns off the PC, and then turns it on again."),
+    ("Sleep", "The PC stays on but uses low power. Apps stay open so when the PC wakes up, you're back to where you left off."),
+    ("Sign out", "Closes all apps and signs you out."),
+    ("Switch user", "Switches users without closing apps."),
+];
+
+fn run_power_action(idx: usize) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    const NO_WIN: u32 = 0x0800_0000;
+    match idx {
+        0 => { let _ = std::process::Command::new("shutdown").args(["/s", "/t", "0"]).creation_flags(NO_WIN).spawn(); }
+        1 => { let _ = std::process::Command::new("shutdown").args(["/r", "/t", "0"]).creation_flags(NO_WIN).spawn(); }
+        2 => unsafe {
+            let lib = LoadLibraryW(w("powrprof.dll").as_ptr());
+            if !lib.is_null() {
+                if let Some(f) = GetProcAddress(lib, b"SetSuspendState\0".as_ptr()) {
+                    let susp: unsafe extern "system" fn(u8, u8, u8) -> u8 = std::mem::transmute(f);
+                    susp(0, 0, 0);
+                }
+                FreeLibrary(lib);
+            }
+        },
+        3 => unsafe {
+            #[link(name = "user32")]
+            unsafe extern "system" {
+                fn ExitWindowsEx(flags: u32, reason: u32) -> i32;
+            }
+            ExitWindowsEx(0, 0);
+        },
+        4 => unsafe {
+            let lib = LoadLibraryW(w("wtsapi32.dll").as_ptr());
+            if !lib.is_null() {
+                if let Some(f) = GetProcAddress(lib, b"WTSDisconnectSession\0".as_ptr()) {
+                    let disc: unsafe extern "system" fn(isize, u32, i32) -> i32 = std::mem::transmute(f);
+                    disc(0, u32::MAX, 0);
+                }
+                FreeLibrary(lib);
+            }
+        },
+        _ => {}
+    }
+}
+
+unsafe extern "system" fn shutdown_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    use windows_sys::Win32::Graphics::Gdi::{SetBkMode, SetTextColor, TRANSPARENT};
+    const CBS_DROPDOWNLIST: u32 = 0x0003;
+    const CB_ADDSTRING: u32 = 0x0143;
+    const CB_GETCURSEL: u32 = 0x0147;
+    const CB_SETCURSEL: u32 = 0x014E;
+    const CBN_SELCHANGE: u16 = 1;
+    unsafe {
+        match m {
+            WM_CREATE => {
+                ui::dark_title(h);
+                let inst = GetModuleHandleW(ptr::null());
+                let pad = ui::sc(22);
+                let cw = ui::sc(420) - pad * 2;
+                let title = CreateWindowExW(0, w("STATIC").as_ptr(), w("Windows 11").as_ptr(), WS_CHILD | WS_VISIBLE, pad, ui::sc(16), cw, ui::sc(30), h, 100 as _, inst, ptr::null());
+                put(title, WM_SETFONT, ui::font(22, 600, ui::ui_face()) as usize, 1);
+                let ask = CreateWindowExW(0, w("STATIC").as_ptr(), w("What do you want the computer to do?").as_ptr(), WS_CHILD | WS_VISIBLE, pad, ui::sc(54), cw, ui::sc(20), h, 103 as _, inst, ptr::null());
+                put(ask, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
+                let cb = CreateWindowExW(0, w("COMBOBOX").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, pad, ui::sc(80), cw, ui::sc(200), h, 101 as _, inst, ptr::null());
+                put(cb, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
+                for (name, _) in SHUTDOWN_OPTS {
+                    put(cb, CB_ADDSTRING, 0, w(name).as_ptr() as isize);
+                }
+                put(cb, CB_SETCURSEL, 0, 0);
+                let desc = CreateWindowExW(0, w("STATIC").as_ptr(), w(SHUTDOWN_OPTS[0].1).as_ptr(), WS_CHILD | WS_VISIBLE, pad, ui::sc(114), cw, ui::sc(34), h, 102 as _, inst, ptr::null());
+                put(desc, WM_SETFONT, ui::font(12, 400, ui::ui_face()) as usize, 1);
+                let bw = ui::sc(88);
+                let bh = ui::sc(28);
+                let by = ui::sc(162);
+                let ok = CreateWindowExW(0, w("BUTTON").as_ptr(), w("OK").as_ptr(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32, pad + cw - bw * 2 - ui::sc(10), by, bw, bh, h, 1 as _, inst, ptr::null());
+                let cancel = CreateWindowExW(0, w("BUTTON").as_ptr(), w("Cancel").as_ptr(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, pad + cw - bw, by, bw, bh, h, 2 as _, inst, ptr::null());
+                put(ok, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
+                put(cancel, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
+                SetFocus(cb);
+                0
+            }
+            WM_CTLCOLORSTATIC => {
+                SetTextColor(wp as _, ui::pal().text);
+                SetBkMode(wp as _, TRANSPARENT as i32);
+                GetStockObject(5) as isize
+            }
+            WM_COMMAND => {
+                let id = (wp & 0xFFFF) as u16;
+                let code = ((wp >> 16) & 0xFFFF) as u16;
+                if id == 101 && code == CBN_SELCHANGE {
+                    let idx = SendDlgItemMessageW(h, 101, CB_GETCURSEL, 0, 0) as usize;
+                    if let Some((_, desc)) = SHUTDOWN_OPTS.get(idx) {
+                        SetDlgItemTextW(h, 102, w(desc).as_ptr());
+                    }
+                } else if id == 1 {
+                    let idx = SendDlgItemMessageW(h, 101, CB_GETCURSEL, 0, 0) as usize;
+                    DestroyWindow(h);
+                    run_power_action(idx);
+                } else if id == 2 {
+                    DestroyWindow(h);
+                }
+                0
+            }
+            WM_CLOSE => { DestroyWindow(h); 0 }
+            WM_DESTROY => { SHUTDOWN_HWND.store(0, Relaxed); 0 }
+            _ => DefWindowProcW(h, m, wp, lp),
+        }
+    }
+}
+
+fn show_shutdown_dialog(_h: HWND) {
+    let cur = SHUTDOWN_HWND.load(Relaxed) as HWND;
+    if !cur.is_null() && unsafe { IsWindow(cur) != 0 } {
+        unsafe { SetForegroundWindow(cur); }
+        return;
+    }
+    unsafe {
+        let inst = GetModuleHandleW(ptr::null());
+        let cls = w("RxShutdownDlg");
+        let bg = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(ui::pal().bg);
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(shutdown_proc), hInstance: inst, lpszClassName: cls.as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), hbrBackground: bg, ..std::mem::zeroed() });
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let mut r = RECT { left: 0, top: 0, right: ui::sc(420), bottom: ui::sc(206) };
+        AdjustWindowRectEx(&mut r, style, 0, WS_EX_TOPMOST | WS_EX_DLGMODALFRAME);
+        let (ww, wh) = (r.right - r.left, r.bottom - r.top);
+        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        let dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, cls.as_ptr(), w("Shut Down Windows").as_ptr(), style | WS_VISIBLE, (sw - ww) / 2, (sh - wh) / 2, ww, wh, 0 as _, 0 as _, inst, ptr::null());
+        if !dlg.is_null() {
+            SHUTDOWN_HWND.store(dlg as isize, Relaxed);
+            SetForegroundWindow(dlg);
+        }
+    }
+}
+
 unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if m == winrust_common::style::msg() {
@@ -2647,6 +2785,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             }
             desk::SPAWN_WORKERW if desk() => { desk::spawn_workerw(h); 0 }
             WM_TIMER if desk() && wp == 7 => { desk::check_live(ST.with_borrow(|st| st.list)); 0 }
+            WM_CLOSE if desk() => { PostMessageW(h, WM_SHUTDOWN_DLG, 0, 0); 0 }
+            WM_SHUTDOWN_DLG if desk() => { show_shutdown_dialog(h); 0 }
             WM_DESTROY => { if !desk() { save_place(h); } shellwin::revoke(); PostQuitMessage(0); 0 }
             _ => DefWindowProcW(h, m, wp, lp),
         }
@@ -2662,6 +2802,7 @@ fn namespace_target() -> Option<String> {
 }
 
 fn main() {
+    winrust_common::install_panic_hook("rust-explorer");
     if let Some(t) = namespace_target() {
         if env::var_os("RX_NS_HOP").is_none() {
             let addr = if t.starts_with("::") { format!("shell:{t}") } else { t };
@@ -2757,6 +2898,15 @@ fn main() {
             if msg.message == WM_SYSKEYDOWN && !desk() {
                 let act = match msg.wParam { 0x25 => 1, 0x27 => 2, 0x0D => 3, 0x26 => 4, _ => 0 };
                 if act != 0 { PostMessageW(GetAncestor(msg.hwnd, GA_ROOT), WM_NAV, act, 0); continue; }
+            }
+            if msg.message == WM_SYSKEYDOWN && msg.wParam == 0x73 && desk() && GetKeyState(0x12) < 0 {
+                let root = FindWindowW(w("Progman").as_ptr(), w("rs-desktop").as_ptr());
+                if !root.is_null() { PostMessageW(root, WM_SHUTDOWN_DLG, 0, 0); }
+                continue;
+            }
+            let sdlg = SHUTDOWN_HWND.load(Relaxed) as HWND;
+            if !sdlg.is_null() && IsDialogMessageW(sdlg, &msg) != 0 {
+                continue;
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);

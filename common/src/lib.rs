@@ -26,16 +26,15 @@ pub fn utf8_console() {
 
 static LOG_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+pub fn log_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("WinRust")
+}
+
 pub fn log_file() -> PathBuf {
-    LOG_FILE
-        .get_or_init(|| {
-            let base = std::env::var_os("LOCALAPPDATA")
-                .or_else(|| std::env::var_os("ProgramData"))
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-            base.join("WinRust").join("winrust.log")
-        })
-        .clone()
+    LOG_FILE.get_or_init(|| log_dir().join("winrust.log")).clone()
 }
 
 pub(crate) fn with_wide<T>(s: &str, f: impl FnOnce(*const u16) -> T) -> T {
@@ -55,6 +54,13 @@ pub(crate) fn with_wide<T>(s: &str, f: impl FnOnce(*const u16) -> T) -> T {
 
 pub fn log(component: &str, msg: &str) {
     use std::io::Write;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLocalTime(lp: *mut [u16; 8]);
+    }
+    let mut st = [0u16; 8];
+    unsafe { GetLocalTime(&mut st) };
+    let ts = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", st[0], st[1], st[3], st[4], st[5], st[6]);
     let p = log_file();
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -62,9 +68,16 @@ pub fn log(component: &str, msg: &str) {
     if std::fs::metadata(&p).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
         let _ = std::fs::rename(&p, p.with_extension("log.old"));
     }
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-        let _ = writeln!(f, "[{t}] [{component}] {msg}");
+    let open = |path: &PathBuf| std::fs::OpenOptions::new().create(true).append(true).open(path);
+    let file = open(&p).or_else(|_| {
+        let fb = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("WinRust").join("winrust.log");
+        if let Some(dir) = fb.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        open(&fb)
+    });
+    if let Ok(mut f) = file {
+        let _ = writeln!(f, "[{ts}] [{component}] {msg}");
     }
 }
 

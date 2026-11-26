@@ -26,8 +26,18 @@ pub(crate) static WARN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub(crate) fn soft(what: &str, r: Result<(), String>) {
     if let Err(e) = r {
+        log(&format!("WARN {what}: {e}"));
         WARN.lock().unwrap().push(format!("{what}: {e}"));
     }
+}
+
+fn ensure_shared_log_dir() {
+    let dir = winrust_common::log_dir();
+    let _ = fs::create_dir_all(&dir);
+    let _ = Command::new("icacls.exe")
+        .args([&dir.to_string_lossy().into_owned(), "/grant", "*S-1-5-32-545:(OI)(CI)M", "/Q"])
+        .creation_flags(0x0800_0000)
+        .output();
 }
 
 pub(crate) fn program_data() -> PathBuf {
@@ -120,6 +130,23 @@ pub(crate) fn stop_and_delete_rs_search_tasks() {
     }
 }
 
+fn set_matching_tasks(needles: &[&str], enable: bool) {
+    if let Ok(csv) = out("schtasks", &["/query", "/fo", "csv", "/nh"]) {
+        for line in csv.lines() {
+            let Some(name) = line.trim().strip_prefix('"').and_then(|s| s.split('"').next()) else { continue };
+            let low = name.to_ascii_lowercase();
+            if needles.iter().any(|n| low.contains(n)) {
+                if enable {
+                    let _ = run("schtasks", &["/change", "/tn", name, "/enable"]);
+                } else {
+                    let _ = run("schtasks", &["/end", "/tn", name]);
+                    let _ = run("schtasks", &["/change", "/tn", name, "/disable"]);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn override_windhawk() {
     let has_svc = i18n::reg::exists(r"HKLM\SYSTEM\CurrentControlSet\Services\Windhawk", None);
     let has_reg = i18n::reg::exists(r"HKLM\SOFTWARE\Windhawk", None);
@@ -144,15 +171,7 @@ pub(crate) fn override_windhawk() {
         let _ = run("sc.exe", &["config", "Windhawk", "start=", "disabled"]);
     }
     kill_procs(&["windhawk.exe", "windhawk-tray.exe"]);
-    if let Ok(csv) = out("schtasks", &["/query", "/fo", "csv", "/nh"]) {
-        for line in csv.lines() {
-            let Some(name) = line.trim().strip_prefix('"').and_then(|s| s.split('"').next()) else { continue };
-            if name.to_ascii_lowercase().contains("windhawk") {
-                let _ = run("schtasks", &["/end", "/tn", name]);
-                let _ = run("schtasks", &["/change", "/tn", name, "/disable"]);
-            }
-        }
-    }
+    set_matching_tasks(&["windhawk"], false);
     let _ = run("reg", &["delete", RUN_KEY, "/v", "Windhawk", "/f"]);
     let _ = run("reg", &["delete", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "/v", "Windhawk", "/f"]);
     for mods_key in [
@@ -170,6 +189,46 @@ pub(crate) fn override_windhawk() {
         }
     }
     log("windhawk: stopped and disabled conflicting taskbar hooks");
+}
+
+const SAB_KEY: &str = r"HKCU\Software\StartIsBack";
+const SAB_STATE: &str = r"HKCU\Software\WinRust\StartAllBack";
+
+pub(crate) fn override_startallback() {
+    let has_reg = i18n::reg::exists(SAB_KEY, None)
+        || i18n::reg::exists(r"HKLM\SOFTWARE\StartIsBack", None);
+    let has_proc = !winrust_common::proc::pids("StartAllBackCfg.exe").is_empty();
+    if !has_reg && !has_proc {
+        return;
+    }
+    if reg_dword(SAB_STATE, "DisabledByWinRust").is_none() && reg_dword(SAB_KEY, "Disabled") != Some(1) {
+        let prev = reg_dword(SAB_KEY, "Disabled").map_or(u32::MAX, |v| v);
+        let _ = run("reg", &["add", SAB_STATE, "/v", "DisabledByWinRust", "/t", "REG_DWORD", "/d", &prev.to_string(), "/f"]);
+    }
+    kill_procs(&["StartAllBackCfg.exe"]);
+    let _ = run("reg", &["add", SAB_KEY, "/v", "Disabled", "/t", "REG_DWORD", "/d", "1", "/f"]);
+    set_matching_tasks(&["startallback", "startisback"], false);
+    log("startallback: disabled conflicting taskbar hooks");
+}
+
+pub(crate) fn restore_startallback() {
+    let prev = match reg_dword(SAB_STATE, "DisabledByWinRust") {
+        Some(v) => v,
+        None if reg_dword(SAB_KEY, "Disabled") == Some(1) => u32::MAX,
+        None => return,
+    };
+    if prev == u32::MAX {
+        let _ = run("reg", &["delete", SAB_KEY, "/v", "Disabled", "/f"]);
+    } else {
+        let _ = run("reg", &["add", SAB_KEY, "/v", "Disabled", "/t", "REG_DWORD", "/d", &prev.to_string(), "/f"]);
+    }
+    let _ = run("reg", &["delete", SAB_STATE, "/f"]);
+    set_matching_tasks(&["startallback", "startisback"], true);
+    if !winrust_common::proc::shell_explorers().is_empty() {
+        winrust_common::proc::kill_shell_explorers();
+        let _ = winrust_common::proc::start_shell_explorer();
+    }
+    log("startallback: restored");
 }
 
 fn delete_on_reboot(path: &Path) -> bool {
@@ -647,12 +706,13 @@ fn warnings_note(w: &[String]) -> String {
     if w.is_empty() {
         String::new()
     } else {
-        format!(" Warnings: {} (see %LOCALAPPDATA%\\WinRust\\winrust.log).", w.len())
+        format!(" Warnings: {} (see %ProgramData%\\WinRust\\winrust.log).", w.len())
     }
 }
 
 pub(crate) fn install_plugin(i: usize) -> Result<String, String> {
     require_elevated()?;
+    ensure_shared_log_dir();
     let p = &PLUGINS[i];
     let (inst, uninst) = p.actions.ok_or("installation is not available")?;
     init().inspect_err(|e| log(&format!("{}: ERROR {e}", p.name)))?;
@@ -742,6 +802,7 @@ pub(crate) fn rollback_core(hwnd: Option<isize>) -> Result<String, String> {
         }
     }
     restore_windows_taskbar();
+    restore_startallback();
 
     let remaining: Vec<&str> = PLUGINS.iter().filter(|p| (p.installed)()).map(|p| p.name).collect();
     if !remaining.is_empty() {
@@ -753,7 +814,7 @@ pub(crate) fn rollback_core(hwnd: Option<isize>) -> Result<String, String> {
         if !warnings.is_empty() {
             log(&format!("rollback: {warnings}"));
         }
-        " See warnings in %LOCALAPPDATA%\\WinRust\\winrust.log."
+        " See warnings in %ProgramData%\\WinRust\\winrust.log."
     };
     if errs.is_empty() {
         Ok(format!("All plugins removed.{note}"))

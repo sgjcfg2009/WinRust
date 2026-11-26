@@ -189,6 +189,7 @@ fn save_windows_desktop_icons() {
 
 pub(crate) fn rx_install() -> Result<(), String> {
     override_windhawk();
+    override_startallback();
     save_windows_desktop_icons();
     let fresh = !rx_dir().join("rust-explorer.exe").is_file()
         && trim_read((RX_STATE, "AutoRestartShell"))?.is_none();
@@ -256,6 +257,9 @@ pub(crate) fn rx_uninstall() -> Result<(), String> {
         if !winrust_common::launch::program(r"C:\Windows\explorer.exe") {
             let _ = winrust_common::proc::start_shell_explorer();
         }
+    }
+    if !bar_dir().join("topbar.exe").is_file() {
+        restore_startallback();
     }
     rm_file(&rx_lnk());
     rm_file(&start_lnk("Rust Explorer"));

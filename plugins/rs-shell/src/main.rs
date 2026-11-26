@@ -420,6 +420,7 @@ fn bootstrap() -> bool {
 }
 
 fn main() {
+    winrust_common::install_panic_hook("rs-shell");
     let a: Vec<String> = std::env::args().skip(1).collect();
     let code = match a.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => { if !bootstrap() { run_shell(); } 0 }

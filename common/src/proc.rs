@@ -264,7 +264,11 @@ pub fn elevated() -> bool {
         let ok = GetTokenInformation(t, TokenElevation, &mut e as *mut _ as _, size_of::<TOKEN_ELEVATION>() as u32, &mut n);
         let (mut et, mut etn) = (0u32, 0u32);
         let default_admin = GetTokenInformation(t, TokenElevationType, &mut et as *mut _ as _, 4, &mut etn) != 0 && et == 1 && IsUserAnAdmin() != 0;
-        if (ok == 0 || e.TokenIsElevated == 0) && !default_admin {
+        if default_admin {
+            CloseHandle(t);
+            return true;
+        }
+        if ok == 0 || e.TokenIsElevated == 0 {
             CloseHandle(t);
             return false;
         }

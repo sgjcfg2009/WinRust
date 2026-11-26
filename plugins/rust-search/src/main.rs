@@ -584,7 +584,9 @@ fn serve_log(drive: char) {
     if !env::current_exe().is_ok_and(|e| e.starts_with(install_dir())) {
         return;
     }
-    let p = install_dir().join(format!("serve-{drive}.log"));
+    let dir = PathBuf::from(env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into())).join("WinRust");
+    let _ = std::fs::create_dir_all(&dir);
+    let p = dir.join(format!("serve-{drive}.log"));
     if std::fs::metadata(&p).is_ok_and(|m| m.len() > 1 << 20) {
         let _ = std::fs::remove_file(&p);
     }

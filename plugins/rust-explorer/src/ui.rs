@@ -170,9 +170,10 @@ pub unsafe fn restyle(h: HWND) {
 
 pub fn style_list(list: HWND) {
     unsafe {
-        SetWindowTheme(list, w("DarkMode_Explorer").as_ptr(), ptr::null());
+        let light = winrust_common::style::style().light();
+        SetWindowTheme(list, w(if light { "Explorer" } else { "DarkMode_Explorer" }).as_ptr(), ptr::null());
         let hdr = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
-        SetWindowTheme(hdr, w("DarkMode_ItemsView").as_ptr(), ptr::null());
+        SetWindowTheme(hdr, w(if light { "ItemsView" } else { "DarkMode_ItemsView" }).as_ptr(), ptr::null());
         for (m, c) in [(LVM_SETBKCOLOR, listbg()), (LVM_SETTEXTBKCOLOR, listbg()), (LVM_SETTEXTCOLOR, pal().text)] { SendMessageW(list, m, 0, c as isize); }
         let old_f = SendMessageW(list, WM_GETFONT, 0, 0);
         SendMessageW(list, WM_SETFONT, font(14, 400, ui_face()) as usize, 1);
@@ -852,15 +853,18 @@ fn layout(cw: i32, n: usize) -> Layout {
     let nw = if wide_cmd { sc(82) } else { cbw };
     let new_btn = rc(sc(10), cy0, sc(10) + nw, cy1);
     let cmd_x0 = new_btn.right + sc(12);
-    let cmds: Vec<RECT> = (0..5).map(|i| {
-        let l = cmd_x0 + i * (cbw + sc(4));
-        rc(l, cy0, l + cbw, cy1)
-    }).collect();
     let sw_btn = if wide_cmd { sc(82) } else { cbw };
     let vw_btn = if wide_cmd { sc(82) } else { cbw };
     let more_btn = rc(cw - sc(12) - cbw, cy0, cw - sc(12), cy1);
     let view = rc(more_btn.left - sc(4) - vw_btn, cy0, more_btn.left - sc(4), cy1);
     let sort_btn = rc(view.left - sc(4) - sw_btn, cy0, view.left - sc(4), cy1);
+    let cmds: Vec<RECT> = (0..5)
+        .map(|i| {
+            let l = cmd_x0 + i * (cbw + sc(4));
+            rc(l, cy0, l + cbw, cy1)
+        })
+        .filter(|r| r.right + sc(8) <= sort_btn.left)
+        .collect();
 
     Layout { tabs, close, plus, cap_min, cap_max, cap_close, back: nav_btn(0), fwd: nav_btn(1), up: nav_btn(2), reload, pill, search, new_btn, cmds, sort_btn, view, more_btn }
 }
@@ -1627,12 +1631,10 @@ pub const NAV_W: i32 = 232;
 const NAV_ROW: i32 = 34;
 const NAV_HEAD: i32 = 32;
 
-struct NavItem { title: String, path: PathBuf, glyph: &'static str, cap: Option<(u64, u64)> }
-
-const NAV_DRIVE: i32 = 52;
+struct NavItem { title: String, path: PathBuf, glyph: &'static str }
 
 fn nav_h(it: &NavItem) -> i32 {
-    sc(if it.path.as_os_str().is_empty() { NAV_HEAD } else if it.cap.is_some() { NAV_DRIVE } else { NAV_ROW })
+    sc(if it.path.as_os_str().is_empty() { NAV_HEAD } else { NAV_ROW })
 }
 
 thread_local! {
@@ -1687,8 +1689,8 @@ pub fn toggle_pin(p: &Path) {
 pub fn nav_init(h: HWND) {
     NAVWND.set(h as isize);
     let home = PathBuf::from(env::var_os("USERPROFILE").unwrap_or_default());
-    let head = |lbl: &str| NavItem { title: lbl.into(), path: PathBuf::new(), glyph: "", cap: None };
-    let mut v = vec![head("Quick access"), NavItem { title: "Home".into(), path: home.clone(), glyph: "\u{E80F}", cap: None }];
+    let head = |lbl: &str| NavItem { title: lbl.into(), path: PathBuf::new(), glyph: "" };
+    let mut v = vec![head("Quick access"), NavItem { title: "Home".into(), path: home.clone(), glyph: "\u{E80F}" }];
     use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos};
     let known = [
         ("Desktop", &FOLDERID_Desktop, "\u{E7F4}"),
@@ -1700,14 +1702,14 @@ pub fn nav_init(h: HWND) {
     ];
     for (lbl, id, g) in known {
         let Some(p) = crate::sh::known_dir(id).filter(|p| p.is_dir()) else { continue };
-        v.push(NavItem { title: lbl.into(), path: p, glyph: g, cap: None });
+        v.push(NavItem { title: lbl.into(), path: p, glyph: g });
     }
     for p in pins() {
-        if p.is_dir() { v.push(NavItem { title: p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()), path: p, glyph: "\u{E718}", cap: None }); }
+        if p.is_dir() { v.push(NavItem { title: p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()), path: p, glyph: "\u{E718}" }); }
     }
-    v.push(NavItem { title: "This PC".into(), path: PathBuf::from(crate::THIS_PC_KEY), glyph: "\u{E7F4}", cap: None });
+    v.push(NavItem { title: "This PC".into(), path: PathBuf::from(crate::THIS_PC_KEY), glyph: "\u{E7F4}" });
     unsafe {
-        use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
+        use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
         let mask = GetLogicalDrives();
         for i in 0..26u32 {
             if mask & (1 << i) == 0 { continue; }
@@ -1715,18 +1717,15 @@ pub fn nav_init(h: HWND) {
             let root = format!("{letter}:\\");
             let ty = GetDriveTypeW(w(&root).as_ptr());
             if ty == 4 {
-                v.push(NavItem { title: format!("Network Drive ({}:)", letter), path: PathBuf::from(root), glyph: "\u{E8CE}", cap: None });
+                v.push(NavItem { title: format!("Network Drive ({}:)", letter), path: PathBuf::from(root), glyph: "\u{E8CE}" });
                 continue;
             }
             if !matches!(ty, 2 | 3 | 5 | 6) { continue; }
             let mut label = [0u16; 64];
             let ok = GetVolumeInformationW(w(&root).as_ptr(), label.as_mut_ptr(), 64, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0);
             let name = if ok != 0 { wstr(label.as_ptr()) } else { String::new() };
-            let (mut free, mut total) = (0u64, 0u64);
-            let cap = (GetDiskFreeSpaceExW(w(&root).as_ptr(), &mut free, &mut total, ptr::null_mut()) != 0 && total > 0).then_some((free, total));
             let base = if name.is_empty() { "Local Disk" } else { &name };
-            let _ = cap;
-            v.push(NavItem { title: format!("{base} ({letter}:)"), path: PathBuf::from(root), glyph: if ty == 5 { "\u{E958}" } else { "\u{EDA2}" }, cap: None });
+            v.push(NavItem { title: format!("{base} ({letter}:)"), path: PathBuf::from(root), glyph: if ty == 5 { "\u{E958}" } else { "\u{EDA2}" } });
         }
     }
     NAV.with_borrow_mut(|n| *n = v);
@@ -1781,7 +1780,7 @@ unsafe fn paint_nav(hwnd: HWND) {
         nf = [font(13, 400, ui_face()), font(12, 600, ui_face()), font(16, 400, winrust_common::style::icon_face()), font(11, 400, ui_face())];
         NAV_FONTS.set(nf);
     }
-    let [f_txt, f_head, f_glyph, f_small] = [nf[0] as HFONT, nf[1] as HFONT, nf[2] as HFONT, nf[3] as HFONT];
+    let [f_txt, f_head, f_glyph, _f_small] = [nf[0] as HFONT, nf[1] as HFONT, nf[2] as HFONT, nf[3] as HFONT];
     let of = SelectObject(dc, f_txt);
     let cur = ST.with(|c| c.try_borrow().ok().map(|s| s.dir.to_string_lossy().to_lowercase())).unwrap_or_default();
     let hot = NAVHOT.get();
@@ -1827,15 +1826,6 @@ unsafe fn paint_nav(hwnd: HWND) {
             text(dc, it.glyph, rc(r.left + sc(10), line.top, r.left + sc(38), line.bottom), ico_col, DT_CENTER);
             SelectObject(dc, f_txt);
             text(dc, &it.title, rc(r.left + sc(44), line.top, r.right - sc(8), line.bottom), mix(pal().dim, pal().text, ta.max(th).max(0.45)), DT_LEFT);
-            if let Some((free, total)) = it.cap {
-                let used = 1.0 - free as f32 / total as f32;
-                let bar = rc(r.left + sc(44), y + sc(30), r.right - sc(14), y + sc(34));
-                fill(dc, bar, mix(pal().bg, pal().text, 0.12), sc(4));
-                let fw = ((bar.right - bar.left) as f32 * used) as i32;
-                fill(dc, rc(bar.left, bar.top, bar.left + fw.max(sc(4)), bar.bottom), if used > 0.9 { winrust_common::style::BAD } else { pal().accent }, sc(4));
-                SelectObject(dc, f_small);
-                text(dc, &format!("{} free of {}", fmt_cap(free), fmt_cap(total)), rc(bar.left, bar.bottom + sc(1), r.right - sc(8), y + hgt - sc(2)), pal().dim, DT_LEFT);
-            }
             y += hgt;
         }
     });

@@ -850,7 +850,7 @@ pub(crate) fn apply(h: isize) -> Result<String, String> {
     if !failed.is_empty() {
         return Err(format!("{}.{}", failed.join("; "), if done.is_empty() { String::new() } else { format!(" {done}.") }));
     }
-    let note = if warned { " There are warnings (see %LOCALAPPDATA%\\WinRust\\winrust.log)." } else { "" };
+    let note = if warned { " There are warnings (see %ProgramData%\\WinRust\\winrust.log)." } else { "" };
     Ok(format!("{done}.{note}"))
 }
 

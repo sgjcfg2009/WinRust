@@ -210,6 +210,9 @@ fn main() {
         if args.is_empty() || matches!(args.first().map(String::as_str), Some("install" | "update")) {
             override_windhawk();
         }
+        if matches!(args.first().map(String::as_str), Some("install" | "update")) {
+            override_startallback();
+        }
     }
     if !args.is_empty() {
         std::process::exit(cli(&args));

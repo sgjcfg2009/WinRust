@@ -41,8 +41,13 @@ pub fn program(target: &str) -> bool {
     let uac_on = crate::reg::get_dword(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "EnableLUA") != Some(0);
     let ext = ext_of(target);
     if uac_on
+        && crate::proc::elevated()
         && (ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("com") || ext.eq_ignore_ascii_case("scr"))
-        && Command::new("runas").args(["/trustlevel:0x20000", target]).creation_flags(NO_WINDOW).spawn().is_ok()
+        && Command::new("runas")
+            .args(["/trustlevel:0x20000", target])
+            .creation_flags(NO_WINDOW)
+            .output()
+            .is_ok_and(|o| o.status.success())
     {
         return true;
     }

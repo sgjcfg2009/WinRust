@@ -14,6 +14,71 @@ pub(crate) unsafe fn tray() -> [HWND; 2] {
     [find_other("Shell_TrayWnd"), find_other("Shell_SecondaryTrayWnd")]
 }
 
+pub(crate) unsafe fn foreign_taskbar_windows() -> Vec<HWND> {
+    let host = HOST.get();
+    let mut trays = Vec::new();
+    let mut tray_pids = Vec::new();
+    for cls in ["Shell_TrayWnd", "Shell_SecondaryTrayWnd"] {
+        let c = wide(cls);
+        let mut h = null_mut();
+        loop {
+            h = FindWindowExW(null_mut(), h, c.as_ptr(), null());
+            if h.is_null() {
+                break;
+            }
+            if h != host {
+                trays.push(h);
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(h, &mut pid);
+                if pid != 0 && !tray_pids.contains(&pid) {
+                    tray_pids.push(pid);
+                }
+            }
+        }
+    }
+    struct Ctx<'a> {
+        host: HWND,
+        own_pid: u32,
+        trays: &'a [HWND],
+        tray_pids: &'a [u32],
+        out: Vec<HWND>,
+    }
+    unsafe extern "system" fn collect_tb(w: HWND, lp: LPARAM) -> i32 {
+        let ctx = &mut *(lp as *mut Ctx);
+        if w == ctx.host {
+            return 1;
+        }
+        if ctx.trays.contains(&w) {
+            ctx.out.push(w);
+            return 1;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(w, &mut pid);
+        if pid == 0 || pid == ctx.own_pid {
+            return 1;
+        }
+        let owner = GetWindow(w, GW_OWNER);
+        if !owner.is_null() && ctx.trays.contains(&owner) {
+            ctx.out.push(w);
+            return 1;
+        }
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(w, cls.as_mut_ptr(), cls.len() as i32).max(0) as usize;
+        let name = String::from_utf16_lossy(&cls[..n]);
+        let is_start_cls = name.eq_ignore_ascii_case("Start")
+            || name.starts_with("StartAllBack")
+            || name.starts_with("StartIsBack")
+            || (name.eq_ignore_ascii_case("Button") && ctx.tray_pids.contains(&pid));
+        if is_start_cls {
+            ctx.out.push(w);
+        }
+        1
+    }
+    let mut ctx = Ctx { host, own_pid: std::process::id(), trays: &trays, tray_pids: &tray_pids, out: Vec::new() };
+    EnumWindows(Some(collect_tb), &mut ctx as *mut _ as LPARAM);
+    ctx.out
+}
+
 pub(crate) unsafe fn announce() {
     let msg = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
     if msg == 0 {

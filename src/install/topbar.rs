@@ -40,6 +40,7 @@ pub(crate) fn shells_run(script: &str) -> Result<(), String> {
 
 pub(crate) fn bar_install() -> Result<(), String> {
     override_windhawk();
+    override_startallback();
     let dst = bar_dir().join("topbar.exe");
     let rsh = bar_dir().join("reshell.exe");
     kill_procs(&["topbar.exe", "reshell.exe"]);
@@ -71,6 +72,9 @@ pub(crate) fn bar_uninstall() -> Result<(), String> {
     kill_procs(&["reshell.exe"]);
     kill_procs(&["topbar.exe"]);
     restore_windows_taskbar();
+    if !rx_dir().join("rust-explorer.exe").is_file() {
+        restore_startallback();
+    }
     soft("PowerShell profile", profile_uninstall());
     rm_dir_checked(&bar_dir())?;
     if let Some(ad) = appdata() {

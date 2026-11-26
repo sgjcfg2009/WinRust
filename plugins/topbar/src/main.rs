@@ -723,7 +723,7 @@ unsafe fn set_state(hwnd: HWND, state: usize) {
 
 unsafe fn hide_taskbar() {
     set_state(tray()[0], ABS_AUTOHIDE as usize);
-    for t in tray().into_iter().filter(|t| !t.is_null()) {
+    for t in foreign_taskbar_windows() {
         ShowWindow(t, SW_HIDE);
     }
 }
@@ -758,13 +758,13 @@ unsafe fn remember_taskbar_state() -> usize {
 
 unsafe fn show_taskbar(state: usize) {
     set_state(tray()[0], state);
-    for t in tray().into_iter().filter(|t| !t.is_null()) {
+    for t in foreign_taskbar_windows() {
         ShowWindow(t, SW_SHOWNA);
     }
 }
 
 unsafe fn hide_taskbar_if_shown() {
-    if tray().into_iter().any(|t| !t.is_null() && IsWindowVisible(t) != 0) {
+    if foreign_taskbar_windows().into_iter().any(|t| IsWindowVisible(t) != 0) {
         hide_taskbar();
     }
 }
