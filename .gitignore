@@ -1,0 +1,20 @@
+# Build outputs
+/target/
+/plugins/*/target/
+/out/
+/payload/
+/tools/
+
+# Binaries & debug artifacts
+*.exe
+*.pdb
+*.dll
+*.log
+*.old
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
