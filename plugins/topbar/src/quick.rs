@@ -21,10 +21,19 @@ pub fn refresh() {
     }
     std::thread::spawn(|| {
         let rs = radios();
-        let on = |r: &Radio| r.State().is_ok_and(|s| s == RadioState::On);
-        let bt: Vec<_> = rs.iter().filter(|r| r.Kind().is_ok_and(|k| k == RadioKind::Bluetooth)).collect();
-        BT.store(if bt.is_empty() { -1 } else { bt.iter().any(|r| on(r)) as i8 }, Relaxed);
-        AIR.store(if rs.is_empty() { -1 } else { rs.iter().all(|r| !on(r)) as i8 }, Relaxed);
+        let (mut has_bt, mut bt_on, mut all_off) = (false, false, true);
+        for r in &rs {
+            let is_on = r.State().is_ok_and(|s| s == RadioState::On);
+            if is_on {
+                all_off = false;
+            }
+            if r.Kind().is_ok_and(|k| k == RadioKind::Bluetooth) {
+                has_bt = true;
+                bt_on |= is_on;
+            }
+        }
+        BT.store(if !has_bt { -1 } else { bt_on as i8 }, Relaxed);
+        AIR.store(if rs.is_empty() { -1 } else { all_off as i8 }, Relaxed);
         BUSY.store(false, Relaxed);
     });
 }

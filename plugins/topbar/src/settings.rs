@@ -2,6 +2,8 @@ use super::*;
 
 thread_local! {
     static SET_HWND: Cell<HWND> = const { Cell::new(null_mut()) };
+    static SET_OPENING: Cell<bool> = const { Cell::new(false) };
+    static SET_T0: Cell<u64> = const { Cell::new(0) };
     static SET_HOT: Cell<i32> = const { Cell::new(-1) };
     static SET_RESET: Cell<bool> = const { Cell::new(false) };
     static SET_LBUF: RefCell<LayeredBuf> = const { RefCell::new(LayeredBuf::new()) };
@@ -35,8 +37,12 @@ pub(crate) unsafe fn style_menu() {
     let y = if at_top() { bar_h() + sc(12) } else { (bar_top() - sc(12) - h).max(wa.top + sc(8)) };
     let hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, cls.as_ptr(), null(), WS_POPUP, x, y, w, h, null_mut(), null_mut(), hi, null());
     SET_HWND.set(hw);
-    ShowWindow(hw, SW_SHOW);
+    SET_T0.set(now_ms());
+    SET_OPENING.set(true);
+    SetWindowPos(hw, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
     force_fg(hw);
+    SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SET_OPENING.set(false);
 }
 
 fn sscale(cw: i32, ch: i32) -> f32 {
@@ -123,37 +129,6 @@ fn set_hit(s: f32, x: i32, y: i32) -> Option<i32> {
     hit
 }
 
-unsafe fn stroke_border(g: *mut GpGraphics, r: RECT, c: u32, rad: i32) {
-    if g.is_null() {
-        return;
-    }
-    use windows_sys::Win32::Graphics::GdiPlus::{GdipDrawPath, GdipDrawRectangle};
-    let argb = 0xFF00_0000 | (c & 255) << 16 | (c & 0xFF00) | (c >> 16 & 255);
-    let mut pen: *mut GpPen = null_mut();
-    GdipCreatePen1(argb, 1.0, UnitPixel, &mut pen);
-    if pen.is_null() {
-        return;
-    }
-    let (x, y, w, h) = (r.left as f32 + 0.5, r.top as f32 + 0.5, (r.right - r.left) as f32 - 1.0, (r.bottom - r.top) as f32 - 1.0);
-    if rad <= 0 || style().square() {
-        GdipDrawRectangle(g, pen, x, y, w, h);
-    } else {
-        let d = (rad as f32).min(w).min(h);
-        let mut path: *mut GpPath = null_mut();
-        GdipCreatePath(FillModeAlternate, &mut path);
-        if !path.is_null() {
-            GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
-            GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
-            GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
-            GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
-            GdipClosePathFigure(path);
-            GdipDrawPath(g, pen, path);
-            GdipDeletePath(path);
-        }
-    }
-    GdipDeletePen(pen);
-}
-
 unsafe fn set_paint(hw: HWND) {
     let mut ps: PAINTSTRUCT = zeroed();
     let wdc = BeginPaint(hw, &mut ps);
@@ -164,11 +139,11 @@ unsafe fn set_paint(hw: HWND) {
         return;
     }
     let s = sscale(cr.right, cr.bottom);
-    let (dc, _, g) = SET_LBUF.with_borrow_mut(|b| b.begin(wdc, cr.right, cr.bottom, 255));
+    let (dc, _, _) = SET_LBUF.with_borrow_mut(|b| b.begin(wdc, cr.right, cr.bottom));
     let border_col = if style().light() { mix(pal().bg, pal().line, 0.9) } else { mix(pal().bg, pal().text, 0.14) };
     let rad_w = rr(16);
     fill(dc, cr, pal().bg, rad_w);
-    stroke_border(g, cr, border_col, rad_w);
+    stroke_round(dc, cr, border_col, 255, rad_w, 1.0);
     SetBkMode(dc, TRANSPARENT as i32);
 
     let s_bits = s.to_bits();
@@ -221,7 +196,7 @@ unsafe fn set_paint(hw: HWND) {
         };
         fill(dc, rc, bg, rad);
         if !active {
-            stroke_border(g, rc, card_border, rad);
+            stroke_round(dc, rc, card_border, 255, rad, 1.0);
         }
         let fg = if active {
             if danger { rgb(255, 255, 255) } else { i18n::style::on_accent() }
@@ -245,6 +220,14 @@ unsafe extern "system" fn set_proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
         WM_PAINT => set_paint(hw),
         WM_ERASEBKGND => return 1,
         WM_ACTIVATE if wp & 0xffff == 0 => {
+            if SET_OPENING.get() {
+                return 0;
+            }
+            if now_ms().saturating_sub(SET_T0.get()) < 150 {
+                SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                force_fg(hw);
+                return 0;
+            }
             SET_HWND.set(null_mut());
             DestroyWindow(hw);
         }

@@ -28,7 +28,7 @@ use windows_sys::Win32::{
         Gdi::*,
         GdiPlus::{
             FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen,
-            GdipDrawPath, GdipFillPath, GdipFillRectangle, GdipSetPenColor, GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdipSetSolidFillColor, GdiplusStartup, GdiplusStartupInput, GpBrush, GpGraphics,
+            GdipDrawPath, GdipFillPath, GdipFillRectangle, GdipSetPenColor, GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdipSetSolidFillColor, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBrush, GpGraphics,
             GpPath, GpPen, GpSolidFill, PixelOffsetModeHalf, SmoothingModeAntiAlias, UnitPixel,
         },
     },
@@ -176,17 +176,26 @@ fn elevate_self(args: &[String], tried: bool) -> bool {
     #[link(name = "ole32")]
     unsafe extern "system" {
         fn CoInitializeEx(reserved: *mut core::ffi::c_void, coinit: u32) -> i32;
+        fn CoUninitialize();
     }
     let r = unsafe {
-        CoInitializeEx(null_mut(), 0x2 | 0x4);
-        windows_sys::Win32::UI::Shell::ShellExecuteW(
-            null_mut(),
-            wide("runas").as_ptr(),
-            wide(&exe.to_string_lossy()).as_ptr(),
-            params_w.as_ptr(),
-            dir_w.as_ref().map_or(null(), |w| w.as_ptr()),
-            SW_SHOWNORMAL,
-        ) as isize
+        let co = CoInitializeEx(null_mut(), 0x2 | 0x4);
+        let res = with_wide("runas", |verb| {
+            with_wide(&exe.to_string_lossy(), |file| {
+                windows_sys::Win32::UI::Shell::ShellExecuteW(
+                    null_mut(),
+                    verb,
+                    file,
+                    params_w.as_ptr(),
+                    dir_w.as_ref().map_or(null(), |w| w.as_ptr()),
+                    SW_SHOWNORMAL,
+                ) as isize
+            })
+        });
+        if co >= 0 {
+            CoUninitialize();
+        }
+        res
     };
     r > 32
 }
@@ -233,13 +242,8 @@ fn main() {
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let mut r = RECT { left: 0, top: 0, right: (WIN_W * s).round() as i32, bottom: (WIN_H * s).round() as i32 };
         AdjustWindowRect(&mut r, style, 0);
-        let mut wa: RECT = zeroed();
-        let has_wa = SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as *mut _, 0) != 0;
-        let (wa_l, wa_t, wa_w, wa_h) = if has_wa {
-            (wa.left, wa.top, (wa.right - wa.left).max(400), (wa.bottom - wa.top).max(320))
-        } else {
-            (0, 0, GetSystemMetrics(SM_CXSCREEN).max(400), GetSystemMetrics(SM_CYSCREEN).max(320))
-        };
+        let wa = winrust_common::ui::work_area();
+        let (wa_l, wa_t, wa_w, wa_h) = (wa.left, wa.top, (wa.right - wa.left).max(400), (wa.bottom - wa.top).max(320));
         let win_w = (r.right - r.left).min(wa_w);
         let win_h = (r.bottom - r.top).min(wa_h);
         let x = wa_l + ((wa_w - win_w) / 2).max(0);
@@ -254,5 +258,6 @@ fn main() {
             TranslateMessage(&m);
             DispatchMessageW(&m);
         }
+        GdiplusShutdown(token);
     }
 }

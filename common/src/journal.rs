@@ -25,12 +25,16 @@ impl Entry {
     }
 
     pub fn parse(l: &str) -> Option<Entry> {
-        let f: Vec<&str> = l.trim_end_matches(['\r', '\n']).splitn(5, '|').collect();
-        let s = |i: usize| f[i].to_string();
-        match f.as_slice() {
-            ["reg", _, n, "-"] if !n.is_empty() => Some(Entry::Reg { key: s(1), name: s(2), old: None }),
-            ["reg", _, n, ty, _] if !n.is_empty() && TYPES.contains(ty) => Some(Entry::Reg { key: s(1), name: s(2), old: Some((s(3), s(4))) }),
-            ["svc", _, _] => Some(Entry::Svc { name: s(1), mode: s(2) }).filter(|e| e.line().is_some()),
+        let mut parts = [""; 5];
+        let mut n = 0;
+        for part in l.trim_end_matches(['\r', '\n']).splitn(5, '|') {
+            parts[n] = part;
+            n += 1;
+        }
+        match &parts[..n] {
+            ["reg", k, name, "-"] if !name.is_empty() => Some(Entry::Reg { key: (*k).into(), name: (*name).into(), old: None }),
+            ["reg", k, name, ty, val] if !name.is_empty() && TYPES.contains(ty) => Some(Entry::Reg { key: (*k).into(), name: (*name).into(), old: Some(((*ty).into(), (*val).into())) }),
+            ["svc", name, mode] => Some(Entry::Svc { name: (*name).into(), mode: (*mode).into() }).filter(|e| e.line().is_some()),
             _ => None,
         }
     }

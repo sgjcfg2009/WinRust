@@ -1,15 +1,14 @@
 use std::ptr::null_mut;
+use winapi::shared::minwindef::HMODULE;
 use winapi::um::{
     fileapi::{CreateFileW, GetDiskFreeSpaceExW, OPEN_EXISTING},
     handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
     ioapiset::DeviceIoControl,
-    libloaderapi::{GetProcAddress, LoadLibraryW},
+    libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryW},
     winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE},
 };
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
+use crate::ui::wide;
 
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Dimm {
@@ -195,16 +194,15 @@ pub fn disk_info() -> DiskInfo {
 pub fn disk_info_for(number: u32) -> DiskInfo {
     let mut d = DiskInfo { number, ..Default::default() };
     if let Some(h) = open_device(&format!(r"\\.\PhysicalDrive{}", d.number)) {
-        let query = |prop: u32| -> Vec<u8> {
+        let mut out = [0u8; 1024];
+        let query = |prop: u32, buf: &mut [u8; 1024]| -> bool {
             let mut q = [0u8; 12];
             q[..4].copy_from_slice(&prop.to_le_bytes());
-            let mut out = vec![0u8; 1024];
-            if ioctl(h, 0x002D_1400 , &q, &mut out) { out } else { vec![] }
+            ioctl(h, 0x002D_1400, &q, buf)
         };
-        let dev = query(0);
-        if dev.len() >= 36 {
-            let off = |o: usize| u32::from_le_bytes([dev[o], dev[o + 1], dev[o + 2], dev[o + 3]]);
-            let (vendor, product) = (cstr_at(&dev, off(12)), cstr_at(&dev, off(16)));
+        if query(0, &mut out) {
+            let off = |o: usize| u32::from_le_bytes([out[o], out[o + 1], out[o + 2], out[o + 3]]);
+            let (vendor, product) = (cstr_at(&out, off(12)), cstr_at(&out, off(16)));
             d.model = if vendor.is_empty() || product.to_lowercase().starts_with(&vendor.to_lowercase()) { product } else { format!("{vendor} {product}") };
             d.bus = match off(28) {
                 17 => "NVMe",
@@ -217,28 +215,21 @@ pub fn disk_info_for(number: u32) -> DiskInfo {
             }
             .into();
         }
-        let seek = query(7);
-        if seek.len() >= 9 {
-            d.kind = if seek[8] == 0 { "SSD" } else { "HDD" }.into();
+        if query(7, &mut out) {
+            d.kind = if out[8] == 0 { "SSD" } else { "HDD" }.into();
         }
         let mut geo = [0u8; 128];
-        if ioctl(h, 0x0007_00A0 , &[], &mut geo) {
+        if ioctl(h, 0x0007_00A0, &[], &mut geo) {
             d.capacity = i64::from_le_bytes([geo[24], geo[25], geo[26], geo[27], geo[28], geo[29], geo[30], geo[31]]).max(0) as u64;
         }
         unsafe { CloseHandle(h) };
     }
-    let (mut free, mut total, mut total_free) = (0u64, 0u64, 0u64);
     unsafe {
-        use winapi::shared::ntdef::ULARGE_INTEGER;
-        let (mut a, mut b, mut c): (ULARGE_INTEGER, ULARGE_INTEGER, ULARGE_INTEGER) = (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
-        if GetDiskFreeSpaceExW(wide(r"C:\").as_ptr(), &mut a, &mut b, &mut c) != 0 {
-            free = *a.QuadPart();
-            total = *b.QuadPart();
-            total_free = *c.QuadPart();
+        let mut total: winapi::shared::ntdef::ULARGE_INTEGER = std::mem::zeroed();
+        if GetDiskFreeSpaceExW(wide(r"C:\").as_ptr(), null_mut(), &mut total, null_mut()) != 0 {
+            d.formatted = *total.QuadPart();
         }
     }
-    let _ = (free, total_free);
-    d.formatted = total;
     d
 }
 
@@ -252,9 +243,9 @@ pub struct GpuReg {
 pub fn gpu_registry(name: &str) -> GpuReg {
     use winapi::um::winreg::{RegGetValueW, HKEY_LOCAL_MACHINE};
     let class = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
-    let get_str = |sub: &str, val: &str| -> Option<String> {
+    let mut buf = [0u16; 256];
+    let mut get_str = |sub: &str, val: &str| -> Option<String> {
         let (s, v) = (wide(sub), wide(val));
-        let mut buf = vec![0u16; 256];
         let mut size = (buf.len() * 2) as u32;
         let rc = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, s.as_ptr(), v.as_ptr(), 0x2, null_mut(), buf.as_mut_ptr() as *mut _, &mut size) };
         (rc == 0).then(|| String::from_utf16_lossy(&buf[..(size as usize / 2).saturating_sub(1)]))
@@ -264,7 +255,7 @@ pub fn gpu_registry(name: &str) -> GpuReg {
         if get_str(&sub, "DriverDesc").as_deref() == Some(name) {
             let (s, v) = (wide(&sub), wide("HardwareInformation.qwMemorySize"));
             let (mut q, mut size) = (0u64, 8u32);
-            let rc = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, s.as_ptr(), v.as_ptr(), 0xFFFF , null_mut(), &mut q as *mut u64 as *mut _, &mut size) };
+            let rc = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, s.as_ptr(), v.as_ptr(), 0xFFFF, null_mut(), &mut q as *mut u64 as *mut _, &mut size) };
             return GpuReg { driver_version: get_str(&sub, "DriverVersion").unwrap_or_default(), driver_date: get_str(&sub, "DriverDate").unwrap_or_default(), vram: if rc == 0 { q } else { 0 } };
         }
     }
@@ -272,15 +263,10 @@ pub fn gpu_registry(name: &str) -> GpuReg {
 }
 
 pub struct Nvml {
+    lib: HMODULE,
     device: usize,
     get_temp: unsafe extern "C" fn(usize, u32, *mut u32) -> i32,
-}
-
-#[repr(C)]
-struct NvmlMemory {
-    total: u64,
-    free: u64,
-    used: u64,
+    shutdown: Option<unsafe extern "C" fn() -> i32>,
 }
 
 impl Nvml {
@@ -293,33 +279,53 @@ impl Nvml {
             if lib.is_null() {
                 return None;
             }
-            let sym = |n: &str| GetProcAddress(lib, format!("{n}\0").as_ptr() as *const i8);
-            let (init, by_index, temp) = (sym("nvmlInit_v2"), sym("nvmlDeviceGetHandleByIndex_v2"), sym("nvmlDeviceGetTemperature"));
+            let init = GetProcAddress(lib, c"nvmlInit_v2".as_ptr());
+            let by_index = GetProcAddress(lib, c"nvmlDeviceGetHandleByIndex_v2".as_ptr());
+            let temp = GetProcAddress(lib, c"nvmlDeviceGetTemperature".as_ptr());
+            let shut = GetProcAddress(lib, c"nvmlShutdown".as_ptr());
             if init.is_null() || by_index.is_null() || temp.is_null() {
+                FreeLibrary(lib);
                 return None;
             }
             let init: unsafe extern "C" fn() -> i32 = std::mem::transmute(init);
             let by_index: unsafe extern "C" fn(u32, *mut usize) -> i32 = std::mem::transmute(by_index);
+            let shutdown: Option<unsafe extern "C" fn() -> i32> = (!shut.is_null()).then(|| std::mem::transmute(shut));
             if init() != 0 {
+                FreeLibrary(lib);
                 return None;
             }
             let mut device = 0usize;
             if by_index(0, &mut device) != 0 {
+                if let Some(f) = shutdown {
+                    f();
+                }
+                FreeLibrary(lib);
                 return None;
             }
-            Some(Nvml { device, get_temp: std::mem::transmute::<winapi::shared::minwindef::FARPROC, unsafe extern "C" fn(usize, u32, *mut u32) -> i32>(temp) })
+            Some(Nvml {
+                lib,
+                device,
+                get_temp: std::mem::transmute::<winapi::shared::minwindef::FARPROC, unsafe extern "C" fn(usize, u32, *mut u32) -> i32>(temp),
+                shutdown,
+            })
         }
     }
 
     pub fn temp(&self) -> Option<u32> {
         let mut t = 0u32;
-        (unsafe { (self.get_temp)(self.device, 0 , &mut t) } == 0).then_some(t)
+        (unsafe { (self.get_temp)(self.device, 0, &mut t) } == 0).then_some(t)
     }
 }
 
-#[allow(dead_code)]
-fn _size_check() -> usize {
-    std::mem::size_of::<NvmlMemory>()
+impl Drop for Nvml {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(f) = self.shutdown {
+                f();
+            }
+            FreeLibrary(self.lib);
+        }
+    }
 }
 
 #[cfg(test)]

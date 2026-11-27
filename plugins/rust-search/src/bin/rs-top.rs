@@ -2,7 +2,8 @@ use std::{collections::HashMap, env, process::Command, thread};
 use sysinfo::{ProcessesToUpdate, System, MINIMUM_CPU_UPDATE_INTERVAL};
 
 fn services() -> HashMap<u32, String> {
-    let out = Command::new("tasklist").args(["/svc", "/fo", "csv", "/nh"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    use std::os::windows::process::CommandExt;
+    let out = Command::new("tasklist").args(["/svc", "/fo", "csv", "/nh"]).creation_flags(0x0800_0000).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     out.lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.trim().trim_matches('"').split("\",\"").collect();

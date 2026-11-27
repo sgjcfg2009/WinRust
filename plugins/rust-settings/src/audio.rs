@@ -112,7 +112,8 @@ fn proc_name(pid: u32) -> Option<String> {
         let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut n) != 0;
         CloseHandle(h);
         let path = String::from_utf16_lossy(&buf[..n as usize]);
-        ok.then(|| path.rsplit('\\').next().unwrap_or(&path).trim_end_matches(".exe").to_string())
+        let s = path.rsplit('\\').next().unwrap_or(&path);
+        ok.then(|| s.strip_suffix(".exe").unwrap_or(s).to_string())
     }
 }
 
@@ -132,22 +133,21 @@ pub fn apps() -> Vec<(u32, String)> {
     out
 }
 
-fn app_volumes(pid: u32) -> Vec<ISimpleAudioVolume> {
+fn app_volumes(pid: u32) -> impl Iterator<Item = ISimpleAudioVolume> {
     sessions()
         .into_iter()
-        .filter(|s| {
+        .filter(move |s| {
             let sys = unsafe { s.IsSystemSoundsSession() }.0 == 0;
             if pid == 0 { sys } else { !sys && unsafe { s.GetProcessId() }.ok() == Some(pid) }
         })
         .filter_map(|s| s.cast::<ISimpleAudioVolume>().ok())
-        .collect()
 }
 
 pub fn volume(src: Src) -> Option<f32> {
     unsafe {
         match src {
             Src::Out | Src::Mic => endpoint(src == Src::Mic)?.GetMasterVolumeLevelScalar().ok(),
-            Src::App(pid) => app_volumes(pid).first()?.GetMasterVolume().ok(),
+            Src::App(pid) => app_volumes(pid).next()?.GetMasterVolume().ok(),
         }
     }
 }
@@ -161,7 +161,7 @@ pub fn set_volume(src: Src, v: f32) {
                     let _ = e.SetMasterVolumeLevelScalar(v, null());
                 }
             }
-            Src::App(pid) => app_volumes(pid).iter().for_each(|a| drop(a.SetMasterVolume(v, null()))),
+            Src::App(pid) => app_volumes(pid).for_each(|a| drop(a.SetMasterVolume(v, null()))),
         }
     }
 }

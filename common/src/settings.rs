@@ -208,7 +208,16 @@ fn run(uri: &str) {
 }
 
 fn own_page(uri: &str) -> Option<&'static str> {
-    match uri.trim().to_ascii_lowercase().as_str() {
+    let trimmed = uri.trim();
+    if trimmed.len() > 64 || !trimmed.is_ascii() {
+        return None;
+    }
+    let mut buf = [0u8; 64];
+    for (dst, &src) in buf.iter_mut().zip(trimmed.as_bytes()) {
+        *dst = src.to_ascii_lowercase();
+    }
+    let lower = std::str::from_utf8(&buf[..trimmed.len()]).ok()?;
+    match lower {
         "ms-settings:" | "ms-settings:display" | "ms-settings:nightlight" => Some("display"),
         "ms-settings:sound" => Some("sound"),
         "ms-settings:personalization" | "ms-settings:colors" | "ms-settings:personalization-colors" | "ms-settings:themes" => Some("personalization"),

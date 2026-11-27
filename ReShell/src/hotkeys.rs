@@ -6,16 +6,40 @@ static HOOK: AtomicIsize = AtomicIsize::new(0);
 static HELD: AtomicU32 = AtomicU32::new(0);
 static TOPBAR: [u16; 7] = [b't' as u16, b'o' as u16, b'p' as u16, b'b' as u16, b'a' as u16, b'r' as u16, 0];
 
+const VD_KEY: [u16; 67] = [
+    b'S' as u16, b'O' as u16, b'F' as u16, b'T' as u16, b'W' as u16, b'A' as u16, b'R' as u16, b'E' as u16, b'\\' as u16,
+    b'M' as u16, b'i' as u16, b'c' as u16, b'r' as u16, b'o' as u16, b's' as u16, b'o' as u16, b'f' as u16, b't' as u16, b'\\' as u16,
+    b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16, b's' as u16, b'\\' as u16,
+    b'C' as u16, b'u' as u16, b'r' as u16, b'r' as u16, b'e' as u16, b'n' as u16, b't' as u16,
+    b'V' as u16, b'e' as u16, b'r' as u16, b's' as u16, b'i' as u16, b'o' as u16, b'n' as u16, b'\\' as u16,
+    b'E' as u16, b'x' as u16, b'p' as u16, b'l' as u16, b'o' as u16, b'r' as u16, b'e' as u16, b'r' as u16, b'\\' as u16,
+    b'V' as u16, b'i' as u16, b'r' as u16, b't' as u16, b'u' as u16, b'a' as u16, b'l' as u16,
+    b'D' as u16, b'e' as u16, b's' as u16, b'k' as u16, b't' as u16, b'o' as u16, b'p' as u16, b's' as u16, 0,
+];
+const VD_IDS: [u16; 18] = [
+    b'V' as u16, b'i' as u16, b'r' as u16, b't' as u16, b'u' as u16, b'a' as u16, b'l' as u16,
+    b'D' as u16, b'e' as u16, b's' as u16, b'k' as u16, b't' as u16, b'o' as u16, b'p' as u16, b'I' as u16, b'D' as u16, b's' as u16, 0,
+];
+const VD_CUR: [u16; 22] = [
+    b'C' as u16, b'u' as u16, b'r' as u16, b'r' as u16, b'e' as u16, b'n' as u16, b't' as u16,
+    b'V' as u16, b'i' as u16, b'r' as u16, b't' as u16, b'u' as u16, b'a' as u16, b'l' as u16,
+    b'D' as u16, b'e' as u16, b's' as u16, b'k' as u16, b't' as u16, b'o' as u16, b'p' as u16, 0,
+];
+
 fn desktops() -> Option<(usize, usize)> {
-    let key: Vec<u16> = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops\0".encode_utf16().collect();
-    let get = |name: &str| -> Option<Vec<u8>> {
-        let n: Vec<u16> = format!("{name}\0").encode_utf16().collect();
-        let mut buf = vec![0u8; 1024];
-        let mut len = buf.len() as u32;
-        let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), n.as_ptr(), RRF_RT_REG_BINARY, std::ptr::null_mut(), buf.as_mut_ptr().cast(), &mut len) };
-        (r == 0).then(|| { buf.truncate(len as usize); buf })
-    };
-    index_in(&get("VirtualDesktopIDs")?, &get("CurrentVirtualDesktop")?)
+    let mut ids = [0u8; 1024];
+    let mut ids_len = ids.len() as u32;
+    let mut cur = [0u8; 16];
+    let mut cur_len = cur.len() as u32;
+    unsafe {
+        if RegGetValueW(HKEY_CURRENT_USER, VD_KEY.as_ptr(), VD_IDS.as_ptr(), RRF_RT_REG_BINARY, std::ptr::null_mut(), ids.as_mut_ptr().cast(), &mut ids_len) != 0 {
+            return None;
+        }
+        if RegGetValueW(HKEY_CURRENT_USER, VD_KEY.as_ptr(), VD_CUR.as_ptr(), RRF_RT_REG_BINARY, std::ptr::null_mut(), cur.as_mut_ptr().cast(), &mut cur_len) != 0 || cur_len != 16 {
+            return None;
+        }
+    }
+    index_in(&ids[..ids_len as usize], &cur)
 }
 
 fn index_in(ids: &[u8], cur: &[u8]) -> Option<(usize, usize)> {

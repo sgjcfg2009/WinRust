@@ -50,21 +50,33 @@ impl Adapter {
     }
 
     pub fn summary(&self) -> String {
-        let ip = self.ipv4.iter().find(|(ip, _)| !apipa(ip)).map(|(ip, _)| ip.to_string()).or_else(|| self.ipv6.first().map(|ip| ip.to_string()));
-        let kind = if self.wifi { "Wi-Fi" } else { "Ethernet" };
-        [Some(kind.to_string()), ip, if self.up { speed_text(self.speed) } else { None }].into_iter().flatten().collect::<Vec<_>>().join("  ·  ")
+        use std::fmt::Write;
+        let mut s = String::from(if self.wifi { "Wi-Fi" } else { "Ethernet" });
+        if let Some(ip) = self.ipv4.iter().find(|(ip, _)| !apipa(ip)).map(|(ip, _)| *ip) {
+            let _ = write!(s, "  ·  {ip}");
+        } else if let Some(ip) = self.ipv6.first() {
+            let _ = write!(s, "  ·  {ip}");
+        }
+        if self.up {
+            if let Some(sp) = speed_text(self.speed) {
+                let _ = write!(s, "  ·  {sp}");
+            }
+        }
+        s
     }
 
     pub fn details(&self) -> Vec<(String, String)> {
-        let join = |v: Vec<String>| if v.is_empty() { "—".to_string() } else { v.join(", ") };
+        let join = |v: &[String]| if v.is_empty() { "—".to_string() } else { v.join(", ") };
         let mut out = vec![("Description".to_string(), self.desc.clone())];
         if self.up {
-            out.push(("IPv4".into(), join(self.ipv4.iter().map(|(ip, p)| format!("{ip}/{p}")).collect())));
+            let v4: Vec<String> = self.ipv4.iter().map(|(ip, p)| format!("{ip}/{p}")).collect();
+            out.push(("IPv4".into(), join(&v4)));
             if !self.ipv6.is_empty() {
-                out.push(("IPv6".into(), join(self.ipv6.iter().map(|ip| ip.to_string()).collect())));
+                let v6: Vec<String> = self.ipv6.iter().map(|ip| ip.to_string()).collect();
+                out.push(("IPv6".into(), join(&v6)));
             }
-            out.push(("Gateway".into(), join(self.gateway.clone())));
-            out.push(("DNS".into(), join(self.dns.clone())));
+            out.push(("Gateway".into(), join(&self.gateway)));
+            out.push(("DNS".into(), join(&self.dns)));
         }
         out.push(("IP assignment".into(), if self.dhcp { "Automatic (DHCP)".into() } else { "Manual".into() }));
         out.push(("MAC".into(), self.mac.clone()));
@@ -136,8 +148,23 @@ fn internet() -> Vec<(windows::core::GUID, bool)> {
 }
 
 fn guid_of(name: &str) -> Option<windows::core::GUID> {
-    let h = name.trim_matches(|c| c == '{' || c == '}').replace('-', "");
-    u128::from_str_radix(&h, 16).ok().filter(|_| h.len() == 32).map(windows::core::GUID::from_u128)
+    let mut hex = [0u8; 32];
+    let mut n = 0usize;
+    for b in name.trim_matches(|c| c == '{' || c == '}').bytes() {
+        if b == b'-' {
+            continue;
+        }
+        if n >= 32 {
+            return None;
+        }
+        hex[n] = b;
+        n += 1;
+    }
+    if n != 32 {
+        return None;
+    }
+    let s = std::str::from_utf8(&hex).ok()?;
+    u128::from_str_radix(s, 16).ok().map(windows::core::GUID::from_u128)
 }
 
 pub fn adapters() -> Vec<Adapter> {
@@ -166,9 +193,16 @@ pub fn adapters() -> Vec<Adapter> {
                         _ => {}
                     }
                 }
-                let name = unsafe { std::ffi::CStr::from_ptr(a.AdapterName as _) }.to_string_lossy().into_owned();
+                let name = unsafe { std::ffi::CStr::from_ptr(a.AdapterName as _) }.to_string_lossy();
                 let id = guid_of(&name);
-                let mac = a.PhysicalAddress[..(a.PhysicalAddressLength as usize).min(8)].iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
+                let mut mac = String::with_capacity(23);
+                for (i, b) in a.PhysicalAddress[..(a.PhysicalAddressLength as usize).min(8)].iter().enumerate() {
+                    use std::fmt::Write;
+                    if i > 0 {
+                        mac.push(':');
+                    }
+                    let _ = write!(mac, "{b:02X}");
+                }
                 Adapter {
                     name: pwstr(a.FriendlyName),
                     desc: pwstr(a.Description),

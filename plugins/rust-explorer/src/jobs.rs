@@ -1,8 +1,9 @@
 use std::{
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::Instant,
@@ -30,20 +31,30 @@ impl Progress {
 
 static JOB: Mutex<Option<Arc<Progress>>> = Mutex::new(None);
 static RUNNING: AtomicBool = AtomicBool::new(false);
+static TICK_LOCK: Mutex<bool> = Mutex::new(false);
+static TICK_CV: Condvar = Condvar::new();
 
 pub fn status_text() -> Option<String> {
     let p = JOB.lock().unwrap().clone()?;
     let (b, tb, f, tf) = (p.bytes.load(Relaxed), p.total_bytes.load(Relaxed), p.files.load(Relaxed), p.total_files.load(Relaxed));
     let secs = p.started.elapsed().as_secs_f64().max(0.1);
-    let mut s = p.what.clone();
+    let mut s = String::with_capacity(p.what.len() + 64);
+    s.push_str(&p.what);
     if tf > 0 {
-        let count = format!("{} of {} files", f, tf);
-        s += &format!("  \u{00B7}  {count}");
+        let _ = write!(s, "  \u{00B7}  {f} of {tf} files");
     }
     if tb > 0 {
-        s += &format!("  \u{00B7}  {}", format!("{} of {} ({}%)  \u{00B7}  {}/s", super::size_text(b), super::size_text(tb), b * 100 / tb.max(1), super::size_text((b as f64 / secs) as u64)));
+        let _ = write!(
+            s,
+            "  \u{00B7}  {} of {} ({}%)  \u{00B7}  {}/s",
+            super::size_text(b),
+            super::size_text(tb),
+            b * 100 / tb.max(1),
+            super::size_text((b as f64 / secs) as u64)
+        );
     }
-    Some(s + "\u{2026}")
+    s.push('\u{2026}');
+    Some(s)
 }
 
 pub fn busy() -> bool {
@@ -74,20 +85,21 @@ fn spawn(h: isize, what: String, f: impl FnOnce(&Progress) -> Result<(), String>
     }
     let p = Progress::new(what);
     *JOB.lock().unwrap() = Some(p.clone());
-    let ticker = std::thread::spawn({
-        let p = p.clone();
-        move || {
-            while RUNNING.load(Relaxed) {
-                unsafe { super::ui::status_dirty(h as _) };
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            drop(p);
+    *TICK_LOCK.lock().unwrap() = true;
+    let ticker = std::thread::spawn(move || {
+        let mut g = TICK_LOCK.lock().unwrap();
+        while *g {
+            unsafe { super::ui::status_dirty(h as _) };
+            let (ng, _) = TICK_CV.wait_timeout(g, std::time::Duration::from_millis(200)).unwrap();
+            g = ng;
         }
     });
     std::thread::spawn(move || {
         let r = f(&p);
         *JOB.lock().unwrap() = None;
         RUNNING.store(false, Relaxed);
+        *TICK_LOCK.lock().unwrap() = false;
+        TICK_CV.notify_one();
         let _ = ticker.join();
         let msg = Box::new(r.err());
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(h as _, super::WM_JOB, Box::into_raw(msg) as usize, 0) };
@@ -105,19 +117,36 @@ fn walk(src: &Path, rel: PathBuf, out: &mut Vec<Entry>) -> std::io::Result<()> {
             let e = e?;
             walk(&e.path(), rel.join(e.file_name()), out)?;
         }
-    } else if md.file_type().is_symlink() && fs::metadata(src).is_ok_and(|m| m.is_dir()) {
-    } else {
-        out.push((src.to_path_buf(), rel, Some(fs::metadata(src).map_or(md.len(), |m| m.len()))));
+    } else if !(md.file_type().is_symlink() && fs::metadata(src).is_ok_and(|m| m.is_dir())) {
+        let len = if md.file_type().is_symlink() { fs::metadata(src).map_or(md.len(), |m| m.len()) } else { md.len() };
+        out.push((src.to_path_buf(), rel, Some(len)));
     }
     Ok(())
 }
 
 pub fn free_name(dir: &Path, name: &str, is_dir: bool) -> PathBuf {
+    let mut p = dir.join(name);
+    if fs::symlink_metadata(&p).is_err() {
+        return p;
+    }
     let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !is_dir && !s.is_empty() => (s.to_string(), format!(".{e}")),
-        _ => (name.to_string(), String::new()),
+        Some((s, e)) if !is_dir && !s.is_empty() => (s, e),
+        _ => (name, ""),
     };
-    (1..).map(|n| dir.join(if n == 1 { name.to_string() } else { format!("{stem} ({n}){ext}") })).find(|p| fs::symlink_metadata(p).is_err()).unwrap()
+    let mut buf = String::with_capacity(name.len() + 8);
+    for n in 2u32.. {
+        buf.clear();
+        if ext.is_empty() {
+            let _ = write!(buf, "{stem} ({n})");
+        } else {
+            let _ = write!(buf, "{stem} ({n}).{ext}");
+        }
+        p.set_file_name(&buf);
+        if fs::symlink_metadata(&p).is_err() {
+            return p;
+        }
+    }
+    unreachable!()
 }
 
 pub fn can_fast_copy(from: &[PathBuf], to: &Path) -> bool {
@@ -132,14 +161,16 @@ pub fn writable(dir: &Path) -> bool {
 }
 
 pub fn same_volume(a: &Path, b: &Path) -> bool {
-    let root = |p: &Path| p.components().next().map(|c| c.as_os_str().to_string_lossy().to_lowercase());
-    root(a).is_some() && root(a) == root(b)
+    a.components().next().zip(b.components().next()).is_some_and(|(x, y)| x.as_os_str().eq_ignore_ascii_case(y.as_os_str()))
 }
 
 fn seek_penalty(p: &Path) -> bool {
     use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*, System::{IO::DeviceIoControl, Ioctl::*}};
-    let Some(letter) = p.to_string_lossy().chars().next().filter(|c| c.is_ascii_alphabetic()) else { return false };
-    let dev: Vec<u16> = format!(r"\\.\{letter}:").encode_utf16().chain([0]).collect();
+    let Some(first) = std::os::windows::ffi::OsStrExt::encode_wide(p.as_os_str()).next() else { return false };
+    if !(first as u8 as char).is_ascii_alphabetic() || first > 0x7F {
+        return false;
+    }
+    let dev = [b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16, first, b':' as u16, 0];
     unsafe {
         let h = CreateFileW(dev.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut());
         if h == INVALID_HANDLE_VALUE {
@@ -156,18 +187,24 @@ fn seek_penalty(p: &Path) -> bool {
 
 const BIG: u64 = 256 << 20;
 
-fn copy_file(src: &Path, dst: &Path, size: u64, p: &Progress) -> std::io::Result<()> {
+fn copy_file(src: &Path, dst: &Path, size: u64, p: &Progress, ws: &mut Vec<u16>, wd: &mut Vec<u16>) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{COPY_FILE_FAIL_IF_EXISTS, COPY_FILE_NO_BUFFERING, CopyFileExW};
     unsafe extern "system" fn cb(_total: i64, done: i64, _st: i64, _sd: i64, _id: u32, _r: u32, _s: *mut core::ffi::c_void, _d: *mut core::ffi::c_void, data: *const core::ffi::c_void) -> u32 {
         let (prog, last) = unsafe { &mut *(data as *mut (&Progress, u64)) };
-        prog.bytes.fetch_add(done as u64 - *last, Relaxed);
+        prog.bytes.fetch_add((done as u64).saturating_sub(*last), Relaxed);
         *last = done as u64;
-        0
+        u32::from(prog.cancelled())
     }
-    let w = |p: &Path| -> Vec<u16> { std::os::windows::ffi::OsStrExt::encode_wide(p.as_os_str()).chain([0]).collect() };
+    ws.clear();
+    ws.extend(src.as_os_str().encode_wide());
+    ws.push(0);
+    wd.clear();
+    wd.extend(dst.as_os_str().encode_wide());
+    wd.push(0);
     let mut state: (&Progress, u64) = (p, 0);
     let flags = COPY_FILE_FAIL_IF_EXISTS | if size >= BIG { COPY_FILE_NO_BUFFERING } else { 0 };
-    let ok = unsafe { CopyFileExW(w(src).as_ptr(), w(dst).as_ptr(), Some(cb), &mut state as *mut _ as _, std::ptr::null_mut(), flags) } != 0;
+    let ok = unsafe { CopyFileExW(ws.as_ptr(), wd.as_ptr(), Some(cb), &mut state as *mut _ as _, std::ptr::null_mut(), flags) } != 0;
     p.bytes.fetch_add(size.saturating_sub(state.1), Relaxed);
     if ok { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
@@ -180,18 +217,24 @@ pub fn copy(h: isize, from: Vec<PathBuf>, to: PathBuf, then_delete: bool) -> boo
 fn copy_now(from: &[PathBuf], to: &Path, then_delete: bool, p: &Progress) -> Result<(), String> {
     let mut entries = vec![];
     for src in from {
-        let name = src.file_name().ok_or_else(|| format!("{}: no name", src.display()))?.to_string_lossy().into_owned();
+        let name = src.file_name().ok_or_else(|| format!("{}: no name", src.display()))?.to_string_lossy();
         let top = free_name(to, &name, src.is_dir());
         walk(src, PathBuf::from(top.file_name().unwrap()), &mut entries).map_err(|e| format!("{}: {e}", src.display()))?;
     }
-    p.total_files.store(entries.iter().filter(|e| e.2.is_some()).count() as u64, Relaxed);
-    p.total_bytes.store(entries.iter().filter_map(|e| e.2).sum(), Relaxed);
-    for (_, rel, size) in &entries {
-        if size.is_none() {
-            fs::create_dir_all(to.join(rel)).map_err(|e| format!("{}: {e}", to.join(rel).display()))?;
+    let (mut tf, mut tb) = (0u64, 0u64);
+    let mut files: Vec<&Entry> = Vec::with_capacity(entries.len());
+    for e in &entries {
+        if let Some(sz) = e.2 {
+            tf += 1;
+            tb += sz;
+            files.push(e);
+        } else {
+            let d = to.join(&e.1);
+            fs::create_dir_all(&d).map_err(|err| format!("{}: {err}", d.display()))?;
         }
     }
-    let mut files: Vec<&Entry> = entries.iter().filter(|e| e.2.is_some()).collect();
+    p.total_files.store(tf, Relaxed);
+    p.total_bytes.store(tb, Relaxed);
     files.sort_by_key(|e| std::cmp::Reverse(e.2));
     let threads = if seek_penalty(&from[0]) || seek_penalty(to) { 1 } else { std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8) };
     let next = AtomicU64::new(0);
@@ -199,16 +242,24 @@ fn copy_now(from: &[PathBuf], to: &Path, then_delete: bool, p: &Progress) -> Res
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
-                while let Some(e) = files.get(next.fetch_add(1, Relaxed) as usize) {
-                    let dst = to.join(&e.1);
-                    match copy_file(&e.0, &dst, e.2.unwrap(), p) {
+                let (mut ws, mut wd, mut dst) = (Vec::with_capacity(260), Vec::with_capacity(260), PathBuf::with_capacity(260));
+                while !p.cancelled() {
+                    let Some(e) = files.get(next.fetch_add(1, Relaxed) as usize) else { break };
+                    dst.clear();
+                    dst.push(to);
+                    dst.push(&e.1);
+                    match copy_file(&e.0, &dst, e.2.unwrap(), p, &mut ws, &mut wd) {
                         Ok(()) => _ = p.files.fetch_add(1, Relaxed),
-                        Err(err) => errors.lock().unwrap().push(format!("{}: {err}", e.0.display())),
+                        Err(err) if !p.cancelled() => errors.lock().unwrap().push(format!("{}: {err}", e.0.display())),
+                        Err(_) => {}
                     }
                 }
             });
         }
     });
+    if p.cancelled() {
+        return Err("Cancelled".to_string());
+    }
     let errors = errors.into_inner().unwrap();
     if !errors.is_empty() {
         let more = if errors.len() > 5 { format!("\n... and {} more", errors.len() - 5) } else { String::new() };
@@ -232,7 +283,8 @@ pub fn zip(h: isize, from: Vec<PathBuf>, dest: PathBuf) -> bool {
 }
 
 fn zip_name(rel: &Path) -> String {
-    rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+    let s = rel.to_string_lossy();
+    if s.contains('\\') { s.replace('\\', "/") } else { s.into_owned() }
 }
 
 fn zip_now(from: &[PathBuf], dest: &Path, p: &Progress) -> Result<(), String> {
@@ -243,67 +295,64 @@ fn zip_now(from: &[PathBuf], dest: &Path, p: &Progress) -> Result<(), String> {
         walk(src, PathBuf::from(name), &mut entries).map_err(|e| format!("{}: {e}", src.display()))?;
     }
     entries.retain(|e| e.0 != dest);
-    p.total_files.store(entries.iter().filter(|e| e.2.is_some()).count() as u64, Relaxed);
-    p.total_bytes.store(entries.iter().filter_map(|e| e.2).sum(), Relaxed);
     let file = fs::File::create(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
     let mut w = Writer::new(std::io::BufWriter::with_capacity(1 << 20, file));
     let err = |e: &dyn std::fmt::Display, path: &Path| format!("{}: {e}", path.display());
-    for (src, rel, size) in &entries {
-        if size.is_none() {
-            w.add_dir(&zip_name(rel), zipx::dos_time(src)).map_err(|e| err(&e, src))?;
+    let (mut tf, mut tb) = (0u64, 0u64);
+    let mut small = Vec::new();
+    let mut big = Vec::new();
+    for e in &entries {
+        match e.2 {
+            None => w.add_dir(&zip_name(&e.1), zipx::dos_time(&e.0)).map_err(|x| err(&x, &e.0))?,
+            Some(sz) => {
+                tf += 1;
+                tb += sz;
+                if sz <= PAR_MAX { small.push(e); } else { big.push(e); }
+            }
         }
     }
-    let small: Vec<&Entry> = entries.iter().filter(|e| e.2.is_some_and(|s| s <= PAR_MAX)).collect();
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let next = AtomicU64::new(0);
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Prepared, String>>(threads * 2);
-    let written: Result<(), String> = std::thread::scope(|s| {
-        for _ in 0..threads {
-            let tx = tx.clone();
-            let (small, next) = (&small, &next);
-            s.spawn(move || {
-                while let Some(e) = small.get(next.fetch_add(1, Relaxed) as usize) {
-                    let r = zipx::prepare(zip_name(&e.1), &e.0).map_err(|x| format!("{}: {x}", e.0.display()));
-                    if tx.send(r).is_err() {
-                        break;
+    p.total_files.store(tf, Relaxed);
+    p.total_bytes.store(tb, Relaxed);
+    if !small.is_empty() {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(small.len());
+        let next = AtomicU64::new(0);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Prepared, String>>(threads * 2);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let tx = tx.clone();
+                let (small, next) = (&small, &next);
+                s.spawn(move || {
+                    while let Some(e) = small.get(next.fetch_add(1, Relaxed) as usize) {
+                        if p.cancelled() {
+                            break;
+                        }
+                        let r = zipx::prepare(zip_name(&e.1), &e.0).map_err(|x| format!("{}: {x}", e.0.display()));
+                        if tx.send(r).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
-        }
-        drop(tx);
-        for r in rx {
-            if p.cancelled() {
-                return Err("Cancelled".to_string());
+                });
             }
-            let f = r?;
-            let n = f.uncompressed_size();
-            w.add_prepared(f).map_err(|e| e.to_string())?;
-            p.bytes.fetch_add(n, Relaxed);
-            p.files.fetch_add(1, Relaxed);
-        }
-        Ok(())
-    });
-    written?;
-    for (src, rel, _) in entries.iter().filter(|e| e.2.is_some_and(|s| s > PAR_MAX)) {
-        w.add_stream(zip_name(rel), src, |n| { p.bytes.fetch_add(n, Relaxed); !p.cancelled() }).map_err(|e| err(&e, src))?;
+            drop(tx);
+            for r in rx {
+                if p.cancelled() {
+                    return Err("Cancelled".to_string());
+                }
+                let f = r?;
+                let n = f.uncompressed_size();
+                w.add_prepared(f).map_err(|e| e.to_string())?;
+                p.bytes.fetch_add(n, Relaxed);
+                p.files.fetch_add(1, Relaxed);
+            }
+            Ok(())
+        })?;
+    }
+    for e in big {
+        w.add_stream(zip_name(&e.1), &e.0, |n| { p.bytes.fetch_add(n, Relaxed); !p.cancelled() }).map_err(|x| err(&x, &e.0))?;
         p.files.fetch_add(1, Relaxed);
     }
     w.finish().map_err(|e| err(&e, dest))?;
     Ok(())
-}
-
-fn collect_zip_entries(root: &Path, prefix: &str, dirs: &mut Vec<(String, (u16, u16))>, files: &mut Vec<(String, PathBuf, u64)>) {
-    let Ok(rd) = fs::read_dir(root) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        let name = format!("{prefix}/{}", e.file_name().to_string_lossy());
-        if p.is_dir() {
-            dirs.push((name.clone(), crate::zipx::dos_time(&p)));
-            collect_zip_entries(&p, &name, dirs, files);
-        } else if let Ok(m) = e.metadata() {
-            files.push((name, p, m.len()));
-        }
-    }
 }
 
 pub fn compress(h: isize, paths: Vec<PathBuf>, dir: PathBuf) -> bool {
@@ -315,43 +364,7 @@ pub fn compress(h: isize, paths: Vec<PathBuf>, dir: PathBuf) -> bool {
     let stem = if base.is_empty() { "Archive".to_string() } else { base };
     let out_zip = free_name(&dir, &format!("{stem}.zip"), false);
     let what = format!("Compressing {}", out_zip.file_name().unwrap_or_default().to_string_lossy());
-    spawn(h, what, move |p| {
-        let mut dirs = vec![];
-        let mut files = vec![];
-        for src in &paths {
-            let name = src.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            if src.is_dir() {
-                dirs.push((name.clone(), crate::zipx::dos_time(src)));
-                collect_zip_entries(src, &name, &mut dirs, &mut files);
-            } else if let Ok(m) = fs::metadata(src) {
-                files.push((name, src.clone(), m.len()));
-            }
-        }
-        p.total_files.store(files.len() as u64, Relaxed);
-        p.total_bytes.store(files.iter().map(|f| f.2).sum(), Relaxed);
-        let f = fs::File::create(&out_zip).map_err(|e| e.to_string())?;
-        let mut w = crate::zipx::Writer::new(std::io::BufWriter::with_capacity(1 << 20, f));
-        for (d, tm) in dirs {
-            w.add_dir(&d, tm).map_err(|e| e.to_string())?;
-        }
-        for (name, path, sz) in files {
-            if p.cancelled() {
-                drop(w);
-                let _ = fs::remove_file(&out_zip);
-                return Ok(());
-            }
-            if sz <= crate::zipx::CHUNK as u64 {
-                let prep = crate::zipx::prepare(name, &path).map_err(|e| e.to_string())?;
-                w.add_prepared(prep).map_err(|e| e.to_string())?;
-                p.bytes.fetch_add(sz, Relaxed);
-            } else {
-                w.add_stream(name, &path, |n| { p.bytes.fetch_add(n, Relaxed); !p.cancelled() }).map_err(|e| e.to_string())?;
-            }
-            p.files.fetch_add(1, Relaxed);
-        }
-        w.finish().map_err(|e| e.to_string())?;
-        Ok(())
-    })
+    spawn(h, what, move |p| zip_now(&paths, &out_zip, p).inspect_err(|_| _ = fs::remove_file(&out_zip)).or_else(|e| if p.cancelled() { Ok(()) } else { Err(e) }))
 }
 
 pub fn is_archive(p: &Path) -> bool {

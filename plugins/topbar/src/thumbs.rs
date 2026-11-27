@@ -124,35 +124,7 @@ pub(crate) unsafe fn paint(host: HWND, wins: &[HWND], rects: &[RECT], ids: &[isi
         static PV_BUF: RefCell<LayeredBuf> = const { RefCell::new(LayeredBuf::new()) };
         static PV_FONT: std::cell::Cell<(i32, HFONT)> = const { std::cell::Cell::new((0, null_mut())) };
     }
-    let (mem, _, g) = PV_BUF.with_borrow_mut(|b| b.begin(wdc, r.right, r.bottom, 255));
-    let rad = sc(18);
-    fill(mem, r, pal().bg, rad);
-    if !g.is_null() {
-        use windows_sys::Win32::Graphics::GdiPlus::{GdipDrawPath, GdipDrawRectangle};
-        let argb = 0xFF00_0000 | (pal().line & 255) << 16 | (pal().line & 0xFF00) | (pal().line >> 16 & 255);
-        let mut pen: *mut GpPen = null_mut();
-        GdipCreatePen1(argb, 1.0, UnitPixel, &mut pen);
-        if !pen.is_null() {
-            let (x, y, w, h) = (r.left as f32 + 0.5, r.top as f32 + 0.5, (r.right - r.left) as f32 - 1.0, (r.bottom - r.top) as f32 - 1.0);
-            if rad <= 0 || style().square() {
-                GdipDrawRectangle(g, pen, x, y, w, h);
-            } else {
-                let d = (rad as f32).min(w).min(h);
-                let mut path: *mut GpPath = null_mut();
-                GdipCreatePath(FillModeAlternate, &mut path);
-                if !path.is_null() {
-                    GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
-                    GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
-                    GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
-                    GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
-                    GdipClosePathFigure(path);
-                    GdipDrawPath(g, pen, path);
-                    GdipDeletePath(path);
-                }
-            }
-            GdipDeletePen(pen);
-        }
-    }
+    let (mem, _, _) = PV_BUF.with_borrow_mut(|b| b.begin(wdc, r.right, r.bottom));
     let fh = sc(12);
     let (cfh, mut f) = PV_FONT.get();
     if cfh != fh || f.is_null() {
@@ -173,6 +145,8 @@ pub(crate) unsafe fn paint(host: HWND, wins: &[HWND], rects: &[RECT], ids: &[isi
             let on = sel == Some(k);
             if on {
                 fill(mem, *c, pal().accent, sc(12));
+            } else {
+                stroke_round(mem, *c, pal().line, 255, sc(12), 1.0);
             }
             fill(mem, RECT { left: c.left + sc(2), top: c.top + sc(2), right: c.right - sc(2), bottom: c.bottom - sc(2) }, if on { pal().active } else { pal().hover }, sc(10));
             let ic = icons.and_then(|v| v.get(k)).copied().filter(|h| !h.is_null()).unwrap_or(fallback_ic);
@@ -222,11 +196,8 @@ pub(crate) unsafe fn show_preview(btn: i32, cx: i32) -> bool {
 }
 
 unsafe fn layout(pv: HWND, wins: Vec<HWND>, cx: i32) {
-    let pad = sc(GAP);
     let (scw, sch) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-    let (mut rects, tw, th) = grid(wins.len(), scw - sc(16) - 2 * pad, sch / 2, sc(CARD_W), sc(CARD_H), sc(GAP));
-    rects.iter_mut().for_each(|r| *r = RECT { left: r.left + pad, top: r.top + pad, right: r.right + pad, bottom: r.bottom + pad });
-    let (w, h) = (tw + 2 * pad, th + 2 * pad);
+    let (rects, w, h) = grid(wins.len(), scw - sc(16), sch / 2, sc(CARD_W), sc(CARD_H), sc(GAP));
     let old = PV.take();
     let mut ids = old.2;
     unregister(pv, &mut ids);

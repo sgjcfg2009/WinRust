@@ -1,4 +1,4 @@
-use std::{env, fs, io::Write, path::PathBuf, process::Command};
+use std::{env, fmt::Write as _, fs, io::Write, path::PathBuf, process::Command};
 
 const JUNK: &[&str] = &[
     "Clipchamp.Clipchamp", "Microsoft.BingNews", "Microsoft.BingWeather", "Microsoft.BingSearch", "Microsoft.Copilot",
@@ -21,6 +21,12 @@ const PROTECTED: &[&str] = &[
     "Microsoft.WindowsCalculator", "Microsoft.Paint", "Microsoft.ScreenSketch", "Microsoft.Windows.Photos", "Microsoft.WindowsNotepad",
 ];
 
+const OVERRIDE_PROTECTED: &[&str] = &[
+    "Microsoft.Windows.Ai.Copilot.Provider",
+    "Microsoft.Windows.DevHome",
+    "MicrosoftWindows.Client.WebExperience",
+];
+
 const TASKS: &[&str] = &[
     r"\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser",
     r"\Microsoft\Windows\Application Experience\ProgramDataUpdater",
@@ -33,15 +39,17 @@ const TASKS: &[&str] = &[
     r"\Microsoft\Windows\Windows Error Reporting\QueueReporting",
 ];
 
-fn starts(name: &str, list: &[&str]) -> bool {
-    let n = name.to_lowercase();
-    list.iter().any(|p| n.starts_with(&p.to_lowercase()))
+fn starts_ic(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+}
+
+fn contains_ic(s: &str, needle: &str) -> bool {
+    !needle.is_empty() && s.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn is_junk(name: &str) -> bool {
-    let keep = starts(name, PROTECTED) && !starts(name, &["Microsoft.Windows.Ai.Copilot.Provider", "Microsoft.Windows.DevHome", "MicrosoftWindows.Client.WebExperience"]);
-    let n = name.to_lowercase();
-    !keep && JUNK.iter().any(|p| n.starts_with(&p.to_lowercase()) || (p.len() >= 5 && !p.contains('.') && n.contains(&p.to_lowercase())))
+    let keep = PROTECTED.iter().any(|p| starts_ic(name, p)) && !OVERRIDE_PROTECTED.iter().any(|p| starts_ic(name, p));
+    !keep && JUNK.iter().any(|p| starts_ic(name, p) || (p.len() >= 5 && !p.contains('.') && contains_ic(name, p)))
 }
 
 enum Item {
@@ -63,13 +71,17 @@ fn ps(script: &str) -> (bool, String) {
 fn parse(out: &str) -> Vec<Item> {
     let mut v = vec![];
     for l in out.lines().map(str::trim) {
-        let f: Vec<&str> = l.split('|').collect();
-        if f.iter().any(|x| x.contains('\'')) {
+        if l.contains('\'') {
             continue;
         }
-        match f.as_slice() {
-            ["appx", full, name, nonremovable] if *nonremovable != "True" && is_junk(name) => v.push(Item::Appx { full: full.to_string(), name: name.to_string() }),
-            ["prov", pkg, name] if is_junk(name) => v.push(Item::Prov { pkg: pkg.to_string(), name: name.to_string() }),
+        let mut it = l.split('|');
+        match (it.next(), it.next(), it.next(), it.next(), it.next()) {
+            (Some("appx"), Some(full), Some(name), Some(nonremovable), None) if nonremovable != "True" && is_junk(name) => {
+                v.push(Item::Appx { full: full.to_string(), name: name.to_string() });
+            }
+            (Some("prov"), Some(pkg), Some(name), None, None) if is_junk(name) => {
+                v.push(Item::Prov { pkg: pkg.to_string(), name: name.to_string() });
+            }
             _ => {}
         }
     }
@@ -84,8 +96,23 @@ fn found() -> Result<Vec<Item>, String> {
     Ok(parse(&out))
 }
 
-fn task_exists(t: &str) -> bool {
-    run("schtasks.exe", &["/Query", "/TN", t]).0
+fn existing_tasks() -> Vec<&'static str> {
+    let (ok, out) = run("schtasks.exe", &["/Query", "/FO", "CSV", "/NH"]);
+    if !ok {
+        return vec![];
+    }
+    let mut present = Vec::new();
+    for t in TASKS {
+        let found = out.lines().any(|l| {
+            l.strip_prefix('"')
+                .and_then(|r| r.split('"').next())
+                .is_some_and(|name| name.eq_ignore_ascii_case(t))
+        });
+        if found {
+            present.push(*t);
+        }
+    }
+    present
 }
 
 fn onedrive_setup() -> Option<PathBuf> {
@@ -101,36 +128,36 @@ fn edge_setup() -> Option<PathBuf> {
 }
 
 fn plan(od: bool, edge: bool) {
-    println!("{}", "Dry run: nothing is removed. --apply REMOVES it FOR GOOD (no undo).\n");
+    println!("Dry run: nothing is removed. --apply REMOVES it FOR GOOD (no undo).\n");
     match found() {
         Ok(items) => {
             for i in &items {
                 match i {
-                    Item::Appx { name, .. } => println!("{}", format!("  app (installed)    {name}")),
-                    Item::Prov { name, .. } => println!("{}", format!("  app (provisioned)  {name}")),
+                    Item::Appx { name, .. } => println!("  app (installed)    {name}"),
+                    Item::Prov { name, .. } => println!("  app (provisioned)  {name}"),
                 }
             }
-            println!("{}", format!("  {} app entries found", items.len()));
+            println!("  {} app entries found", items.len());
         }
         Err(e) => println!("  {e}"),
     }
-    for t in TASKS.iter().filter(|t| task_exists(t)) {
-        println!("{}", format!("  task               {t}"));
+    for t in existing_tasks() {
+        println!("  task               {t}");
     }
     if od {
-        println!("{}", format!("  OneDrive           {}", onedrive_setup().map_or("not present".to_string(), |p| p.display().to_string())));
+        println!("  OneDrive           {}", onedrive_setup().map_or("not present".to_string(), |p| p.display().to_string()));
     }
     if edge {
-        println!("{}", format!("  Edge               {}", edge_setup().map_or("not present".to_string(), |p| p.display().to_string())));
+        println!("  Edge               {}", edge_setup().map_or("not present".to_string(), |p| p.display().to_string()));
     }
 }
 
 fn apply(od: bool, edge: bool) -> Result<(), String> {
     let dir = PathBuf::from(env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join("winrust-purge");
-    fs::create_dir_all(&dir).map_err(|e| format!("{0}: {1} (run as admin)", dir.display(), e))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e} (run as admin)", dir.display()))?;
     let mut log = fs::OpenOptions::new().create(true).append(true).open(dir.join("removed.txt")).map_err(|e| e.to_string())?;
-    let mut failed = 0;
-    let mut did = |what: String, ok: bool| {
+    let mut failed = 0u32;
+    let mut did = |what: &str, ok: bool| {
         println!("{}  {what}", if ok { "removed" } else { "FAILED " });
         if ok {
             let _ = writeln!(log, "{what}");
@@ -138,33 +165,57 @@ fn apply(od: bool, edge: bool) -> Result<(), String> {
             failed += 1;
         }
     };
-    for i in found()? {
-        match i {
-            Item::Appx { full, name } => did(format!("app {name}"), ps(&format!("Remove-AppxPackage -Package '{full}' -AllUsers -ErrorAction Stop")).0),
-            Item::Prov { pkg, name } => did(format!("provisioned {name}"), ps(&format!("Remove-AppxProvisionedPackage -Online -PackageName '{pkg}' -ErrorAction Stop")).0),
+    let items = found()?;
+    if !items.is_empty() {
+        let mut script = String::with_capacity(items.len() * 96);
+        for (idx, i) in items.iter().enumerate() {
+            match i {
+                Item::Appx { full, .. } => {
+                    let _ = writeln!(script, "try {{ Remove-AppxPackage -Package '{full}' -AllUsers -ErrorAction Stop; 'OK|{idx}' }} catch {{ 'ERR|{idx}' }}");
+                }
+                Item::Prov { pkg, .. } => {
+                    let _ = writeln!(script, "try {{ Remove-AppxProvisionedPackage -Online -PackageName '{pkg}' -ErrorAction Stop | Out-Null; 'OK|{idx}' }} catch {{ 'ERR|{idx}' }}");
+                }
+            }
+        }
+        let (_, out) = ps(&script);
+        let mut ok_flags = vec![false; items.len()];
+        for l in out.lines().map(str::trim) {
+            if let Some(rest) = l.strip_prefix("OK|")
+                && let Ok(idx) = rest.parse::<usize>()
+                && let Some(slot) = ok_flags.get_mut(idx)
+            {
+                *slot = true;
+            }
+        }
+        for (i, ok) in items.iter().zip(ok_flags) {
+            match i {
+                Item::Appx { name, .. } => did(&format!("app {name}"), ok),
+                Item::Prov { name, .. } => did(&format!("provisioned {name}"), ok),
+            }
         }
     }
-    for t in TASKS.iter().filter(|t| task_exists(t)) {
-        did(format!("task {t}"), run("schtasks.exe", &["/Delete", "/TN", t, "/F"]).0);
+    for t in existing_tasks() {
+        did(&format!("task {t}"), run("schtasks.exe", &["/Delete", "/TN", t, "/F"]).0);
     }
     if od {
         let _ = run("taskkill", &["/f", "/im", "OneDrive.exe"]);
         match onedrive_setup() {
-            Some(p) => did("OneDrive".into(), run(&p.display().to_string(), &["/uninstall"]).0),
-            None => println!("{}", "skip     OneDrive: not present"),
+            Some(p) => did("OneDrive", run(&p.display().to_string(), &["/uninstall"]).0),
+            None => println!("skip     OneDrive: not present"),
         }
     }
     if edge {
         match edge_setup() {
             Some(p) => {
                 let _ = run("reg", &["add", r"HKLM\SOFTWARE\Microsoft\EdgeUpdateDev", "/v", "AllowUninstall", "/t", "REG_SZ", "/d", "", "/f"]);
-                did("Edge (best effort, Windows may refuse)".into(), run(&p.display().to_string(), &["--uninstall", "--system-level", "--verbose-logging", "--force-uninstall"]).0)
+                did("Edge (best effort, Windows may refuse)", run(&p.display().to_string(), &["--uninstall", "--system-level", "--verbose-logging", "--force-uninstall"]).0);
             }
-            None => println!("{}", "skip     Edge: not present"),
+            None => println!("skip     Edge: not present"),
         }
     }
-    println!("{}", format!("\nThis cannot be undone. A log of what was removed: {}", dir.join("removed.txt").display()));
-    if failed > 0 { Err(format!("{} item(s) failed (run as administrator)", failed)) } else { Ok(()) }
+    println!("\nThis cannot be undone. A log of what was removed: {}", dir.join("removed.txt").display());
+    if failed > 0 { Err(format!("{failed} item(s) failed (run as administrator)")) } else { Ok(()) }
 }
 
 fn main() {
@@ -173,14 +224,12 @@ fn main() {
     let has = |f: &str| a.iter().any(|x| x == f);
     let r = if has("--ask") {
         plan(has("--onedrive"), has("--edge"));
-        print!("{}", "
-This REMOVES the apps above FOR GOOD, there is no undo. Type YES to continue: ");
+        print!("\nThis REMOVES the apps above FOR GOOD, there is no undo. Type YES to continue: ");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
-        let r = if line.trim() == "YES" { apply(has("--onedrive"), has("--edge")) } else { println!("{}", "Nothing removed."); Ok(()) };
-        println!("{}", "
-Press Enter to close.");
+        let r = if line.trim() == "YES" { apply(has("--onedrive"), has("--edge")) } else { println!("Nothing removed."); Ok(()) };
+        println!("\nPress Enter to close.");
         let _ = std::io::stdin().read_line(&mut line);
         r
     } else if has("--apply") {

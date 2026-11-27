@@ -194,7 +194,7 @@ impl App {
                     }
                     if row.icon_path.is_some() || page == Page::Processes || (page == Page::Users && row.depth > 0) {
                         let sz = g.px(16.0);
-                        let ico = row.icon_path.as_deref().and_then(|p| d.res.get(p)).map_or(0, |r| r.icon);
+                        let ico = row.icon_path.as_deref().map_or(0, |p| d.res.icon(p));
                         g.icon(if ico != 0 { ico } else { d.res.generic_icon }, x, y + (row_h - sz) / 2, sz);
                         x += sz + g.px(8.0);
                     }
@@ -453,18 +453,15 @@ impl App {
     }
 }
 
-fn agg_value(d: &Data, m: Metric) -> f64 {
-    match m {
+fn agg_text(d: &Data, m: Metric) -> String {
+    let v = match m {
         Metric::Cpu => d.cpu_total as f64,
         Metric::Mem => d.mem_pct as f64,
         Metric::Disk => d.sample.disk_active as f64,
         Metric::Net => d.sample.net_util as f64,
         Metric::Gpu => d.sample.gpu_total as f64,
-    }
-}
-
-fn agg_text(d: &Data, m: Metric) -> String {
-    format!("{:.0}%", agg_value(d, m))
+    };
+    format!("{v:.0}%")
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

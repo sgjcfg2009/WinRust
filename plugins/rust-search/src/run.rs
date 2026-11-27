@@ -23,9 +23,14 @@ pub fn expand(s: &str) -> String {
         out.push_str(&rest[..a]);
         let after = &rest[a + 1..];
         match after.find('%') {
-            Some(b) if b > 0 && std::env::var(&after[..b]).is_ok() => {
-                out.push_str(&std::env::var(&after[..b]).unwrap());
-                rest = &after[b + 1..];
+            Some(b) if b > 0 => {
+                if let Ok(val) = std::env::var(&after[..b]) {
+                    out.push_str(&val);
+                    rest = &after[b + 1..];
+                } else {
+                    out.push('%');
+                    rest = after;
+                }
             }
             _ => {
                 out.push('%');
@@ -126,17 +131,16 @@ pub fn describe(line: &str) -> Option<usize> {
 
 pub fn programs() -> Vec<String> {
     let mut v: Vec<String> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .unwrap_or_default()
-        .iter()
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .filter_map(|d| std::fs::read_dir(d).ok())
         .flatten()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .chain(app_paths())
-        .filter_map(|n| n.to_lowercase().ends_with(".exe").then(|| n[..n.len() - 4].to_string()))
+        .filter_map(|n| (n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(".exe")).then(|| n[..n.len() - 4].to_string()))
         .collect();
-    v.sort_by_key(|s| s.to_lowercase());
+    v.sort_by_cached_key(|s| s.to_lowercase());
     v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     v
 }

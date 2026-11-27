@@ -189,7 +189,7 @@ fn open_volume(drive: char) -> Result<HANDLE, String> {
     Ok(h)
 }
 
-fn records(b: &[u8], mut f: impl FnMut(u64, u64, u32, String)) {
+fn records(b: &[u8], buf: &mut String, mut f: impl FnMut(u64, u64, u32, &str)) {
     let mut off = 8;
     while off + 60 <= b.len() {
         let r = &b[off..];
@@ -202,8 +202,11 @@ fn records(b: &[u8], mut f: impl FnMut(u64, u64, u32, String)) {
         let reason = u32::from_le_bytes(r[40..44].try_into().unwrap());
         let nlen = u16::from_le_bytes(r[56..58].try_into().unwrap()) as usize;
         let noff = u16::from_le_bytes(r[58..60].try_into().unwrap()) as usize;
-        let name: Vec<u16> = r[noff..noff + nlen].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        f(frn, parent, reason, String::from_utf16_lossy(&name));
+        buf.clear();
+        for c in char::decode_utf16(r[noff..noff + nlen].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]))) {
+            buf.push(c.unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+        f(frn, parent, reason, buf);
         off += len;
     }
 }
@@ -212,6 +215,7 @@ fn scan(h: HANDLE) -> Result<Index, String> {
     let mut idx = Index::new();
     let mut med = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: i64::MAX };
     let mut buf = vec![0u8; 1 << 20];
+    let mut name = String::with_capacity(260);
     loop {
         let mut n = 0u32;
         let ok = unsafe {
@@ -235,8 +239,8 @@ fn scan(h: HANDLE) -> Result<Index, String> {
         }
         let b = &buf[..n as usize];
         med.StartFileReferenceNumber = u64::from_le_bytes(b[..8].try_into().unwrap());
-        records(b, |frn, parent, _, name| {
-            idx.insert(frn, parent, &name);
+        records(b, &mut name, |frn, parent, _, name| {
+            idx.insert(frn, parent, name);
         });
     }
 }
@@ -271,6 +275,7 @@ fn tail(drive: char, sh: &Mutex<Shared>) {
         let g = sh.lock().unwrap();
         (g.jid, g.usn)
     };
+    let mut name = String::with_capacity(260);
     loop {
         let rd = READ_USN_JOURNAL_DATA_V0 { StartUsn: usn, ReasonMask: mask, ReturnOnlyOnClose: 0, Timeout: 1, BytesToWaitFor: 1, UsnJournalID: jid };
         let mut n = 0u32;
@@ -286,11 +291,11 @@ fn tail(drive: char, sh: &Mutex<Shared>) {
         usn = i64::from_le_bytes(b[..8].try_into().unwrap());
         let mut g = sh.lock().unwrap();
         if b.len() > 8 {
-            records(b, |frn, parent, reason, name| {
+            records(b, &mut name, |frn, parent, reason, name| {
                 if reason & USN_REASON_FILE_DELETE != 0 {
                     g.idx.remove(frn);
                 } else {
-                    g.idx.insert(frn, parent, &name);
+                    g.idx.insert(frn, parent, name);
                 }
             });
             g.dirty = true;
@@ -392,14 +397,25 @@ fn contains_ci(name: &str, t: &str) -> bool {
     }
 }
 
+fn ends_with_ci_ascii(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len() && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 fn query(idx: &Index, drive: char, terms: &[String]) -> (Vec<String>, usize) {
+    let t0 = &terms[0];
+    let t0_ascii = t0.is_ascii();
     let mut hits: Vec<(u8, u8, usize, u32)> = idx.par_filter_map(|rec, n| {
         if !terms.iter().all(|t| contains_ci(n, t)) {
             return None;
         }
-        let n = n.to_lowercase();
-        let rank = if n == terms[0] { 0 } else if n.starts_with(&terms[0]) { 1 } else { 2 };
-        Some((!(n.ends_with(".lnk") || n.ends_with(".exe")) as u8, rank, n.len(), rec))
+        let rank = if n.is_ascii() && t0_ascii {
+            let (nb, tb) = (n.as_bytes(), t0.as_bytes());
+            if nb.eq_ignore_ascii_case(tb) { 0 } else if nb.len() >= tb.len() && nb[..tb.len()].eq_ignore_ascii_case(tb) { 1 } else { 2 }
+        } else {
+            let low = n.to_lowercase();
+            if low == *t0 { 0 } else if low.starts_with(t0) { 1 } else { 2 }
+        };
+        Some((!(ends_with_ci_ascii(n, ".lnk") || ends_with_ci_ascii(n, ".exe")) as u8, rank, n.len(), rec))
     });
     let total = hits.len();
     const CAND: usize = 1000;
@@ -473,6 +489,11 @@ fn serve(drive: char, allow: Option<String>) -> Result<(), String> {
     let pipe = unsafe {
         CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 1 << 16, 1 << 16, 0, sa.as_ref().map_or(ptr::null(), |s| s as *const _))
     };
+    if let Some(s) = sa {
+        if !s.lpSecurityDescriptor.is_null() {
+            unsafe { LocalFree(s.lpSecurityDescriptor as _) };
+        }
+    }
     if pipe == INVALID_HANDLE_VALUE {
         return Err(format!("cannot create pipe (error {}); is a server already running?", unsafe { GetLastError() }));
     }
@@ -499,7 +520,10 @@ fn bench(drive: char, args: &[String]) -> Result<(), String> {
     if terms.is_empty() {
         return Err("usage: rs --bench <term>".into());
     }
-    let idx = scan(open_volume(drive)?)?;
+    let h = open_volume(drive)?;
+    let idx = scan(h);
+    unsafe { CloseHandle(h) };
+    let idx = idx?;
     for _ in 0..5 {
         let t = Instant::now();
         let (_, total) = query(&idx, drive, &terms);
@@ -511,8 +535,10 @@ fn bench(drive: char, args: &[String]) -> Result<(), String> {
 const TASK: &str = "rs-search";
 
 fn ps(script: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
     let o = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(0x0800_0000)
         .output()
         .map_err(|e| format!("cannot run powershell: {e}"))?;
     if o.status.success() {

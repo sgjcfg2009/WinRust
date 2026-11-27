@@ -100,6 +100,7 @@ struct St {
     fonts: [isize; 5],
     mem_dc: isize,
     mem_bmp: isize,
+    mem_old_bmp: isize,
     mem_bits: isize,
     mem_gp: isize,
     mem_w: i32,
@@ -240,15 +241,22 @@ unsafe fn show(h: HWND, run: bool) {
     if run && st(|s| s.programs.is_empty()) {
         spawn_programs_load(h as isize);
     }
-    let (x, y) = {
+    let (x, y, max_w, max_h) = {
         let mut pt: POINT = zeroed();
         GetCursorPos(&mut pt);
         let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
         let mut mi: MONITORINFO = zeroed();
         mi.cbSize = size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(mon, &mut mi);
-        let w = st(|s| (W as f32 * s.scale) as i32);
-        (mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2, mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top) / 5)
+        let mw = (mi.rcWork.right - mi.rcWork.left - 16).max(320);
+        let mh = (mi.rcWork.bottom - mi.rcWork.top - 16).max(160);
+        let w = st(|s| ((W as f32 * s.scale) as i32).min(mw));
+        (
+            mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2,
+            mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top) / 5,
+            mw,
+            mh,
+        )
     };
     let (w, hgt) = st(|s| {
         s.text.clear();
@@ -262,10 +270,10 @@ unsafe fn show(h: HWND, run: bool) {
             s.purge = None;
         }
         (s.top, s.sel, s.sel_f, s.caret) = (0, 0, 0.0, true);
-        s.th = target_height(s);
+        s.th = target_height(s).min(max_h as f32);
         (s.height, s.ta, s.x, s.y) = (s.th, 1.0, x, y);
-        let w = (W as f32 * s.scale) as i32;
-        let hgt = s.height.round() as i32;
+        let w = ((W as f32 * s.scale) as i32).min(max_w);
+        let hgt = (s.height.round() as i32).min(max_h);
         s.win_h = hgt;
         (w, hgt)
     });
@@ -322,11 +330,19 @@ unsafe fn open(h: HWND, reveal: bool) {
     }
 }
 
+fn rust_explorer_exe() -> Option<std::path::PathBuf> {
+    std::env::var_os("ProgramFiles")
+        .map(|pf| std::path::PathBuf::from(pf).join(r"rust-explorer\rust-explorer.exe"))
+        .filter(|p| p.is_file())
+}
+
 fn open_in_rust_explorer(dir: &str) -> bool {
-    let Some(rx) = std::env::var_os("ProgramFiles").map(|pf| std::path::PathBuf::from(pf).join(r"rust-explorer\rust-explorer.exe")).filter(|p| p.is_file()) else {
-        return false;
-    };
-    std::process::Command::new(rx).arg(dir).spawn().is_ok()
+    rust_explorer_exe().is_some_and(|rx| std::process::Command::new(rx).arg(dir).spawn().is_ok())
+}
+
+fn remember_run(line: &str) {
+    run::remember(line);
+    st(|s| run::remember_in(&mut s.run_history, line));
 }
 
 unsafe fn run_selected(h: HWND, admin: bool) {
@@ -337,22 +353,19 @@ unsafe fn run_selected(h: HWND, admin: bool) {
     if !admin && args.is_empty() {
         if file.to_ascii_lowercase().starts_with("ms-settings:") {
             winrust_common::settings::open(&file);
-            run::remember(&line);
-            st(|s| run::remember_in(&mut s.run_history, &line));
+            remember_run(&line);
             return;
         }
         if file.eq_ignore_ascii_case("shell:MyComputerFolder") {
-            if let Some(rx) = std::env::var_os("ProgramFiles").map(|pf| std::path::PathBuf::from(pf).join(r"rust-explorer\rust-explorer.exe")).filter(|p| p.is_file()) {
+            if let Some(rx) = rust_explorer_exe() {
                 if std::process::Command::new(rx).spawn().is_ok() {
-                    run::remember(&line);
-                    st(|s| run::remember_in(&mut s.run_history, &line));
+                    remember_run(&line);
                     return;
                 }
             }
         }
         if std::path::Path::new(&file).is_dir() && open_in_rust_explorer(&file) {
-            run::remember(&line);
-            st(|s| run::remember_in(&mut s.run_history, &line));
+            remember_run(&line);
             return;
         }
     }
@@ -366,8 +379,7 @@ unsafe fn run_selected(h: HWND, admin: bool) {
     ei.lpDirectory = dir_w.as_ptr();
     ei.nShow = SW_SHOWNORMAL;
     if ShellExecuteExW(&mut ei) != 0 {
-        run::remember(&line);
-        st(|s| run::remember_in(&mut s.run_history, &line));
+        remember_run(&line);
     } else if GetLastError() != ERROR_CANCELLED {
         note(&format!("Windows cannot find '{}'. Make sure you typed the name correctly, and then try again.", file), MB_ICONERROR);
     }
@@ -403,6 +415,77 @@ unsafe fn on_char(h: HWND, c: u16) {
                 s.text.push(c);
             }
         });
+        text_changed(h);
+    }
+}
+
+unsafe fn clip_copy(h: HWND, cut: bool) {
+    use windows_sys::Win32::System::{
+        DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+        Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
+    };
+    let len = st(|s| s.text.len());
+    if len == 0 || OpenClipboard(h) == 0 {
+        return;
+    }
+    EmptyClipboard();
+    let hg = GlobalAlloc(GMEM_MOVEABLE, (len + 1) * 2);
+    if !hg.is_null() {
+        let p = GlobalLock(hg) as *mut u16;
+        if !p.is_null() {
+            st(|s| std::ptr::copy_nonoverlapping(s.text.as_ptr(), p, len));
+            *p.add(len) = 0;
+            GlobalUnlock(hg);
+            if SetClipboardData(13, hg).is_null() {
+                windows_sys::Win32::Foundation::GlobalFree(hg);
+            }
+        } else {
+            windows_sys::Win32::Foundation::GlobalFree(hg);
+        }
+    }
+    CloseClipboard();
+    if cut {
+        st(|s| {
+            s.text.clear();
+            s.caret = true;
+        });
+        text_changed(h);
+    }
+}
+
+unsafe fn clip_paste(h: HWND) {
+    use windows_sys::Win32::System::{
+        DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
+        Memory::{GlobalLock, GlobalUnlock},
+    };
+    if st(|s| s.menu.is_some() || s.purge.is_some()) || OpenClipboard(h) == 0 {
+        return;
+    }
+    let hd = GetClipboardData(13);
+    let mut pasted = false;
+    if !hd.is_null() {
+        let p = GlobalLock(hd) as *const u16;
+        if !p.is_null() {
+            st(|s| {
+                let mut i = 0usize;
+                while s.text.len() < 200 {
+                    let c = *p.add(i);
+                    if c == 0 {
+                        break;
+                    }
+                    if c >= 0x20 {
+                        s.text.push(c);
+                        pasted = true;
+                    }
+                    i += 1;
+                }
+                s.caret = true;
+            });
+            GlobalUnlock(hd);
+        }
+    }
+    CloseClipboard();
+    if pasted {
         text_changed(h);
     }
 }
@@ -558,6 +641,9 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
                 VK_NEXT => move_sel(MAX_ROWS as isize),
                 VK_PRIOR => move_sel(-(MAX_ROWS as isize)),
                 VK_BACK => backspace(h, ctrl),
+                0x43 if ctrl => clip_copy(h, false),
+                0x58 if ctrl => clip_copy(h, true),
+                0x56 if ctrl => clip_paste(h),
                 VK_TAB if st(|s| s.run) => {
                     if let Some(r) = st(|s| s.results.get(s.sel).cloned()) {
                         st(|s| (s.text, s.caret) = (r.encode_utf16().collect(), true));
@@ -661,12 +747,31 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
             0
         }
         WM_ERASEBKGND => 1,
+        0x02E0 => {
+            let dpi = (wp & 0xFFFF) as f32;
+            if dpi > 0.0 {
+                st(|s| {
+                    s.scale = dpi / 96.0;
+                    s.th = target_height(s);
+                });
+                apply_style(h);
+                sync_window(h);
+            }
+            0
+        }
         WM_PAINT => {
             paint(h);
             0
         }
         WM_DESTROY => {
+            UnregisterHotKey(h, 1);
             st(|s| {
+                for f in s.fonts.iter_mut() {
+                    if *f != 0 {
+                        DeleteObject(*f as _);
+                        *f = 0;
+                    }
+                }
                 for (_, img) in s.icons.drain() {
                     if img != 0 {
                         GdipDisposeImage(img as _);
@@ -676,13 +781,20 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
                     GdipDeleteGraphics(s.mem_gp as _);
                     s.mem_gp = 0;
                 }
-                if s.mem_bmp != 0 {
-                    DeleteObject(s.mem_bmp as _);
-                    s.mem_bmp = 0;
-                }
                 if s.mem_dc != 0 {
+                    if s.mem_old_bmp != 0 {
+                        SelectObject(s.mem_dc as _, s.mem_old_bmp as _);
+                        s.mem_old_bmp = 0;
+                    }
+                    if s.mem_bmp != 0 {
+                        DeleteObject(s.mem_bmp as _);
+                        s.mem_bmp = 0;
+                    }
                     DeleteDC(s.mem_dc as _);
                     s.mem_dc = 0;
+                } else if s.mem_bmp != 0 {
+                    DeleteObject(s.mem_bmp as _);
+                    s.mem_bmp = 0;
                 }
             });
             PostQuitMessage(0);
@@ -1233,23 +1345,7 @@ unsafe fn draw_purge(dc: HDC, g: *mut GpGraphics, bits: *mut u32, stride: i32, h
 
 unsafe fn icon_path(p: &str) -> String {
     use windows_sys::Win32::Storage::FileSystem::SearchPathW;
-    let mut e = String::new();
-    let mut rest = p;
-    while let Some(a) = rest.find('%') {
-        e.push_str(&rest[..a]);
-        let after = &rest[a + 1..];
-        match after.find('%').and_then(|b| std::env::var(&after[..b]).ok().map(|v| (b, v))) {
-            Some((b, v)) => {
-                e.push_str(&v);
-                rest = &after[b + 1..];
-            }
-            None => {
-                e.push('%');
-                rest = after;
-            }
-        }
-    }
-    e.push_str(rest);
+    let e = run::expand(p);
     if e.contains(['\\', '/', ':']) {
         return e;
     }
@@ -1369,7 +1465,10 @@ unsafe fn paint(h: HWND) {
             let b = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut pbits, null_mut(), 0);
             s.mem_bmp = b as isize;
             s.mem_bits = pbits as isize;
-            SelectObject(s.mem_dc as _, b as _);
+            let prev = SelectObject(s.mem_dc as _, b as _);
+            if s.mem_old_bmp == 0 {
+                s.mem_old_bmp = prev as isize;
+            }
             let mut g: *mut GpGraphics = null_mut();
             GdipCreateFromHDC(s.mem_dc as _, &mut g);
             GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
@@ -1395,7 +1494,7 @@ unsafe fn fill(dc: HDC, l: i32, t: i32, r: i32, b: i32, c: Rgb) {
     FillRect(dc, &RECT { left: l, top: t, right: r, bottom: b }, GetStockObject(DC_BRUSH) as _);
 }
 
-unsafe fn round_rect(g: *mut GpGraphics, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgb) {
+unsafe fn make_round_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> *mut GpPath {
     let r = if style().square() { 0.5 } else { r };
     let mut path: *mut GpPath = null_mut();
     GdipCreatePath(FillModeAlternate, &mut path);
@@ -1405,6 +1504,11 @@ unsafe fn round_rect(g: *mut GpGraphics, x: f32, y: f32, w: f32, h: f32, r: f32,
     GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
     GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
     GdipClosePathFigure(path);
+    path
+}
+
+unsafe fn round_rect(g: *mut GpGraphics, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgb) {
+    let path = make_round_path(x, y, w, h, r);
     let mut b: *mut GpSolidFill = null_mut();
     GdipCreateSolidFill(argb(c), &mut b);
     GdipFillPath(g, b as *mut GpBrush, path);
@@ -1413,15 +1517,7 @@ unsafe fn round_rect(g: *mut GpGraphics, x: f32, y: f32, w: f32, h: f32, r: f32,
 }
 
 unsafe fn stroke_round_rect(g: *mut GpGraphics, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgb) {
-    let r = if style().square() { 0.5 } else { r };
-    let mut path: *mut GpPath = null_mut();
-    GdipCreatePath(FillModeAlternate, &mut path);
-    let d = r * 2.0;
-    GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
-    GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
-    GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
-    GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
-    GdipClosePathFigure(path);
+    let path = make_round_path(x, y, w, h, r);
     let mut pen: *mut GpPen = null_mut();
     GdipCreatePen1(argb(c), 1.0, UnitPixel, &mut pen);
     GdipDrawPath(g, pen, path);
@@ -1430,10 +1526,14 @@ unsafe fn stroke_round_rect(g: *mut GpGraphics, x: f32, y: f32, w: f32, h: f32, 
 }
 
 unsafe fn text(dc: HDC, bits: *mut u32, stride: i32, hgt: i32, font: isize, c: Rgb, mut r: RECT, s: &str, flags: u32) {
-    let w: Vec<u16> = s.encode_utf16().collect();
+    thread_local! { static BUF: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) }; }
     let old = SelectObject(dc, font as _);
     SetTextColor(dc, rgb(c));
-    DrawTextW(dc, w.as_ptr(), w.len() as i32, &mut r, flags | DT_NOPREFIX);
+    BUF.with_borrow_mut(|w| {
+        w.clear();
+        w.extend(s.encode_utf16());
+        DrawTextW(dc, w.as_ptr(), w.len() as i32, &mut r, flags | DT_NOPREFIX);
+    });
     SelectObject(dc, old);
     fix_alpha(bits, stride, hgt, r);
 }
@@ -1510,7 +1610,15 @@ unsafe fn draw(dc: HDC, g: *mut GpGraphics, bits: *mut u32, stride: i32, w: i32,
         text(dc, bits, stride, hgt, v.fonts[F_PATH], c_dim(), RECT { left, top: y0 + p(29), right, bottom: y0 + p(47) }, sub, DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     let foot_y = rows_top + (nrows as f32 * row_h) as i32;
-    let more = if v.total > nrows { format!("   \u{2022}   {}", results_text(v.total)) } else { String::new() };
+    let hint: std::borrow::Cow<'_, str> = if v.run {
+        "\u{21B5} run     Ctrl+Shift+\u{21B5} as administrator     Tab complete     Esc close".into()
+    } else if v.renaming {
+        "Type the new name     \u{21B5} rename     Esc cancel".into()
+    } else if v.total > nrows {
+        format!("\u{2191}\u{2193} select     \u{21B5} open     Ctrl+\u{21B5} folder     Right-click menu     Esc close   \u{2022}   {}", results_text(v.total)).into()
+    } else {
+        "\u{2191}\u{2193} select     \u{21B5} open     Ctrl+\u{21B5} folder     Right-click menu     Esc close".into()
+    };
     text(
         dc,
         bits,
@@ -1519,13 +1627,7 @@ unsafe fn draw(dc: HDC, g: *mut GpGraphics, bits: *mut u32, stride: i32, w: i32,
         v.fonts[F_HINT],
         c_faint(),
         RECT { left: p(PAD + 16), top: foot_y + p(4), right: w - p(PAD + 14), bottom: foot_y + p(FOOT_H) },
-        &if v.run {
-            "\u{21B5} run     Ctrl+Shift+\u{21B5} as administrator     Tab complete     Esc close".to_string()
-        } else if v.renaming {
-            "Type the new name     \u{21B5} rename     Esc cancel".to_string()
-        } else {
-            format!("\u{2191}\u{2193} select     \u{21B5} open     Ctrl+\u{21B5} folder     Right-click menu     Esc close{}", more)
-        },
+        &hint,
         DT_SINGLELINE | DT_VCENTER,
     );
 
@@ -1576,9 +1678,11 @@ fn main() {
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("--autostart") {
+        use std::os::windows::process::CommandExt;
         let exe = std::env::current_exe().unwrap();
         let ok = std::process::Command::new("reg")
             .args(winrust_common::reg::user_args(&["add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "rs-launcher", "/t", "REG_SZ", "/d", &format!("\"{}\"", exe.display()), "/f"]))
+            .creation_flags(0x0800_0000)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -1635,6 +1739,7 @@ fn main() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        windows_sys::Win32::Graphics::GdiPlus::GdiplusShutdown(token);
     }
 }
 

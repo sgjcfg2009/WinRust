@@ -228,11 +228,32 @@ pub fn reason_text(code: u32) -> String {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn hex_bytes(raw: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len() * 2);
+    for &b in raw {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xF) as usize] as char);
+    }
+    out
 }
 
 fn profile_xml(name: &str, raw: &[u8], sec: Sec, key: &str, key_type: &str, hidden: bool) -> String {
-    let hex: String = raw.iter().map(|b| format!("{b:02X}")).collect();
+    let hex = hex_bytes(raw);
     let (auth, enc) = sec.names();
     let name = xml_escape(name);
     let hidden = if hidden { "<nonBroadcast>true</nonBroadcast>" } else { "" };
@@ -271,7 +292,7 @@ fn pick(iface: Option<&GUID>) -> Option<(Client, GUID)> {
 }
 
 fn eap_profile_xml(name: &str, raw: &[u8], auth: &str, hidden: bool) -> String {
-    let hex: String = raw.iter().map(|b| format!("{b:02X}")).collect();
+    let hex = hex_bytes(raw);
     let name = xml_escape(name);
     let enc = if auth == "WPA" { "TKIP" } else { "AES" };
     let hidden = if hidden { "<nonBroadcast>true</nonBroadcast>" } else { "" };

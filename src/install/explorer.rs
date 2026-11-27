@@ -43,13 +43,12 @@ fn trim_registry_error(key: &str, name: &str, code: u32) -> String {
 
 fn trim_read((key, name): Dword<'_>) -> Result<Option<u32>, String> {
     let subkey = trim_subkey(key);
-    let value_name = wide(name);
     let mut value = 0u32;
     let mut len = size_of::<u32>() as u32;
-    let code = unsafe {
-        RegGetValueW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), value_name.as_ptr(), RRF_RT_REG_DWORD,
+    let code = with_wide(name, |value_name| unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), value_name, RRF_RT_REG_DWORD,
             null_mut(), (&mut value as *mut u32).cast(), &mut len)
-    };
+    });
     match code {
         ERROR_SUCCESS if len == size_of::<u32>() as u32 => Ok(Some(value)),
         ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
@@ -60,7 +59,6 @@ fn trim_read((key, name): Dword<'_>) -> Result<Option<u32>, String> {
 
 fn trim_write((key, name): Dword<'_>, value: u32) -> Result<(), String> {
     let subkey = trim_subkey(key);
-    let value_name = wide(name);
     let mut handle = null_mut();
     let code = unsafe {
         RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &mut handle)
@@ -69,7 +67,9 @@ fn trim_write((key, name): Dword<'_>, value: u32) -> Result<(), String> {
         return Err(trim_registry_error(key, name, code));
     }
     let bytes = value.to_le_bytes();
-    let mut code = unsafe { RegSetValueExW(handle, value_name.as_ptr(), 0, REG_DWORD, bytes.as_ptr(), bytes.len() as u32) };
+    let mut code = with_wide(name, |value_name| unsafe {
+        RegSetValueExW(handle, value_name, 0, REG_DWORD, bytes.as_ptr(), bytes.len() as u32)
+    });
     if code == ERROR_SUCCESS && key == RX_STATE {
         code = unsafe { RegFlushKey(handle) };
     }
@@ -133,19 +133,23 @@ fn save_windows_desktop_icons() {
         return;
     }
     unsafe {
-        let pm = FindWindowW(wide("Progman").as_ptr(), wide("Program Manager").as_ptr());
-        let mut dv = if !pm.is_null() { FindWindowExW(pm, null_mut(), wide("SHELLDLL_DefView").as_ptr(), null()) } else { null_mut() };
+        let pm = with_wide("Progman", |c| with_wide("Program Manager", |t| FindWindowW(c, t)));
+        let mut dv = if !pm.is_null() { with_wide("SHELLDLL_DefView", |c| FindWindowExW(pm, null_mut(), c, null())) } else { null_mut() };
         if dv.is_null() {
             let mut ww = null_mut();
-            loop {
-                ww = FindWindowExW(null_mut(), ww, wide("WorkerW").as_ptr(), null());
-                if ww.is_null() { break; }
-                dv = FindWindowExW(ww, null_mut(), wide("SHELLDLL_DefView").as_ptr(), null());
-                if !dv.is_null() { break; }
-            }
+            with_wide("WorkerW", |wc| {
+                with_wide("SHELLDLL_DefView", |dc| {
+                    loop {
+                        ww = FindWindowExW(null_mut(), ww, wc, null());
+                        if ww.is_null() { break; }
+                        dv = FindWindowExW(ww, null_mut(), dc, null());
+                        if !dv.is_null() { break; }
+                    }
+                });
+            });
         }
         if dv.is_null() { return; }
-        let lv = FindWindowExW(dv, null_mut(), wide("SysListView32").as_ptr(), null());
+        let lv = with_wide("SysListView32", |c| FindWindowExW(dv, null_mut(), c, null()));
         if lv.is_null() { return; }
         let n = SendMessageW(lv, 0x1004 , 0, 0) as i32;
         if n <= 0 { return; }
@@ -155,6 +159,7 @@ fn save_windows_desktop_icons() {
         if proc.is_null() { return; }
         let mem = VirtualAllocEx(proc, null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if !mem.is_null() {
+            use std::fmt::Write;
             let mut out = String::new();
             let mut pt = [0i32; 2];
             let mut lvi = [0u8; 88];
@@ -173,7 +178,7 @@ fn save_windows_desktop_icons() {
                 if ch > 0 && ReadProcessMemory(proc, (mem as usize + 128) as *const _, txt.as_mut_ptr().cast(), ch * 2, &mut rw) != 0 {
                     let name = String::from_utf16_lossy(&txt[..ch]);
                     if !name.is_empty() {
-                        out.push_str(&format!("{}\t{}\t{}\n", pt[0], pt[1], name));
+                        let _ = writeln!(out, "{}\t{}\t{name}", pt[0], pt[1]);
                     }
                 }
             }

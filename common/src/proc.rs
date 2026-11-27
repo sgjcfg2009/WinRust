@@ -132,11 +132,10 @@ pub fn enable_debug_privilege() {
             return;
         }
         for name in PRIVS {
-            let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
             let mut tp: TOKEN_PRIVILEGES = std::mem::zeroed();
             tp.PrivilegeCount = 1;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            if LookupPrivilegeValueW(null(), w.as_ptr(), &mut tp.Privileges[0].Luid) != 0 {
+            if crate::with_wide(name, |w| LookupPrivilegeValueW(null(), w, &mut tp.Privileges[0].Luid)) != 0 {
                 AdjustTokenPrivileges(tok, 0, &tp, 0, null_mut(), null_mut());
             }
         }
@@ -276,7 +275,14 @@ pub fn elevated() -> bool {
         GetTokenInformation(t, TokenIntegrityLevel, null_mut(), 0, &mut need);
         let mut high = true;
         if need >= size_of::<*const u8>() as u32 {
-            let mut buf = vec![0u8; need as usize];
+            let mut stack = [0u8; 128];
+            let mut heap = Vec::new();
+            let buf: &mut [u8] = if (need as usize) <= stack.len() {
+                &mut stack[..need as usize]
+            } else {
+                heap.resize(need as usize, 0);
+                &mut heap
+            };
             if GetTokenInformation(t, TokenIntegrityLevel, buf.as_mut_ptr().cast(), need, &mut need) != 0 {
                 let sid = *(buf.as_ptr() as *const *const u8);
                 if !sid.is_null() {

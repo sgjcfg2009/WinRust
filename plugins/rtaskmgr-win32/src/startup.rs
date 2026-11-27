@@ -76,10 +76,10 @@ fn from_utf16_bytes(b: &[u8]) -> String {
 fn string_values(r: HKEY, path: &str) -> Vec<(String, String)> {
     let mut out = vec![];
     let Some(k) = open(r, path, KEY_READ) else { return out };
+    let mut name = vec![0u16; 16384];
+    let mut data = vec![0u8; 32768];
     for i in 0.. {
-        let mut name = vec![0u16; 16384];
         let mut nlen = name.len() as u32;
-        let mut data = vec![0u8; 32768];
         let mut dlen = data.len() as u32;
         let mut ty = 0u32;
         let rc = unsafe { RegEnumValueW(k, i, name.as_mut_ptr(), &mut nlen, null_mut(), &mut ty, data.as_mut_ptr(), &mut dlen) };
@@ -302,8 +302,7 @@ fn dword(k: HKEY, name: &str) -> Option<u32> {
     (rc == 0 && ty == REG_DWORD).then_some(v)
 }
 
-fn sz(k: HKEY, name: &str) -> Option<String> {
-    let mut buf = vec![0u8; 4096];
+fn sz(k: HKEY, name: &str, buf: &mut [u8; 4096]) -> Option<String> {
     let mut len = buf.len() as u32;
     let mut ty = 0u32;
     let rc = unsafe { RegQueryValueExW(k, w(name).as_ptr(), null_mut(), &mut ty, buf.as_mut_ptr(), &mut len) };
@@ -350,9 +349,10 @@ fn services() -> Vec<Item> {
         v
     });
     let mut out = vec![];
+    let mut buf = [0u8; 4096];
     for name in subkeys(HKEY_LOCAL_MACHINE, SERVICES_KEY) {
         let Some(k) = open(HKEY_LOCAL_MACHINE, &format!(r"{SERVICES_KEY}\{name}"), KEY_READ) else { continue };
-        let (start, ty, image) = (dword(k, "Start"), dword(k, "Type").unwrap_or(0), sz(k, "ImagePath").unwrap_or_default());
+        let (start, ty, image) = (dword(k, "Start"), dword(k, "Type").unwrap_or(0), sz(k, "ImagePath", &mut buf).unwrap_or_default());
         unsafe { RegCloseKey(k) };
         let mine = ours.iter().any(|o| o.eq_ignore_ascii_case(&name));
         if ty & 0x30 == 0 || !third_party_image(&image) || !(start == Some(2) || mine && start == Some(3)) {
@@ -423,7 +423,11 @@ pub fn boot_impact(it: &Item, log: &BootLog) -> Option<u32> {
 const SELF_NAME: &str = "RTaskMgr";
 
 pub fn self_autostart() -> bool {
-    string_values(HKEY_CURRENT_USER, RUN).iter().any(|(n, _)| n == SELF_NAME)
+    let Some(k) = open(HKEY_CURRENT_USER, RUN, KEY_READ) else { return false };
+    let mut ty = 0u32;
+    let rc = unsafe { RegQueryValueExW(k, w(SELF_NAME).as_ptr(), null_mut(), &mut ty, null_mut(), null_mut()) };
+    unsafe { RegCloseKey(k) };
+    rc == 0
 }
 
 pub fn set_self_autostart(on: bool, exe: &str) -> bool {

@@ -1,18 +1,8 @@
 use super::*;
 
-unsafe fn layout_list(buf: &mut [HKL; 32]) -> usize {
-    GetKeyboardLayoutList(32, buf.as_mut_ptr()).clamp(0, 32) as usize
-}
-
-pub(crate) unsafe fn own_foreground() -> bool {
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
-    pid == std::process::id()
-}
-
 pub(crate) unsafe fn next_lang(bar: HWND, back: bool) {
     let mut buf: [HKL; 32] = [null_mut(); 32];
-    let n = layout_list(&mut buf);
+    let n = GetKeyboardLayoutList(32, buf.as_mut_ptr()).clamp(0, 32) as usize;
     if n < 2 {
         return;
     }

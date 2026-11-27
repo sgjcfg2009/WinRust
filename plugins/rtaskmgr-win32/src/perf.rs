@@ -1,9 +1,7 @@
 use std::{collections::HashMap, ptr::null_mut};
 use windows_sys::Win32::System::Performance::*;
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
+use crate::ui::wide;
 
 struct Counter(PDH_HCOUNTER);
 
@@ -29,6 +27,8 @@ pub struct Perf {
     net_tx: Option<Counter>,
     net_bw: Option<Counter>,
     cpu_perf: Option<Counter>,
+    buf: Vec<u64>,
+    name_buf: String,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -70,7 +70,6 @@ pub struct Sample {
     pub disk_write: f64,
     pub disk_ms: f32,
     pub gpu_total: f32,
-    pub gpu_types: HashMap<String, f32>,
     pub gpu_by_pid: HashMap<u32, f32>,
     pub gpu_ded: u64,
     pub gpu_shr: u64,
@@ -120,6 +119,8 @@ impl Perf {
                 net_tx: add(r"\Network Interface(*)\Bytes Sent/sec"),
                 net_bw: add(r"\Network Interface(*)\Current Bandwidth"),
                 cpu_perf: add(r"\Processor Information(_Total)\% Processor Performance"),
+                buf: Vec::new(),
+                name_buf: String::new(),
             };
             PdhCollectQueryData(query);
             Some(p)
@@ -138,33 +139,37 @@ impl Perf {
         }
     }
 
-    fn array(c: &Option<Counter>) -> Vec<(String, f64)> {
-        let Some(c) = c else { return vec![] };
+    fn for_each_array(c: &Option<Counter>, buf: &mut Vec<u64>, name_buf: &mut String, mut f: impl FnMut(&str, f64)) {
+        let Some(c) = c else { return };
         unsafe {
             let (mut size, mut count) = (0u32, 0u32);
             let rc = PdhGetFormattedCounterArrayW(c.0, PDH_FMT_DOUBLE, &mut size, &mut count, null_mut());
             if rc != PDH_MORE_DATA || size == 0 {
-                return vec![];
+                return;
             }
-            let mut buf = vec![0u64; size as usize / 8 + 8];
+            let need = size as usize / 8 + 8;
+            if buf.len() < need {
+                buf.resize(need, 0);
+            }
             let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
             if PdhGetFormattedCounterArrayW(c.0, PDH_FMT_DOUBLE, &mut size, &mut count, items) != 0 {
-                return vec![];
+                return;
             }
-            (0..count as usize)
-                .filter_map(|i| {
-                    let it = &*items.add(i);
-                    if it.szName.is_null() || it.FmtValue.CStatus != 0 {
-                        return None;
-                    }
-                    let mut n = 0;
-                    while *it.szName.add(n) != 0 {
-                        n += 1;
-                    }
-                    let name = String::from_utf16_lossy(std::slice::from_raw_parts(it.szName, n));
-                    Some((name, it.FmtValue.Anonymous.doubleValue))
-                })
-                .collect()
+            for i in 0..count as usize {
+                let it = &*items.add(i);
+                if it.szName.is_null() || it.FmtValue.CStatus != 0 {
+                    continue;
+                }
+                let mut n = 0;
+                while *it.szName.add(n) != 0 {
+                    n += 1;
+                }
+                name_buf.clear();
+                for ch in std::char::decode_utf16(std::slice::from_raw_parts(it.szName, n).iter().copied()) {
+                    name_buf.push(ch.unwrap_or('\u{FFFD}'));
+                }
+                f(name_buf, it.FmtValue.Anonymous.doubleValue);
+            }
         }
     }
 
@@ -179,76 +184,94 @@ impl Perf {
             ..Default::default()
         };
         let (mut by_type, mut by_pid_type, mut per_type): (HashMap<String, f64>, HashMap<(u32, String), f64>, HashMap<((u32, i32), String), f64>) = Default::default();
-        for (name, v) in Self::array(&self.gpu_eng) {
+        Self::for_each_array(&self.gpu_eng, &mut self.buf, &mut self.name_buf, |name, v| {
             let pid = name.strip_prefix("pid_").and_then(|r| r.split('_').next()).and_then(|p| p.parse::<u32>().ok());
-            let ty = name.rsplit("engtype_").next().unwrap_or("").to_string();
-            *by_type.entry(ty.clone()).or_default() += v;
+            let ty = name.rsplit("engtype_").next().unwrap_or("");
+            if let Some(cur) = by_type.get_mut(ty) {
+                *cur += v;
+            } else {
+                by_type.insert(ty.to_string(), v);
+            }
             if let Some(pid) = pid {
-                *by_pid_type.entry((pid, ty.clone())).or_default() += v;
+                *by_pid_type.entry((pid, ty.to_string())).or_default() += v;
             }
-            if let Some(l) = parse_luid(&name) {
-                *per_type.entry((l, ty)).or_default() += v;
+            if let Some(l) = parse_luid(name) {
+                *per_type.entry((l, ty.to_string())).or_default() += v;
             }
-        }
+        });
         s.gpu_total = by_type.values().cloned().fold(0.0, f64::max).min(100.0) as f32;
-        s.gpu_types = by_type.iter().map(|(k, v)| (k.clone(), v.min(100.0) as f32)).collect();
         for ((pid, _), v) in by_pid_type {
             let e = s.gpu_by_pid.entry(pid).or_insert(0.0);
             *e = e.max(v.min(100.0) as f32);
         }
-        s.gpu_ded = Self::array(&self.gpu_ded).iter().map(|x| x.1).sum::<f64>() as u64;
-        s.gpu_shr = Self::array(&self.gpu_shr).iter().map(|x| x.1).sum::<f64>() as u64;
+        Self::for_each_array(&self.gpu_ded, &mut self.buf, &mut self.name_buf, |name, v| {
+            s.gpu_ded += v as u64;
+            if let Some(l) = parse_luid(name) {
+                s.gpus.entry(l).or_default().ded += v as u64;
+            }
+        });
+        Self::for_each_array(&self.gpu_shr, &mut self.buf, &mut self.name_buf, |name, v| {
+            s.gpu_shr += v as u64;
+            if let Some(l) = parse_luid(name) {
+                s.gpus.entry(l).or_default().shr += v as u64;
+            }
+        });
 
         for ((l, ty), v) in per_type {
             let g = s.gpus.entry(l).or_default();
             g.types.insert(ty, v.min(100.0) as f32);
             g.total = g.total.max(v.min(100.0) as f32);
         }
-        for (name, v) in Self::array(&self.gpu_ded) {
-            if let Some(l) = parse_luid(&name) {
-                s.gpus.entry(l).or_default().ded += v as u64;
-            }
-        }
-        for (name, v) in Self::array(&self.gpu_shr) {
-            if let Some(l) = parse_luid(&name) {
-                s.gpus.entry(l).or_default().shr += v as u64;
-            }
-        }
 
-        let (act, rd, wr, lat) = (Self::array(&self.disk_time_a), Self::array(&self.disk_read_a), Self::array(&self.disk_write_a), Self::array(&self.disk_lat_a));
-        let (rd, wr, lat): (HashMap<String, f64>, HashMap<String, f64>, HashMap<String, f64>) = (rd.into_iter().collect(), wr.into_iter().collect(), lat.into_iter().collect());
-        for (name, a) in act {
+        let (mut rd, mut wr, mut lat): (HashMap<String, f64>, HashMap<String, f64>, HashMap<String, f64>) = Default::default();
+        Self::for_each_array(&self.disk_read_a, &mut self.buf, &mut self.name_buf, |name, v| {
+            rd.insert(name.to_string(), v);
+        });
+        Self::for_each_array(&self.disk_write_a, &mut self.buf, &mut self.name_buf, |name, v| {
+            wr.insert(name.to_string(), v);
+        });
+        Self::for_each_array(&self.disk_lat_a, &mut self.buf, &mut self.name_buf, |name, v| {
+            lat.insert(name.to_string(), v);
+        });
+        Self::for_each_array(&self.disk_time_a, &mut self.buf, &mut self.name_buf, |name, a| {
             if name == "_Total" {
-                continue;
+                return;
             }
-            let (num, letters) = name.split_once(' ').unwrap_or((&name, ""));
+            let (num, letters) = name.split_once(' ').unwrap_or((name, ""));
             if let Ok(number) = num.parse::<u32>() {
                 s.disks.push(DiskSample {
                     number,
                     letters: letters.to_string(),
                     active: a.clamp(0.0, 100.0) as f32,
-                    rd: rd.get(&name).copied().unwrap_or(0.0),
-                    wr: wr.get(&name).copied().unwrap_or(0.0),
-                    ms: (lat.get(&name).copied().unwrap_or(0.0) * 1000.0) as f32,
+                    rd: rd.get(name).copied().unwrap_or(0.0),
+                    wr: wr.get(name).copied().unwrap_or(0.0),
+                    ms: (lat.get(name).copied().unwrap_or(0.0) * 1000.0) as f32,
                 });
             }
-        }
+        });
         s.disks.sort_by_key(|d| d.number);
 
         s.mem_modified = Self::value(&self.mem_mod) as u64;
         s.mem_standby = (Self::value(&self.mem_sb_res) + Self::value(&self.mem_sb_norm) + Self::value(&self.mem_sb_core)) as u64;
         s.mem_free = Self::value(&self.mem_free) as u64;
 
-        let (rx, tx, bw) = (Self::array(&self.net_rx), Self::array(&self.net_tx), Self::array(&self.net_bw));
-        let tx: HashMap<String, f64> = tx.into_iter().collect();
-        let bw: HashMap<String, f64> = bw.into_iter().collect();
+        let (mut tx, mut bw): (HashMap<String, f64>, HashMap<String, f64>) = Default::default();
+        Self::for_each_array(&self.net_tx, &mut self.buf, &mut self.name_buf, |name, v| {
+            tx.insert(name.to_string(), v);
+        });
+        Self::for_each_array(&self.net_bw, &mut self.buf, &mut self.name_buf, |name, v| {
+            bw.insert(name.to_string(), v);
+        });
         let bad = |n: &str| {
             let l = n.to_lowercase();
             l.contains("loopback") || l.contains("isatap") || l.contains("teredo") || l.contains("pseudo") || l.contains("6to4")
         };
         let mut best: Option<NetIf> = None;
-        for (name, r) in rx.into_iter().filter(|(n, _)| !bad(n)) {
-            let cand = NetIf { rx: r, tx: tx.get(&name).copied().unwrap_or(0.0), bw: bw.get(&name).copied().unwrap_or(0.0), name };
+        Self::for_each_array(&self.net_rx, &mut self.buf, &mut self.name_buf, |name, r| {
+            if bad(name) {
+                return;
+            }
+            let cand = NetIf { rx: r, tx: tx.get(name).copied().unwrap_or(0.0), bw: bw.get(name).copied().unwrap_or(0.0), name: name.to_string() };
             if cand.bw > 0.0 {
                 s.nics.push(cand.clone());
             }
@@ -256,7 +279,7 @@ impl Perf {
             if better && cand.bw > 0.0 {
                 best = Some(cand);
             }
-        }
+        });
         if let Some(b) = &best {
             s.net_util = ((b.rx + b.tx) * 8.0 / b.bw * 100.0).clamp(0.0, 100.0) as f32;
         }

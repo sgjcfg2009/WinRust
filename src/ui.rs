@@ -4,7 +4,7 @@ pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
-fn with_wide<T>(s: &str, f: impl FnOnce(*const u16) -> T) -> T {
+pub(crate) fn with_wide<T>(s: &str, f: impl FnOnce(*const u16) -> T) -> T {
     let mut stack = [0u16; 256];
     let mut len = 0usize;
     for u in s.encode_utf16() {
@@ -202,7 +202,13 @@ pub(crate) fn chosen() -> impl Iterator<Item = usize> {
 }
 
 pub(crate) fn diff() -> (Vec<usize>, Vec<usize>) {
-    plan(&rows().collect::<Vec<_>>(), |i| INSTALLED[i].load(Relaxed), |i| SELECTED[i].load(Relaxed))
+    let mut buf = [0usize; N_READY + N_EXTRA];
+    let mut n = 0;
+    for i in rows() {
+        buf[n] = i;
+        n += 1;
+    }
+    plan(&buf[..n], |i| INSTALLED[i].load(Relaxed), |i| SELECTED[i].load(Relaxed))
 }
 
 pub(crate) fn reset_selection() {
@@ -459,7 +465,7 @@ pub(crate) unsafe fn paint(hwnd: HWND) {
         } else {
             let line = if cur { ACCENT } else { rgb(80, 80, 80) };
             ui.round(c, 11.0, SIDE, line);
-            ui.text(&(k + 1).to_string(), c, 11.0, 600, if cur { TEXT } else { DIM }, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            ui.text(["1", "2", "3"][k], c, 11.0, 600, if cur { TEXT } else { DIM }, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         let fg = if cur { TEXT } else if done { lerp(TEXT, DIM, 0.3) } else { DIM };
         ui.text(label, [56.0, y, SIDE_W - 8.0, y + 38.0], 13.5, if cur { 600 } else { 400 }, fg, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
@@ -587,7 +593,7 @@ pub(crate) unsafe fn paint(hwnd: HWND) {
                 if all { "Removing WinRust" } else { "Installing WinRust" },
                 "Keep the window open until it finishes. The screen may flicker while Windows parts are swapped.",
             );
-            let steps = STEPS.lock().unwrap().clone();
+            let steps = STEPS.lock().unwrap();
             let job = JOB.load(Relaxed);
             let pos = steps.iter().position(|&(i, _)| i == job);
             let total = steps.len().max(1);
@@ -624,9 +630,10 @@ pub(crate) unsafe fn paint(hwnd: HWND) {
             }
         }
         _ => {
-            let (msg, ok) = MSG.lock().unwrap().clone();
+            let msg_guard = MSG.lock().unwrap();
+            let (msg, ok) = (msg_guard.0.as_str(), msg_guard.1);
             let all = REMOVING_ALL.get();
-            let results = RESULTS.lock().unwrap().clone();
+            let results = RESULTS.lock().unwrap();
             let c = [X0, 92.0, X0 + 44.0, 136.0];
             let col = if ok { ACCENT } else { BAD };
             ui.round(c, 22.0, col, col);
@@ -663,7 +670,7 @@ pub(crate) unsafe fn paint(hwnd: HWND) {
                 };
                 ui.text(word, [X0 + 260.0, y, X1, y + 26.0], 13.0, 600, c, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
             }
-            ui.text(&msg, [X0, NOTE_Y, X1, FOOT_Y - 8.0], 12.0, 400, if ok { DIM } else { BAD }, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS);
+            ui.text(msg, [X0, NOTE_Y, X1, FOOT_Y - 8.0], 12.0, 400, if ok { DIM } else { BAD }, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS);
             button(&ui, back_box(), "Options", 1, hot(ID_BACK));
             button(&ui, primary_box(), "Close", 0, hot(ID_MAIN));
         }
@@ -1043,6 +1050,11 @@ pub(crate) unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             _ => {}
         },
         WM_DONE => finished(hwnd),
+        0x02E0 => {
+            let r = &*(lp as *const RECT);
+            SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(hwnd, null(), 0);
+        }
         WM_TIMER if wp == 1 => {
             InvalidateRect(hwnd, null(), 0);
         }

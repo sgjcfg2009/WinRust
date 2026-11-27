@@ -2,7 +2,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use super::*;
 use std::{cell::Cell, collections::HashMap, path::Path};
-use windows_sys::Win32::{Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*}, System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, SystemInformation::GetTickCount64}, UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, TRACKMOUSEEVENT, TME_LEAVE, TrackMouseEvent}};
+use windows_sys::Win32::{Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*}, System::SystemInformation::GetTickCount64, UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, TRACKMOUSEEVENT, TME_LEAVE, TrackMouseEvent}};
 
 pub use winrust_common::style::{pal, ui_face};
 pub fn listbg() -> u32 { if winrust_common::style::style().light() { winrust_common::style::card() } else { mix(pal().bg, pal().text, 0.015) } }
@@ -85,7 +85,7 @@ fn now() -> u64 { unsafe { GetTickCount64() } }
 
 fn ease(t: f32) -> f32 { t * t * (3.0 - 2.0 * t) }
 
-fn mix(a: u32, b: u32, t: f32) -> u32 {
+pub(crate) fn mix(a: u32, b: u32, t: f32) -> u32 {
     let ch = |s: u32| {
         let (x, y) = (((a >> s) & 255) as f32, ((b >> s) & 255) as f32);
         (x + (y - x) * t) as u32
@@ -130,20 +130,34 @@ pub fn dark_title(h: HWND) {
     }
 }
 
-pub fn dark_mode() {
-    unsafe {
-        let m = LoadLibraryW(w("uxtheme.dll").as_ptr());
-        if m.is_null() { return; }
-        if let Some(f) = GetProcAddress(m, 135usize as *const u8) { std::mem::transmute::<_, extern "system" fn(i32) -> i32>(f)(2); }
-        if let Some(f) = GetProcAddress(m, 136usize as *const u8) { std::mem::transmute::<_, extern "system" fn()>(f)(); }
+pub fn set_scale_dpi(dpi: u32) {
+    if dpi > 0 {
+        SCALE.set((dpi as f32 / 96.0).max(0.5));
+    }
+}
+
+pub unsafe fn on_dpi_changed(h: HWND, wp: WPARAM, lp: LPARAM) {
+    set_scale_dpi((wp & 0xFFFF) as u32);
+    restyle(h);
+    let (edit, list) = ST.with(|c| c.try_borrow().map_or((ptr::null_mut(), ptr::null_mut()), |s| (s.edit, s.list)));
+    if !edit.is_null() {
+        let old_ef = SendMessageW(edit, WM_GETFONT, 0, 0);
+        SendMessageW(edit, WM_SETFONT, font(14, 400, ui_face()) as usize, 1);
+        if old_ef != 0 { DeleteObject(old_ef as HGDIOBJ); }
+    }
+    let r = &*(lp as *const RECT);
+    SetWindowPos(h, ptr::null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    if !list.is_null() {
+        fit_columns(list);
     }
 }
 
 pub unsafe fn restyle(h: HWND) {
+    end_rename(false);
     unsafe extern "system" fn each(c: HWND, _: LPARAM) -> i32 {
         let mut cls = [0u16; 32];
         let n = GetClassNameW(c, cls.as_mut_ptr(), 32).max(0) as usize;
-        if String::from_utf16_lossy(&cls[..n]) == "SysListView32" {
+        if cls[..n] == [b'S' as u16, b'y' as u16, b's' as u16, b'L' as u16, b'i' as u16, b's' as u16, b't' as u16, b'V' as u16, b'i' as u16, b'e' as u16, b'w' as u16, b'3' as u16, b'2' as u16] {
             style_list(c);
         }
         1
@@ -154,11 +168,11 @@ pub unsafe fn restyle(h: HWND) {
         DeleteObject(f as HGDIOBJ);
     }
     for f in CHROME_FONTS.replace([0; 3]).into_iter().filter(|&f| f != 0) { DeleteObject(f as HGDIOBJ); }
-    for f in NAV_FONTS.replace([0; 4]).into_iter().filter(|&f| f != 0) { DeleteObject(f as HGDIOBJ); }
+    for f in NAV_FONTS.replace([0; 3]).into_iter().filter(|&f| f != 0) { DeleteObject(f as HGDIOBJ); }
     for f in PC_FONTS.replace([0; 4]).into_iter().filter(|&f| f != 0) { DeleteObject(f as HGDIOBJ); }
     for f in MENU_FONTS.replace([0; 2]).into_iter().filter(|&f| f != 0) { DeleteObject(f as HGDIOBJ); }
     for f in HDR_FONTS.replace([0; 2]).into_iter().filter(|&f| f != 0) { DeleteObject(f as HGDIOBJ); }
-    for f in [STATUS_FONT.replace(0), LIST_ICO_FONT.replace(0), EMPTY_FONT.replace(0)].into_iter().filter(|&f| f != 0) {
+    for f in [STATUS_FONT.replace(0), LIST_ICO_FONT.replace(0), EMPTY_FONT.replace(0), BRUSH.replace(0)].into_iter().filter(|&f| f != 0) {
         DeleteObject(f as HGDIOBJ);
     }
     PC_INFO.with_borrow_mut(|m| m.clear());
@@ -223,6 +237,17 @@ impl BackBuf {
     }
 }
 
+struct RenameState {
+    hwnd: HWND,
+    list: HWND,
+    owner: HWND,
+    idx: usize,
+    old_name: String,
+    rect: RECT,
+    brush: isize,
+    old_proc: isize,
+}
+
 thread_local! {
     static ROWHOT: Cell<isize> = const { Cell::new(-1) };
     static FONTS: Cell<(isize, isize)> = const { Cell::new((0, 0)) };
@@ -234,7 +259,7 @@ thread_local! {
     static PC_BUF: RefCell<BackBuf> = const { RefCell::new(BackBuf::new()) };
     static ICON_BUF: RefCell<BackBuf> = const { RefCell::new(BackBuf::new()) };
     static CHROME_FONTS: Cell<[isize; 3]> = const { Cell::new([0; 3]) };
-    static NAV_FONTS: Cell<[isize; 4]> = const { Cell::new([0; 4]) };
+    static NAV_FONTS: Cell<[isize; 3]> = const { Cell::new([0; 3]) };
     static PC_FONTS: Cell<[isize; 4]> = const { Cell::new([0; 4]) };
     static MENU_FONTS: Cell<[isize; 2]> = const { Cell::new([0; 2]) };
     static HDR_FONTS: Cell<[isize; 2]> = const { Cell::new([0; 2]) };
@@ -244,6 +269,171 @@ thread_local! {
     static WBUF: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
     static IL_XL: Cell<isize> = const { Cell::new(0) };
     static PC_INFO: RefCell<HashMap<String, (String, Option<(u64, u64)>, i32)>> = RefCell::new(HashMap::new());
+    static RENAME: RefCell<Option<RenameState>> = const { RefCell::new(None) };
+}
+
+fn rename_bg() -> u32 {
+    mix(listbg(), pal().accent, 0.18)
+}
+
+unsafe fn clear_sel(list: HWND) {
+    let mut it: LVITEMW = std::mem::zeroed();
+    it.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+    SendMessageW(list, LVM_SETITEMSTATE, usize::MAX, &it as *const _ as isize);
+}
+
+unsafe fn is_empty_hit(list: HWND, x: i32, y: i32) -> bool {
+    let mut cr: RECT = std::mem::zeroed();
+    GetClientRect(list, &mut cr);
+    if x < sc(8) || x >= cr.right - sc(16) { return true; }
+    let mut ht: LVHITTESTINFO = std::mem::zeroed();
+    ht.pt = POINT { x, y };
+    let i = SendMessageW(list, LVM_HITTEST, 0, &mut ht as *mut _ as isize);
+    if i < 0 { return true; }
+    ST.with(|c| c.try_borrow().ok().is_some_and(|s| !s.thumbs && s.rows.get(i as usize).is_some_and(|r| r.hdr)))
+}
+
+pub unsafe fn end_rename(commit: bool) {
+    let Some(st) = RENAME.take() else { return };
+    let new_name = if commit {
+        let n = GetWindowTextLengthW(st.hwnd) as usize;
+        WBUF.with_borrow_mut(|buf| {
+            buf.resize(n + 1, 0);
+            let got = GetWindowTextW(st.hwnd, buf.as_mut_ptr(), n as i32 + 1) as usize;
+            String::from_utf16_lossy(&buf[..got]).trim().to_string()
+        })
+    } else {
+        String::new()
+    };
+    if st.old_proc != 0 {
+        SetWindowLongPtrW(st.hwnd, GWLP_WNDPROC, st.old_proc);
+    }
+    DestroyWindow(st.hwnd);
+    if st.brush != 0 {
+        DeleteObject(st.brush as HGDIOBJ);
+    }
+    InvalidateRect(st.list, &st.rect, 0);
+    if commit && !new_name.is_empty() && new_name != st.old_name && !new_name.contains(['\\', '/', ':']) {
+        crate::commit_rename(st.owner, st.idx, &new_name);
+    }
+}
+
+unsafe extern "system" fn rename_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let old = RENAME.with_borrow(|r| r.as_ref().map_or(0, |s| s.old_proc));
+    match m {
+        WM_GETDLGCODE => return 0x0004,
+        WM_KEYDOWN if wp == 0x0D || wp == 0x1B => {
+            let list = RENAME.with_borrow(|r| r.as_ref().map_or(ptr::null_mut(), |s| s.list));
+            end_rename(wp == 0x0D);
+            if !list.is_null() { SetFocus(list); }
+            return 0;
+        }
+        WM_CHAR if wp == 0x0D || wp == 0x1B => return 0,
+        WM_CHAR if wp == 0x7F => { crate::delete_word(h); return 0; }
+        WM_KILLFOCUS => {
+            end_rename(true);
+            return 0;
+        }
+        _ => {}
+    }
+    if old != 0 {
+        CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(old), h, m, wp, lp)
+    } else {
+        DefWindowProcW(h, m, wp, lp)
+    }
+}
+
+pub unsafe fn start_rename(owner: HWND, list: HWND, idx: usize) {
+    end_rename(false);
+    let info = ST.with(|c| {
+        let st = c.try_borrow().ok()?;
+        let r = st.rows.get(idx)?;
+        if r.hdr || st.dir == Path::new(crate::THIS_PC_KEY) { return None; }
+        Some((r.name.clone(), r.dir, st.thumbs))
+    });
+    let Some((old_name, is_dir, thumbs)) = info else { return };
+    let icon_view = thumbs || crate::desk();
+    SendMessageW(list, LVM_ENSUREVISIBLE, idx, 0);
+    let mut cr: RECT = std::mem::zeroed();
+    GetClientRect(list, &mut cr);
+    let (box_r, edit_r) = if !icon_view {
+        let mut r = RECT { left: LVIR_BOUNDS as i32, ..std::mem::zeroed() };
+        if SendMessageW(list, LVM_GETITEMRECT, idx, &mut r as *mut _ as isize) == 0 { return; }
+        let cw0 = SendMessageW(list, LVM_GETCOLUMNWIDTH, 0, 0) as i32;
+        let himl = SendMessageW(list, LVM_GETIMAGELIST, LVSIL_SMALL as usize, 0);
+        let (mut iw, mut ih) = (sc(16), sc(16));
+        if himl != 0 { ImageList_GetIconSize(himl as _, &mut iw, &mut ih); }
+        let tx = r.left + sc(16) + iw + sc(12);
+        let right = (r.left + cw0 - sc(8)).min(cr.right - sc(18)).max(tx + sc(80));
+        let box_r = rc(tx - sc(6), r.top + sc(4), right, r.bottom - sc(4));
+        let eh = sc(20);
+        let ey = (box_r.top + box_r.bottom - eh) / 2;
+        (box_r, rc(tx, ey, right - sc(6), ey + eh))
+    } else {
+        let mut r = RECT { left: LVIR_LABEL as i32, ..std::mem::zeroed() };
+        if SendMessageW(list, LVM_GETITEMRECT, idx, &mut r as *mut _ as isize) == 0 { return; }
+        let box_r = rc((r.left - sc(4)).max(sc(4)), r.top, (r.right + sc(4)).min(cr.right - sc(4)), (r.bottom + sc(2)).min(cr.bottom));
+        let eh = sc(20);
+        let ey = (box_r.top + box_r.bottom - eh) / 2;
+        (box_r, rc(box_r.left + sc(4), ey, (box_r.right - sc(4)).max(box_r.left + sc(20)), ey + eh))
+    };
+    let style = WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32 | if icon_view { ES_CENTER as u32 } else { 0 };
+    let inst = GetModuleHandleW(ptr::null());
+    let ed = CreateWindowExW(
+        0,
+        w("EDIT").as_ptr(),
+        w(&old_name).as_ptr(),
+        style,
+        edit_r.left,
+        edit_r.top,
+        (edit_r.right - edit_r.left).max(1),
+        (edit_r.bottom - edit_r.top).max(1),
+        list,
+        ptr::null_mut(),
+        inst,
+        ptr::null(),
+    );
+    if ed.is_null() { return; }
+    if FONTS.get().0 == 0 { FONTS.set((font(14, 400, ui_face()), font(13, 400, ui_face()))); }
+    let f = if icon_view { SendMessageW(list, WM_GETFONT, 0, 0) } else { FONTS.get().0 };
+    SendMessageW(ed, WM_SETFONT, f as usize, 1);
+    let old_proc = SetWindowLongPtrW(ed, GWLP_WNDPROC, rename_proc as *const () as isize);
+    let brush = CreateSolidBrush(rename_bg()) as isize;
+    RENAME.set(Some(RenameState { hwnd: ed, list, owner, idx, old_name: old_name.clone(), rect: box_r, brush, old_proc }));
+    InvalidateRect(list, &box_r, 0);
+    SetFocus(ed);
+    let sel_end = if !is_dir {
+        old_name.rfind('.').filter(|&p| p > 0).map_or(-1isize, |p| old_name[..p].encode_utf16().count() as isize)
+    } else {
+        -1isize
+    };
+    SendMessageW(ed, EM_SETSEL, 0, sel_end);
+}
+
+fn drive_label_cap(root: &str) -> (String, Option<(u64, u64)>) {
+    let letter = root.chars().next().unwrap_or('C');
+    let wr = w(root);
+    let mut vol = [0u16; 64];
+    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW(wr.as_ptr(), vol.as_mut_ptr(), 64, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0) };
+    let vname = if ok != 0 { wstr(vol.as_ptr()) } else { String::new() };
+    let base = if vname.is_empty() { "Local Disk" } else { &vname };
+    let (mut free, mut total) = (0u64, 0u64);
+    let has_cap = unsafe { windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wr.as_ptr(), &mut free, &mut total, ptr::null_mut()) } != 0 && total > 0;
+    (format!("{base} ({letter}:)"), has_cap.then_some((free, total)))
+}
+
+unsafe fn draw_cap_bar(dc: HDC, bar: RECT, free: u64, total: u64, base_bg: u32, track_mix: f32) {
+    let used = 1.0 - free as f32 / total as f32;
+    fill(dc, bar, mix(base_bg, pal().text, track_mix), sc(4));
+    let fw = ((bar.right - bar.left) as f32 * used) as i32;
+    fill(dc, rc(bar.left, bar.top, bar.left + fw.max(sc(4)), bar.bottom), if used > 0.9 { winrust_common::style::BAD } else { pal().accent }, sc(4));
+}
+
+unsafe fn draw_vthumb(dc: HDC, cr: RECT, tot_h: i32, scroll: i32, max_s: i32, bg: u32, min_h: i32, pad: i32, right_in: i32, w: i32, rad: i32) {
+    if max_s <= 0 || cr.bottom <= min_h { return; }
+    let th = ((cr.bottom as f32 * cr.bottom as f32 / tot_h.max(1) as f32) as i32).clamp(min_h, cr.bottom - pad * 2);
+    let ty = ((cr.bottom - th - pad * 2) as f32 * (scroll as f32 / max_s as f32)) as i32 + pad;
+    fill(dc, rc(cr.right - right_in - w, ty, cr.right - right_in, ty + th), mix(bg, pal().text, 0.28), rad);
 }
 
 fn pc_sec_key(name: &str) -> String {
@@ -261,20 +451,84 @@ pub fn reset_pc() {
 }
 
 fn friendly_date(ft: u64) -> String {
+    thread_local! {
+        static DAY_CACHE: RefCell<(u64, String, String)> = const { RefCell::new((0, String::new(), String::new())) };
+    }
     let s = date_text(ft);
+    if s.len() < 16 {
+        return s;
+    }
     let mut now: windows_sys::Win32::Foundation::FILETIME = unsafe { std::mem::zeroed() };
     unsafe { windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime(&mut now) };
     let now = (now.dwHighDateTime as u64) << 32 | now.dwLowDateTime as u64;
-    let (today, yest) = (date_text(now), date_text(now.saturating_sub(864_000_000_000)));
-    match s.get(..10) {
-        Some(d) if s.len() >= 16 && today.get(..10) == Some(d) => format!("Today, {}", &s[11..]),
-        Some(d) if s.len() >= 16 && yest.get(..10) == Some(d) => format!("Yesterday, {}", &s[11..]),
-        _ => s,
-    }
+    let min_bucket = now / 600_000_000;
+    DAY_CACHE.with_borrow_mut(|c| {
+        if c.0 != min_bucket {
+            c.0 = min_bucket;
+            c.1 = date_text(now);
+            c.2 = date_text(now.saturating_sub(864_000_000_000));
+        }
+        let d = &s[..10];
+        if c.1.get(..10) == Some(d) {
+            format!("Today, {}", &s[11..])
+        } else if c.2.get(..10) == Some(d) {
+            format!("Yesterday, {}", &s[11..])
+        } else {
+            s
+        }
+    })
 }
 
 fn items_text(k: usize) -> String {
     format!("{k} item{}", if k == 1 { "" } else { "s" })
+}
+
+pub unsafe fn desk_draw(lp: LPARAM) -> LRESULT {
+    let cd = &*(lp as *const NMLVCUSTOMDRAW);
+    let list = cd.nmcd.hdr.hwndFrom;
+    let dc = cd.nmcd.hdc;
+    match cd.nmcd.dwDrawStage {
+        CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW as isize,
+        CDDS_ITEMPREPAINT => {
+            let i = cd.nmcd.dwItemSpec;
+            let sel = SendMessageW(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0;
+            let mut rb = RECT { left: LVIR_BOUNDS as i32, ..std::mem::zeroed() };
+            let mut ri = RECT { left: LVIR_ICON as i32, ..std::mem::zeroed() };
+            let mut rl = RECT { left: LVIR_LABEL as i32, ..std::mem::zeroed() };
+            SendMessageW(list, LVM_GETITEMRECT, i, &mut rb as *mut _ as isize);
+            SendMessageW(list, LVM_GETITEMRECT, i, &mut ri as *mut _ as isize);
+            SendMessageW(list, LVM_GETITEMRECT, i, &mut rl as *mut _ as isize);
+            if sel {
+                let pill = rc(rb.left + sc(2), rb.top + sc(1), rb.right - sc(2), rb.bottom - sc(1));
+                fill_alpha(dc, pill, pal().accent, sc(12), 96);
+            }
+            let himl = SendMessageW(list, LVM_GETIMAGELIST, LVSIL_NORMAL as usize, 0);
+            if himl != 0 {
+                let mut item = LVITEMW { mask: LVIF_IMAGE, iItem: i as i32, ..std::mem::zeroed() };
+                if SendMessageW(list, LVM_GETITEMW, 0, &mut item as *mut _ as isize) != 0 && item.iImage >= 0 {
+                    let (mut iw, mut ih) = (sc(48), sc(48));
+                    ImageList_GetIconSize(himl as _, &mut iw, &mut ih);
+                    let ix = ri.left + (ri.right - ri.left - iw) / 2;
+                    let iy = ri.top + (ri.bottom - ri.top - ih) / 2;
+                    ImageList_Draw(himl as _, item.iImage, dc, ix, iy, ILD_TRANSPARENT);
+                }
+            }
+            let mut buf = [0u16; 260];
+            let mut item = LVITEMW { mask: LVIF_TEXT, iItem: i as i32, pszText: buf.as_mut_ptr(), cchTextMax: buf.len() as i32, ..std::mem::zeroed() };
+            let n = SendMessageW(list, LVM_GETITEMTEXTW, i, &mut item as *mut _ as isize) as i32;
+            if n > 0 {
+                SetBkMode(dc, TRANSPARENT as i32);
+                let fmt = DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS;
+                let mut rs = rc(rl.left, rl.top + 1, rl.right, rl.bottom + 1);
+                SetTextColor(dc, 0x0000_0000);
+                DrawTextW(dc, buf.as_ptr(), n, &mut rs, fmt);
+                SetTextColor(dc, 0x00FF_FFFF);
+                DrawTextW(dc, buf.as_ptr(), n, &mut rl, fmt);
+            }
+            CDRF_SKIPDEFAULT as isize
+        }
+        _ => CDRF_DODEFAULT as isize,
+    }
 }
 
 pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
@@ -322,11 +576,13 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             let row = ST.with(|c| {
                 let mut st = c.try_borrow_mut().ok()?;
                 let State { dir, rows, .. } = &mut *st;
+                let is_pc = *dir == Path::new(crate::THIS_PC_KEY);
                 let r = rows.get_mut(i)?;
                 if r.icon < 0 && !r.hdr { r.icon = icon_of(&dir.join(&r.name), r.dir); }
-                Some((r.name.clone(), r.dir, r.time, r.size, r.icon, r.hdr))
+                let cut = !r.hdr && !is_pc && crate::is_cut_row(dir, &r.name);
+                Some((r.name.clone(), r.dir, r.time, r.size, r.icon, r.hdr, is_pc, cut))
             });
-            let Some((name, is_dir, time, size, icon, hdr)) = row else { return CDRF_DODEFAULT as isize };
+            let Some((name, is_dir, time, size, icon, hdr, is_this_pc, cut)) = row else { return CDRF_DODEFAULT as isize };
             let mut r = RECT { left: LVIR_BOUNDS as i32, ..std::mem::zeroed() };
             SendMessageW(list, LVM_GETITEMRECT, i, &mut r as *mut _ as isize);
             let row_r = rc(0, r.top, cr.right, r.bottom);
@@ -345,23 +601,23 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             let sel = SendMessageW(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0;
             let hot = ROWHOT.get() == i as isize;
             let focus = GetFocus() == list;
-            let pill = rc(sc(6), r.top + sc(2), cr.right - sc(6), r.bottom - sc(2));
-            let bg = match (sel, focus) {
+            let rename_box = RENAME.with_borrow(|rn| rn.as_ref().filter(|s| s.idx == i).map(|s| s.rect));
+            let pill = rc(sc(8), r.top + sc(2), cr.right - sc(16), r.bottom - sc(2));
+            let bg = match (sel, focus || rename_box.is_some()) {
                 (true, true) => mix(listbg(), pal().accent, if hot { 0.24 } else { 0.18 }),
                 (true, false) => mix(listbg(), pal().text, 0.10),
                 _ if hot => mix(listbg(), pal().text, 0.055),
                 _ => listbg(),
             };
             if bg != listbg() { fill(dc, pill, bg, sc(8)); }
-            if sel { fill(dc, rc(pill.left, pill.top + sc(7), pill.left + sc(3), pill.bottom - sc(7)), if focus { pal().accent } else { pal().dim }, sc(4)); }
-            let cw: Vec<i32> = (0..4).map(|k| SendMessageW(list, LVM_GETCOLUMNWIDTH, k, 0) as i32).collect();
-            let x: Vec<i32> = (0..4).map(|k| r.left + cw[..k].iter().sum::<i32>()).collect();
+            if sel { fill(dc, rc(pill.left, pill.top + sc(7), pill.left + sc(3), pill.bottom - sc(7)), if focus || rename_box.is_some() { pal().accent } else { pal().dim }, sc(4)); }
+            let cw = [0, 1, 2, 3].map(|k| SendMessageW(list, LVM_GETCOLUMNWIDTH, k, 0) as i32);
+            let x = [r.left, r.left + cw[0], r.left + cw[0] + cw[1], r.left + cw[0] + cw[1] + cw[2]];
             let himl = SendMessageW(list, LVM_GETIMAGELIST, LVSIL_SMALL as usize, 0);
             let (mut iw, mut ih) = (sc(16), sc(16));
             if himl != 0 {
                 ImageList_GetIconSize(himl as _, &mut iw, &mut ih);
             }
-            let cut = ST.with(|c| c.try_borrow().ok().is_some_and(|st| crate::is_cut_row(&st.dir, &name)));
             if himl != 0 && icon >= 0 {
                 let ix = x[0] + sc(16);
                 let iy = (r.top + r.bottom - ih) / 2;
@@ -394,42 +650,35 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             SetBkMode(dc, TRANSPARENT as i32);
             let of = SelectObject(dc, f_name as HFONT);
             let p = Path::new(&name);
-            let is_this_pc = ST.with(|c| c.try_borrow().is_ok_and(|s| s.dir == Path::new(crate::THIS_PC_KEY)));
             let hit_of_search = p.is_absolute() && !is_this_pc;
             let drive_info = if is_this_pc && name.len() == 3 && name.ends_with(":\\") {
-                let letter = name.chars().next().unwrap_or('C');
-                let mut vol = [0u16; 64];
-                let ok = windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW(w(&name).as_ptr(), vol.as_mut_ptr(), 64, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0);
-                let vname = if ok != 0 { wstr(vol.as_ptr()) } else { String::new() };
-                let base = if vname.is_empty() { "Local Disk" } else { &vname };
-                let (mut free, mut total) = (0u64, 0u64);
-                let has_cap = windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(w(&name).as_ptr(), &mut free, &mut total, ptr::null_mut()) != 0 && total > 0;
-                Some((format!("{base} ({letter}:)"), has_cap.then_some((free, total))))
+                Some(drive_label_cap(&name))
             } else {
                 None
             };
-            let shown = if let Some((dn, _)) = &drive_info {
-                dn.clone()
-            } else if p.is_absolute() {
-                p.file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned())
+            if let Some(br) = rename_box {
+                fill(dc, rc(br.left, br.bottom - sc(2), br.right, br.bottom), pal().accent, 0);
             } else {
-                name.clone()
-            };
-            text(dc, &shown, rc(x[0] + sc(16) + iw + sc(12), r.top, x[1] - sc(8), r.bottom), pal().text, DT_LEFT);
+                let shown = if let Some((dn, _)) = &drive_info {
+                    dn.clone()
+                } else if p.is_absolute() {
+                    p.file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned())
+                } else {
+                    name.clone()
+                };
+                text(dc, &shown, rc(x[0] + sc(16) + iw + sc(12), r.top, x[1] - sc(8), r.bottom), pal().text, DT_LEFT);
+            }
             SelectObject(dc, f_det as HFONT);
             let dim = if sel { mix(pal().dim, pal().text, 0.45) } else { pal().dim };
             if let Some((_, Some((free, total)))) = drive_info {
-                let used = 1.0 - free as f32 / total as f32;
                 let bar = rc(x[1] + sc(10), (r.top + r.bottom) / 2 - sc(4), (x[2] - sc(12)).max(x[1] + sc(50)), (r.top + r.bottom) / 2 + sc(4));
-                fill(dc, bar, mix(listbg(), pal().text, 0.14), sc(4));
-                let fw = ((bar.right - bar.left) as f32 * used) as i32;
-                fill(dc, rc(bar.left, bar.top, bar.left + fw.max(sc(4)), bar.bottom), if used > 0.9 { winrust_common::style::BAD } else { pal().accent }, sc(4));
+                draw_cap_bar(dc, bar, free, total, listbg(), 0.14);
                 text(dc, &format!("{} free of {}", fmt_cap(free), fmt_cap(total)), rc(x[2] + sc(10), r.top, x[3] - sc(8), r.bottom), dim, DT_LEFT);
             } else {
                 text(dc, &friendly_date(time), rc(x[1] + sc(10), r.top, x[2] - sc(8), r.bottom), dim, DT_LEFT);
                 let kind = if hit_of_search { p.parent().map_or(String::new(), |d| d.to_string_lossy().into_owned()) } else { type_text(&name, is_dir) };
                 text(dc, &kind, rc(x[2] + sc(10), r.top, x[3] - sc(8), r.bottom), dim, DT_LEFT | DT_PATH_ELLIPSIS);
-                if !is_dir { text(dc, &size_text(size), rc(x[3], r.top, x[3] + cw[3] - sc(14), r.bottom), dim, DT_RIGHT); }
+                if !is_dir { text(dc, &size_text(size), rc(x[3], r.top, x[3] + cw[3] - sc(18), r.bottom), dim, DT_RIGHT); }
             }
             SelectObject(dc, of);
             CDRF_SKIPDEFAULT as isize
@@ -441,7 +690,7 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
 pub unsafe fn fit_columns(list: HWND) {
     let mut cr: RECT = std::mem::zeroed();
     GetClientRect(list, &mut cr);
-    let w = (cr.right - sc(4)).max(0);
+    let w = cr.right.max(0);
     if w <= 0 { return; }
     let (c1, c2, c3) = if w >= sc(560) {
         let c1 = (w * 20 / 100).clamp(sc(120), sc(170));
@@ -463,6 +712,8 @@ pub unsafe fn fit_columns(list: HWND) {
         ShowScrollBar(list, 0, 0);
     }
     SendMessageW(list, WM_SETREDRAW, 1, 0);
+    let hdr = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
+    if !hdr.is_null() { InvalidateRect(hdr, ptr::null(), 0); }
 }
 
 unsafe fn redraw_row(list: HWND, i: isize) {
@@ -565,7 +816,7 @@ unsafe fn paint_this_pc(list: HWND) {
     if il_xl == 0 {
         il_xl = windows::Win32::UI::Shell::SHGetImageList::<windows::Win32::UI::Controls::IImageList>(windows::Win32::UI::Shell::SHIL_EXTRALARGE as i32)
             .ok()
-            .map(|l| windows::core::Interface::as_raw(&l) as isize)
+            .map(|l| windows::core::Interface::into_raw(l) as isize)
             .unwrap_or(0);
         IL_XL.set(il_xl);
     }
@@ -603,14 +854,8 @@ unsafe fn paint_this_pc(list: HWND) {
                     let mut fi: SHFILEINFOW = std::mem::zeroed();
                     let ic = if SHGetFileInfoW(w(&row.name).as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX) != 0 { fi.iIcon } else { -1 };
                     if row.name.len() == 3 && row.name.ends_with(":\\") {
-                        let letter = row.name.chars().next().unwrap_or('C');
-                        let mut vol = [0u16; 64];
-                        let ok = windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW(w(&row.name).as_ptr(), vol.as_mut_ptr(), 64, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0);
-                        let vname = if ok != 0 { wstr(vol.as_ptr()) } else { String::new() };
-                        let base = if vname.is_empty() { "Local Disk" } else { &vname };
-                        let (mut free, mut total) = (0u64, 0u64);
-                        let cap = (windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(w(&row.name).as_ptr(), &mut free, &mut total, ptr::null_mut()) != 0 && total > 0).then_some((free, total));
-                        (format!("{base} ({letter}:)"), cap, ic)
+                        let (title, cap) = drive_label_cap(&row.name);
+                        (title, cap, ic)
                     } else {
                         let title = Path::new(&row.name).file_name().map_or_else(|| row.name.clone(), |n| n.to_string_lossy().into_owned());
                         (title, None, ic)
@@ -624,11 +869,8 @@ unsafe fn paint_this_pc(list: HWND) {
             if let Some((free, total)) = cap {
                 SelectObject(dc, f_txt);
                 text(dc, &title, rc(tx, r.top + sc(6), r.right - sc(10), r.top + sc(24)), pal().text, DT_LEFT);
-                let used = 1.0 - free as f32 / total as f32;
                 let bar = rc(tx, r.top + sc(28), r.right - sc(14), r.top + sc(38));
-                fill(dc, bar, mix(listbg(), pal().text, 0.16), sc(4));
-                let fw = ((bar.right - bar.left) as f32 * used) as i32;
-                fill(dc, rc(bar.left, bar.top, bar.left + fw.max(sc(4)), bar.bottom), if used > 0.9 { winrust_common::style::BAD } else { pal().accent }, sc(4));
+                draw_cap_bar(dc, bar, free, total, listbg(), 0.16);
                 SelectObject(dc, f_sub);
                 text(dc, &format!("{} free of {}", fmt_cap(free), fmt_cap(total)), rc(tx, r.top + sc(41), r.right - sc(10), r.bottom - sc(4)), pal().dim, DT_LEFT);
             } else {
@@ -636,12 +878,7 @@ unsafe fn paint_this_pc(list: HWND) {
                 text(dc, &title, rc(tx, r.top, r.right - sc(10), r.bottom), pal().text, DT_LEFT);
             }
         }
-        if max_s > 0 && cr.bottom > sc(24) {
-            let tot = tot_h.max(1);
-            let th = ((cr.bottom as f32 * cr.bottom as f32 / tot as f32) as i32).clamp(sc(24), cr.bottom - sc(8));
-            let ty = ((cr.bottom - th - sc(8)) as f32 * (scroll as f32 / max_s as f32)) as i32 + sc(4);
-            fill(dc, rc(cr.right - sc(5), ty, cr.right - sc(2), ty + th), mix(listbg(), pal().text, 0.28), sc(3));
-        }
+        draw_vthumb(dc, cr, tot_h, scroll, max_s, listbg(), sc(24), sc(4), sc(2), sc(3), sc(3));
     });
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, of);
@@ -754,6 +991,17 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
         }
     }
     if m == WM_CONTEXTMENU { return 0; }
+    if m == WM_CTLCOLOREDIT {
+        if let Some(brush) = RENAME.with_borrow(|r| r.as_ref().map(|s| s.brush)) {
+            let dc = wp as HDC;
+            SetTextColor(dc, pal().text);
+            SetBkColor(dc, rename_bg());
+            return brush;
+        }
+    }
+    if matches!(m, WM_VSCROLL | WM_HSCROLL | WM_MOUSEWHEEL) {
+        end_rename(false);
+    }
     if m == WM_ERASEBKGND && ST.with(|c| c.try_borrow().map_or(false, |s| !s.thumbs)) {
         let mut cr: RECT = std::mem::zeroed();
         GetClientRect(h, &mut cr);
@@ -762,10 +1010,15 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
         FillRect(dc, &cr, GetStockObject(DC_BRUSH as i32) as HBRUSH);
         return 1;
     }
+    let (mx, my) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
     if m == WM_MOUSEMOVE {
-        let mut ht: LVHITTESTINFO = std::mem::zeroed();
-        ht.pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
-        let i = SendMessageW(h, LVM_HITTEST, 0, &mut ht as *mut _ as isize);
+        let i = if is_empty_hit(h, mx, my) {
+            -1
+        } else {
+            let mut ht: LVHITTESTINFO = std::mem::zeroed();
+            ht.pt = POINT { x: mx, y: my };
+            SendMessageW(h, LVM_HITTEST, 0, &mut ht as *mut _ as isize)
+        };
         let old = ROWHOT.replace(i);
         if old != i {
             redraw_row(h, old);
@@ -775,9 +1028,24 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
         }
     } else if m == WM_MOUSELEAVE {
         redraw_row(h, ROWHOT.replace(-1));
+    } else if matches!(m, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP) && !crate::desk() && is_empty_hit(h, mx, my) {
+        match m {
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+                clear_sel(h);
+                SetFocus(h);
+                InvalidateRect(h, ptr::null(), 0);
+                status_dirty(GetParent(h));
+            }
+            WM_RBUTTONUP => {
+                PostMessageW(GetParent(h), WM_UI, 23, 0);
+            }
+            _ => {}
+        }
+        return 0;
     } else if m == WM_SETFOCUS || m == WM_KILLFOCUS {
         InvalidateRect(h, ptr::null(), 0);
     } else if m == WM_SIZE && !crate::desk() {
+        end_rename(false);
         let r = DefSubclassProc(h, m, wp, lp);
         fit_columns(h);
         return r;
@@ -790,13 +1058,15 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
                 CDDS_PREPAINT => {
                     SetDCBrushColor(nm.hdc, listbg());
                     FillRect(nm.hdc, &nm.rc, GetStockObject(DC_BRUSH as i32) as HBRUSH);
-                    CDRF_NOTIFYITEMDRAW as isize
+                    (CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT) as isize
                 }
                 CDDS_ITEMPREPAINT => {
                     let (dc, r, i) = (nm.hdc, nm.rc, nm.dwItemSpec);
                     SetDCBrushColor(dc, listbg());
                     FillRect(dc, &r, GetStockObject(DC_BRUSH as i32) as HBRUSH);
-                    fill(dc, rc(r.right - 1, r.top + sc(10), r.right, r.bottom - sc(10)), mix(listbg(), pal().text, 0.05), 0);
+                    if i < 3 {
+                        fill(dc, rc(r.right - 1, r.top + sc(10), r.right, r.bottom - sc(10)), mix(listbg(), pal().text, 0.05), 0);
+                    }
                     let mut buf = [0u16; 128];
                     let mut it: HDITEMW = std::mem::zeroed();
                     it.mask = HDI_TEXT;
@@ -813,10 +1083,21 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
                     let f = if sorted { hf[1] } else { hf[0] } as HFONT;
                     let of = SelectObject(dc, f);
                     SetBkMode(dc, TRANSPARENT as i32);
-                    let align = if i == 3 { DT_RIGHT } else { DT_LEFT };
-                    text(dc, &format!("{}{arrow}", wstr(buf.as_ptr())), rc(r.left + sc(10), r.top, r.right - sc(12), r.bottom), if sorted { pal().text } else { pal().dim }, align);
+                    let (align, rpad) = if i == 3 { (DT_RIGHT, sc(18)) } else { (DT_LEFT, sc(12)) };
+                    text(dc, &format!("{}{arrow}", wstr(buf.as_ptr())), rc(r.left + sc(10), r.top, r.right - rpad, r.bottom), if sorted { pal().text } else { pal().dim }, align);
                     SelectObject(dc, of);
                     CDRF_SKIPDEFAULT as isize
+                }
+                CDDS_POSTPAINT => {
+                    let mut hcr: RECT = std::mem::zeroed();
+                    GetClientRect(hdr, &mut hcr);
+                    let mut lr: RECT = std::mem::zeroed();
+                    let tail = if SendMessageW(hdr, HDM_GETITEMRECT, 3, &mut lr as *mut _ as isize) != 0 { lr.right } else { 0 };
+                    if tail < hcr.right {
+                        SetDCBrushColor(nm.hdc, listbg());
+                        FillRect(nm.hdc, &rc(tail, 0, hcr.right, hcr.bottom), GetStockObject(DC_BRUSH as i32) as HBRUSH);
+                    }
+                    CDRF_DODEFAULT as isize
                 }
                 _ => 0,
             };
@@ -827,7 +1108,7 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
 
 struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, cap_min: RECT, cap_max: RECT, cap_close: RECT, back: RECT, fwd: RECT, up: RECT, reload: RECT, pill: RECT, search: RECT, new_btn: RECT, cmds: Vec<RECT>, sort_btn: RECT, view: RECT, more_btn: RECT }
 
-fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT { RECT { left: l, top: t, right: r, bottom: b } }
+pub(crate) fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT { RECT { left: l, top: t, right: r, bottom: b } }
 
 fn layout(cw: i32, n: usize) -> Layout {
     let cap_w = sc(44);
@@ -906,13 +1187,17 @@ pub fn gdiplus_start() {
     }
 }
 
-unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
+pub(crate) unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
+    fill_alpha(dc, r, c, rad, 255);
+}
+
+pub(crate) unsafe fn fill_alpha(dc: HDC, r: RECT, c: u32, rad: i32, alpha: u8) {
     let rad = if winrust_common::style::style().square() { 0 } else { rad };
     use windows_sys::Win32::Graphics::GdiPlus::*;
     let (wd, ht) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
     if wd <= 0.0 || ht <= 0.0 { return; }
     let mut g: *mut GpGraphics = ptr::null_mut();
-    if rad <= 0 || GdipCreateFromHDC(dc, &mut g) != 0 || g.is_null() {
+    if (rad <= 0 && alpha == 255) || GdipCreateFromHDC(dc, &mut g) != 0 || g.is_null() {
         SetDCBrushColor(dc, c);
         let b = GetStockObject(DC_BRUSH as i32) as HBRUSH;
         if rad <= 0 {
@@ -925,25 +1210,30 @@ unsafe fn fill(dc: HDC, r: RECT, c: u32, rad: i32) {
         }
         return;
     }
-    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-    GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
-    let (x, y, d) = (r.left as f32, r.top as f32, (rad as f32).min(wd).min(ht));
-    let mut path: *mut GpPath = ptr::null_mut();
-    GdipCreatePath(FillModeAlternate, &mut path);
-    GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
-    GdipAddPathArc(path, x + wd - d, y, d, d, 270.0, 90.0);
-    GdipAddPathArc(path, x + wd - d, y + ht - d, d, d, 0.0, 90.0);
-    GdipAddPathArc(path, x, y + ht - d, d, d, 90.0, 90.0);
-    GdipClosePathFigure(path);
+    let argb = ((alpha as u32) << 24) | (c & 255) << 16 | (c & 0xFF00) | (c >> 16 & 255);
     let mut br: *mut GpSolidFill = ptr::null_mut();
-    GdipCreateSolidFill(0xFF00_0000 | (c & 255) << 16 | (c & 0xFF00) | (c >> 16 & 255), &mut br);
-    GdipFillPath(g, br as *mut GpBrush, path);
+    GdipCreateSolidFill(argb, &mut br);
+    if rad <= 0 {
+        GdipFillRectangleI(g, br as *mut GpBrush, r.left, r.top, r.right - r.left, r.bottom - r.top);
+    } else {
+        GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+        GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+        let (x, y, d) = (r.left as f32, r.top as f32, (rad as f32).min(wd).min(ht));
+        let mut path: *mut GpPath = ptr::null_mut();
+        GdipCreatePath(FillModeAlternate, &mut path);
+        GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
+        GdipAddPathArc(path, x + wd - d, y, d, d, 270.0, 90.0);
+        GdipAddPathArc(path, x + wd - d, y + ht - d, d, d, 0.0, 90.0);
+        GdipAddPathArc(path, x, y + ht - d, d, d, 90.0, 90.0);
+        GdipClosePathFigure(path);
+        GdipFillPath(g, br as *mut GpBrush, path);
+        GdipDeletePath(path);
+    }
     GdipDeleteBrush(br as *mut GpBrush);
-    GdipDeletePath(path);
     GdipDeleteGraphics(g);
 }
 
-unsafe fn text(dc: HDC, s: &str, mut r: RECT, c: u32, flags: u32) {
+pub(crate) unsafe fn text(dc: HDC, s: &str, mut r: RECT, c: u32, flags: u32) {
     if s.is_empty() { return; }
     SetTextColor(dc, c);
     WBUF.with_borrow_mut(|b| {
@@ -956,6 +1246,21 @@ unsafe fn text(dc: HDC, s: &str, mut r: RECT, c: u32, flags: u32) {
 unsafe fn glow(dc: HDC, key: i32, r: RECT, base: u32, to: u32, rad: i32, on: bool) {
     let (t, p) = (hv(key, on), press_t(key));
     if t > 0.01 || p > 0.0 { fill(dc, r, mix(mix(base, to, t), pal().accent, 0.45 * p), rad); }
+}
+
+unsafe fn paint_drop_btn(dc: HDC, key: i32, r: RECT, cb: u32, hot: i32, glyph: &str, glyph_col: u32, label: &str, f_glyph: HFONT, f_txt: HFONT, f_small: HFONT) {
+    glow(dc, key, r, cb, pal().hover, sc(8), hot == key);
+    if r.right - r.left > sc(50) {
+        SelectObject(dc, f_glyph);
+        text(dc, glyph, rc(r.left + sc(6), r.top, r.left + sc(28), r.bottom), glyph_col, DT_CENTER);
+        SelectObject(dc, f_txt);
+        text(dc, label, rc(r.left + sc(30), r.top, r.right - sc(18), r.bottom), pal().text, DT_LEFT);
+        SelectObject(dc, f_small);
+        text(dc, "\u{E70D}", rc(r.right - sc(18), r.top, r.right - sc(4), r.bottom), pal().dim, DT_CENTER);
+    } else {
+        SelectObject(dc, f_glyph);
+        text(dc, glyph, r, glyph_col, DT_CENTER);
+    }
 }
 
 unsafe fn paint_chrome(hwnd: HWND) {
@@ -1046,48 +1351,15 @@ unsafe fn paint_chrome(hwnd: HWND) {
     }
 
     fill(dc, rc(0, sc(80), cr.right, sc(81)), mix(pal().bg, pal().text, 0.06), 0);
-    glow(dc, NEW_BTN, l.new_btn, cb, pal().hover, sc(8), hot == NEW_BTN);
-    if l.new_btn.right - l.new_btn.left > sc(50) {
-        SelectObject(dc, f_glyph);
-        text(dc, "\u{E710}", rc(l.new_btn.left + sc(6), l.new_btn.top, l.new_btn.left + sc(26), l.new_btn.bottom), pal().accent, DT_CENTER);
-        SelectObject(dc, f_txt);
-        text(dc, "New", rc(l.new_btn.left + sc(28), l.new_btn.top, l.new_btn.right - sc(18), l.new_btn.bottom), pal().text, DT_LEFT);
-        SelectObject(dc, f_small);
-        text(dc, "\u{E70D}", rc(l.new_btn.right - sc(18), l.new_btn.top, l.new_btn.right - sc(4), l.new_btn.bottom), pal().dim, DT_CENTER);
-    } else {
-        SelectObject(dc, f_glyph);
-        text(dc, "\u{E710}", l.new_btn, pal().accent, DT_CENTER);
-    }
+    paint_drop_btn(dc, NEW_BTN, l.new_btn, cb, hot, "\u{E710}", pal().accent, "New", f_glyph, f_txt, f_small);
     fill(dc, rc(l.new_btn.right + sc(5), l.new_btn.top + sc(6), l.new_btn.right + sc(6), l.new_btn.bottom - sc(6)), mix(pal().bg, pal().text, 0.10), 0);
     SelectObject(dc, f_glyph);
     for (i, r) in l.cmds.iter().enumerate() {
         glow(dc, CMD + i as i32, *r, cb, pal().hover, sc(8), hot == CMD + i as i32);
         text(dc, CMD_GLYPHS[i], *r, pal().text, DT_CENTER);
     }
-    glow(dc, SORT_BTN, l.sort_btn, cb, pal().hover, sc(8), hot == SORT_BTN);
-    if l.sort_btn.right - l.sort_btn.left > sc(50) {
-        SelectObject(dc, f_glyph);
-        text(dc, "\u{E8CB}", rc(l.sort_btn.left + sc(6), l.sort_btn.top, l.sort_btn.left + sc(28), l.sort_btn.bottom), pal().text, DT_CENTER);
-        SelectObject(dc, f_txt);
-        text(dc, "Sort", rc(l.sort_btn.left + sc(30), l.sort_btn.top, l.sort_btn.right - sc(18), l.sort_btn.bottom), pal().text, DT_LEFT);
-        SelectObject(dc, f_small);
-        text(dc, "\u{E70D}", rc(l.sort_btn.right - sc(18), l.sort_btn.top, l.sort_btn.right - sc(4), l.sort_btn.bottom), pal().dim, DT_CENTER);
-    } else {
-        SelectObject(dc, f_glyph);
-        text(dc, "\u{E8CB}", l.sort_btn, pal().text, DT_CENTER);
-    }
-    glow(dc, VIEW, l.view, cb, pal().hover, sc(8), hot == VIEW);
-    if l.view.right - l.view.left > sc(50) {
-        SelectObject(dc, f_glyph);
-        text(dc, if thumbs { "\u{E8FD}" } else { "\u{E80A}" }, rc(l.view.left + sc(6), l.view.top, l.view.left + sc(28), l.view.bottom), pal().text, DT_CENTER);
-        SelectObject(dc, f_txt);
-        text(dc, "View", rc(l.view.left + sc(30), l.view.top, l.view.right - sc(18), l.view.bottom), pal().text, DT_LEFT);
-        SelectObject(dc, f_small);
-        text(dc, "\u{E70D}", rc(l.view.right - sc(18), l.view.top, l.view.right - sc(4), l.view.bottom), pal().dim, DT_CENTER);
-    } else {
-        SelectObject(dc, f_glyph);
-        text(dc, if thumbs { "\u{E8FD}" } else { "\u{E80A}" }, l.view, pal().text, DT_CENTER);
-    }
+    paint_drop_btn(dc, SORT_BTN, l.sort_btn, cb, hot, "\u{E8CB}", pal().text, "Sort", f_glyph, f_txt, f_small);
+    paint_drop_btn(dc, VIEW, l.view, cb, hot, if thumbs { "\u{E8FD}" } else { "\u{E80A}" }, pal().text, "View", f_glyph, f_txt, f_small);
     glow(dc, MORE_BTN, l.more_btn, cb, pal().hover, sc(8), hot == MORE_BTN);
     SelectObject(dc, f_glyph);
     text(dc, "\u{E712}", l.more_btn, pal().text, DT_CENTER);
@@ -1108,7 +1380,15 @@ unsafe fn paint_chrome(hwnd: HWND) {
             text(dc, &format!("Results for \u{201C}{q}\u{201D}"), rc(x0 + sc(6), l.pill.top, x1, l.pill.bottom), pal().accent, DT_LEFT);
         } else {
             let parts = crumbs_of(&dir);
-            let width = |s: &str| { let mut r = rc(0, 0, 0, 0); DrawTextW(dc, w(s).as_ptr(), -1, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX); r.right + sc(16) };
+            let width = |s: &str| {
+                let mut r = rc(0, 0, 0, 0);
+                WBUF.with_borrow_mut(|b| {
+                    b.clear();
+                    b.extend(s.encode_utf16());
+                    DrawTextW(dc, b.as_ptr(), b.len() as i32, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+                });
+                r.right + sc(16)
+            };
             let chev = sc(18);
             SelectObject(dc, f_txt);
             let ws: Vec<i32> = parts.iter().map(|p| width(&p.0)).collect();
@@ -1402,11 +1682,7 @@ unsafe extern "system" fn menu_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
                     text(dc, "\u{E76C}", rc(r.right - sc(20), r.top, r.right - sc(4), r.bottom), pal().dim, DT_CENTER);
                 }
             }
-            if max_s > 0 && cr.bottom > sc(16) {
-                let th = ((cr.bottom as f32 * cr.bottom as f32 / st.tot_h.max(1) as f32) as i32).clamp(sc(18), cr.bottom - sc(6));
-                let ty = ((cr.bottom - th - sc(6)) as f32 * (st.scroll as f32 / max_s as f32)) as i32 + sc(3);
-                fill(dc, rc(cr.right - sc(4), ty, cr.right - sc(1), ty + th), mix(bg_col, pal().text, 0.28), sc(2));
-            }
+            draw_vthumb(dc, cr, st.tot_h, st.scroll, max_s, bg_col, sc(18), sc(3), sc(1), sc(3), sc(2));
             BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
             SelectObject(dc, of);
             EndPaint(h, &ps);
@@ -1557,7 +1833,11 @@ pub unsafe fn popup_menu_at(owner: HWND, items: &[MenuItem], pos: Option<(i32, i
     let mut max_w = sc(168);
     for it in items {
         let mut r = rc(0, 0, 0, 0);
-        DrawTextW(dc, w(&it.label).as_ptr(), -1, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        WBUF.with_borrow_mut(|b| {
+            b.clear();
+            b.extend(it.label.encode_utf16());
+            DrawTextW(dc, b.as_ptr(), b.len() as i32, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        });
         let extra = if it.sub.is_empty() { sc(54) } else { sc(70) };
         max_w = max_w.max(r.right + extra);
     }
@@ -1749,7 +2029,6 @@ pub unsafe fn layout_children(cw: i32, ch: i32) {
     MoveWindow(chrome, 0, 0, cw, top, 1);
     MoveWindow(nav, 0, top, nw, h, 1);
     MoveWindow(list, nw, top, cw - nw, h, 1);
-    fit_columns(list);
 }
 
 fn nav_hit(y: i32) -> Option<usize> {
@@ -1777,10 +2056,10 @@ unsafe fn paint_nav(hwnd: HWND) {
     SetBkMode(dc, TRANSPARENT as i32);
     let mut nf = NAV_FONTS.get();
     if nf[0] == 0 {
-        nf = [font(13, 400, ui_face()), font(12, 600, ui_face()), font(16, 400, winrust_common::style::icon_face()), font(11, 400, ui_face())];
+        nf = [font(13, 400, ui_face()), font(12, 600, ui_face()), font(16, 400, winrust_common::style::icon_face())];
         NAV_FONTS.set(nf);
     }
-    let [f_txt, f_head, f_glyph, _f_small] = [nf[0] as HFONT, nf[1] as HFONT, nf[2] as HFONT, nf[3] as HFONT];
+    let [f_txt, f_head, f_glyph] = [nf[0] as HFONT, nf[1] as HFONT, nf[2] as HFONT];
     let of = SelectObject(dc, f_txt);
     let cur = ST.with(|c| c.try_borrow().ok().map(|s| s.dir.to_string_lossy().to_lowercase())).unwrap_or_default();
     let hot = NAVHOT.get();
@@ -1829,12 +2108,7 @@ unsafe fn paint_nav(hwnd: HWND) {
             y += hgt;
         }
     });
-    if max_s > 0 && cr.bottom > sc(24) {
-        let tot = nav_total_h().max(1);
-        let th = ((cr.bottom as f32 * cr.bottom as f32 / tot as f32) as i32).clamp(sc(24), cr.bottom - sc(8));
-        let ty = ((cr.bottom - th - sc(8)) as f32 * (scroll as f32 / max_s as f32)) as i32 + sc(4);
-        fill(dc, rc(cr.right - sc(5), ty, cr.right - sc(2), ty + th), mix(pal().bg, pal().text, 0.28), sc(3));
-    }
+    draw_vthumb(dc, cr, nav_total_h(), scroll, max_s, pal().bg, sc(24), sc(4), sc(2), sc(3), sc(3));
     fill(dc, rc(cr.right - 1, 0, cr.right, cr.bottom), mix(pal().bg, pal().text, 0.06), 0);
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, of);

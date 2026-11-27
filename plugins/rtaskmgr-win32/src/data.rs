@@ -3,10 +3,9 @@ use std::{
     collections::{HashMap, VecDeque},
     time::Instant,
 };
-use sysinfo::{Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 pub const CAP: usize = 60;
-const EMA: f32 = 2.0 / 31.0;
 pub const CRITICAL: [&str; 8] = ["system", "registry", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe"];
 
 #[derive(Clone)]
@@ -16,7 +15,6 @@ pub struct Proc {
     pub name: String,
     pub exe: Option<String>,
     pub cpu: f32,
-    pub avg: f32,
     pub mem: u64,
     pub disk: f64,
     pub net: f64,
@@ -29,13 +27,6 @@ pub struct Proc {
 pub struct Series {
     pub cpu: VecDeque<f32>,
     pub mem: VecDeque<f32>,
-    pub disk: VecDeque<f32>,
-    pub rd: VecDeque<f32>,
-    pub wr: VecDeque<f32>,
-    pub rx: VecDeque<f32>,
-    pub tx: VecDeque<f32>,
-    pub gpu: VecDeque<f32>,
-    pub cores: Vec<VecDeque<f32>>,
 }
 
 pub fn push(q: &mut VecDeque<f32>, v: f32) {
@@ -47,13 +38,10 @@ pub fn push(q: &mut VecDeque<f32>, v: f32) {
 
 #[derive(Default)]
 pub struct GpuSeries {
-    pub total: VecDeque<f32>,
     pub g3d: VecDeque<f32>,
-    pub gcopy: VecDeque<f32>,
     pub genc: VecDeque<f32>,
     pub gdec: VecDeque<f32>,
     pub ded: VecDeque<f32>,
-    pub shr: VecDeque<f32>,
 }
 
 pub struct GpuState {
@@ -91,9 +79,9 @@ pub struct NicState {
 
 pub struct Data {
     pub sys: System,
-    nets: Networks,
     pub procs: Vec<Proc>,
-    ema: HashMap<u32, f32>,
+    cur: HashMap<u32, f32>,
+    titles: HashMap<u32, String>,
     pub svcs: Vec<sys::Svc>,
     pub svc_pids: HashMap<u32, Vec<String>>,
     pub startup: Vec<startup::Item>,
@@ -113,7 +101,6 @@ pub struct Data {
     pub is_admin: bool,
     pub efficiency: std::collections::HashSet<u32>,
     pub suspended: std::collections::HashSet<u32>,
-    pub disk_total: u64,
     pub hw_mem: hw::MemHw,
     pub gpus: Vec<GpuState>,
     pub disks: Vec<DiskState>,
@@ -142,9 +129,9 @@ impl Data {
     fn new_inner(cfg: store::Settings, is_admin: bool) -> Data {
         Data {
             sys: System::new().expect("sysinfo"),
-            nets: Networks::new_with_refreshed_list().expect("сетевые интерфейсы"),
             procs: vec![],
-            ema: HashMap::new(),
+            cur: HashMap::new(),
+            titles: HashMap::new(),
             svcs: vec![],
             svc_pids: HashMap::new(),
             startup: vec![],
@@ -164,7 +151,6 @@ impl Data {
             is_admin,
             efficiency: Default::default(),
             suspended: Default::default(),
-            disk_total: 0,
             hw_mem: hw::memory_hw(),
             gpus: vec![],
             disks: vec![],
@@ -180,7 +166,7 @@ impl Data {
         self.startup = startup::list();
     }
 
-    pub fn refresh(&mut self) -> Vec<String> {
+    pub fn refresh(&mut self) {
         let dt = self.prev.elapsed().as_secs_f64().clamp(0.3, 5.0);
         self.prev = Instant::now();
         self.ticks += 1;
@@ -199,14 +185,15 @@ impl Data {
         let (used, total) = (self.sys.used_memory(), self.sys.total_memory().max(1));
         self.mem_pct = (100.0 * used as f64 / total as f64) as f32;
         let cores = self.sys.cpus().len().max(1) as f32;
-        let cur: HashMap<u32, f32> = self.sys.processes().values().map(|p| (p.pid().as_u32(), p.cpu_usage() / cores)).collect();
-        self.ema.retain(|k, _| cur.contains_key(k));
-        for (k, v) in &cur {
-            let e = self.ema.entry(*k).or_insert(*v);
-            *e += EMA * (*v - *e);
+        self.cur.clear();
+        for p in self.sys.processes().values() {
+            self.cur.insert(p.pid().as_u32(), p.cpu_usage() / cores);
         }
         if self.etw.is_some() {
-            self.net = net::drain().into_iter().map(|(pid, (rx, tx))| (pid, (rx + tx) as f64 / dt)).collect();
+            self.net.clear();
+            for (pid, (rx, tx)) in net::drain() {
+                self.net.insert(pid, (rx + tx) as f64 / dt);
+            }
         }
         self.sample = self.perf.as_mut().map(|p| p.sample()).unwrap_or_default();
         self.meminfo = perf::mem_info();
@@ -229,9 +216,6 @@ impl Data {
                 g.temp = None;
             }
         }
-        if self.ticks % 30 == 1 {
-            self.disk_total = disk_capacity();
-        }
         if self.ticks % 15 == 1 {
             self.svcs = sys::services();
             self.svc_pids.clear();
@@ -239,69 +223,39 @@ impl Data {
                 self.svc_pids.entry(s.pid).or_default().push(s.name.clone());
             }
         }
-        let titles = if self.ticks % 2 == 1 { Some(sys::window_titles()) } else { None };
-        let old_titles: HashMap<u32, String> = if titles.is_none() {
-            self.procs.iter().filter_map(|p| p.title.clone().map(|t| (p.pid, t))).collect()
-        } else {
-            HashMap::new()
-        };
-        let user_cache = &mut self.user_cache;
-        let procs: Vec<Proc> = self
-            .sys
-            .processes()
-            .values()
-            .map(|p| {
-                let pid = p.pid().as_u32();
-                let d = p.disk_usage();
-                Proc {
-                    pid,
-                    ppid: p.parent().map_or(0, |x| x.as_u32()),
-                    name: p.name().to_string_lossy().into_owned(),
-                    exe: p.exe().map(|e| e.display().to_string()).filter(|e| !e.is_empty()),
-                    cpu: cur.get(&pid).copied().unwrap_or(0.0),
-                    avg: self.ema.get(&pid).copied().unwrap_or(0.0),
-                    mem: p.memory(),
-                    disk: if first { 0.0 } else { (d.read_bytes + d.written_bytes) as f64 / dt },
-                    net: self.net.get(&pid).copied().unwrap_or(0.0),
-                    gpu: self.sample.gpu_by_pid.get(&pid).copied().unwrap_or(0.0),
-                    user: user_cache.entry(pid).or_insert_with(|| sys::process_user(pid).unwrap_or_else(|| "SYSTEM".into())).clone(),
-                    title: match &titles {
-                        Some(t) => t.get(&pid).cloned(),
-                        None => old_titles.get(&pid).cloned(),
-                    },
-                }
-            })
-            .collect();
-        self.procs = procs;
-        self.user_cache.retain(|k, _| cur.contains_key(k));
-        self.efficiency.retain(|p| cur.contains_key(p));
-        self.suspended.retain(|p| cur.contains_key(p));
-
-        let (rx, tx) = self.sample.net.as_ref().map_or_else(
-            || {
-                self.nets.refresh(false);
-                let r = self.nets.iter().fold((0u64, 0u64), |a, (_, n)| (a.0 + n.received(), a.1 + n.transmitted()));
-                (r.0 as f64 / dt, r.1 as f64 / dt)
-            },
-            |n| (n.rx, n.tx),
-        );
-        if !first {
-            let s = &mut self.series;
-            push(&mut s.cpu, self.cpu_total);
-            push(&mut s.mem, self.mem_pct);
-            push(&mut s.disk, self.sample.disk_active);
-            push(&mut s.rd, (self.sample.disk_read / 1_048_576.0) as f32);
-            push(&mut s.wr, (self.sample.disk_write / 1_048_576.0) as f32);
-            push(&mut s.rx, (rx * 8.0 / 1000.0) as f32);
-            push(&mut s.tx, (tx * 8.0 / 1000.0) as f32);
-            push(&mut s.gpu, self.sample.gpu_total);
-            s.cores.resize_with(self.sys.cpus().len(), VecDeque::new);
-            for (q, c) in s.cores.iter_mut().zip(self.sys.cpus()) {
-                push(q, c.usage());
-            }
+        if self.ticks % 2 == 1 {
+            self.titles = sys::window_titles();
         }
+        let user_cache = &mut self.user_cache;
+        let cur = &self.cur;
+        let net = &self.net;
+        let titles = &self.titles;
+        let gpu_by_pid = &self.sample.gpu_by_pid;
+        self.procs.clear();
+        self.procs.extend(self.sys.processes().values().map(|p| {
+            let pid = p.pid().as_u32();
+            let d = p.disk_usage();
+            Proc {
+                pid,
+                ppid: p.parent().map_or(0, |x| x.as_u32()),
+                name: p.name().to_string_lossy().into_owned(),
+                exe: p.exe().map(|e| e.display().to_string()).filter(|e| !e.is_empty()),
+                cpu: cur.get(&pid).copied().unwrap_or(0.0),
+                mem: p.memory(),
+                disk: if first { 0.0 } else { (d.read_bytes + d.written_bytes) as f64 / dt },
+                net: net.get(&pid).copied().unwrap_or(0.0),
+                gpu: gpu_by_pid.get(&pid).copied().unwrap_or(0.0),
+                user: user_cache.entry(pid).or_insert_with(|| sys::process_user(pid).unwrap_or_else(|| "SYSTEM".into())).clone(),
+                title: titles.get(&pid).cloned(),
+            }
+        }));
+        self.user_cache.retain(|k, _| self.cur.contains_key(k));
+        self.efficiency.retain(|p| self.cur.contains_key(p));
+        self.suspended.retain(|p| self.cur.contains_key(p));
 
         if !first {
+            push(&mut self.series.cpu, self.cpu_total);
+            push(&mut self.series.mem, self.mem_pct);
             for g in self.gpus.iter_mut() {
                 let smp = self.sample.gpus.get(&g.adapter.luid).cloned().unwrap_or_default();
                 let ty = |k: &str| smp.types.get(k).copied().unwrap_or(0.0);
@@ -309,13 +263,10 @@ impl Data {
                 g.ded_used = smp.ded;
                 g.shr_used = smp.shr;
                 let s = &mut g.series;
-                push(&mut s.total, smp.total);
                 push(&mut s.g3d, ty("3D"));
-                push(&mut s.gcopy, ty("Copy"));
                 push(&mut s.genc, ty("VideoEncode"));
                 push(&mut s.gdec, ty("VideoDecode"));
                 push(&mut s.ded, (smp.ded >> 20) as f32);
-                push(&mut s.shr, (smp.shr >> 20) as f32);
             }
             for ds in &self.sample.disks {
                 let i = match self.disks.iter().position(|d| d.number == ds.number) {
@@ -360,16 +311,7 @@ impl Data {
             let alive: std::collections::HashSet<&String> = self.sample.nics.iter().map(|n| &n.name).collect();
             self.nics.retain(|n| alive.contains(&n.name));
         }
-
-        vec![]
     }
-}
-
-fn disk_capacity() -> u64 {
-    use sysinfo::Disks;
-    Disks::new_with_refreshed_list()
-        .map(|d| (&d).into_iter().find(|x| x.mount_point().to_string_lossy().to_uppercase().starts_with("C:")).map_or(0, |x| x.total_space()))
-        .unwrap_or(0)
 }
 
 pub fn process_cmd(d: &Data, pid: u32) -> String {

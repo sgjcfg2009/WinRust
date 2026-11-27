@@ -26,7 +26,8 @@ const REGS: &[(&str, &str, u32, &str)] = &[
 ];
 
 fn run(prog: &str, args: &[&str]) -> (bool, String) {
-    match Command::new(prog).args(args).output() {
+    use std::os::windows::process::CommandExt;
+    match Command::new(prog).args(args).creation_flags(0x0800_0000).output() {
         Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned()),
         Err(e) => (false, e.to_string()),
     }
@@ -34,7 +35,10 @@ fn run(prog: &str, args: &[&str]) -> (bool, String) {
 
 fn start_mode(svc: &str) -> Option<&'static str> {
     let (ok, out) = run("sc.exe", &["qc", svc]);
-    let line = out.lines().find(|l| ok && l.contains("START_TYPE"))?;
+    if !ok {
+        return None;
+    }
+    let line = out.lines().find(|l| l.contains("START_TYPE"))?;
     Some(if line.contains("DISABLED") {
         "disabled"
     } else if line.contains("DEMAND_START") {
@@ -54,12 +58,8 @@ fn undo_path() -> PathBuf {
     PathBuf::from(env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join("rs-debloat").join("undo.txt")
 }
 
-fn services(with_wsearch: bool) -> Vec<(&'static str, &'static str)> {
-    let mut v = SERVICES.to_vec();
-    if with_wsearch {
-        v.push(WSEARCH);
-    }
-    v
+fn services(with_wsearch: bool) -> impl Iterator<Item = (&'static str, &'static str)> {
+    SERVICES.iter().copied().chain(with_wsearch.then_some(WSEARCH))
 }
 
 fn plan(with_wsearch: bool) {
@@ -113,10 +113,10 @@ fn undo() -> Result<(), String> {
     let path = undo_path();
     let text = fs::read_to_string(&path).map_err(|_| "nothing to undo (no undo file)".to_string())?;
     for line in text.lines() {
-        let f: Vec<&str> = line.split('|').collect();
-        let ok = match f.as_slice() {
-            ["svc", name, mode] => run("sc.exe", &["config", name, "start=", mode]).0,
-            ["reg", key, value] => run("reg.exe", &["delete", key, "/v", value, "/f"]).0,
+        let Some((kind, rest)) = line.split_once('|') else { continue };
+        let ok = match (kind, rest.split_once('|')) {
+            ("svc", Some((name, mode))) => run("sc.exe", &["config", name, "start=", mode]).0,
+            ("reg", Some((key, value))) => run("reg.exe", &["delete", key, "/v", value, "/f"]).0,
             _ => continue,
         };
         println!("{}  {line}", if ok { "restored" } else { "FAILED  " });

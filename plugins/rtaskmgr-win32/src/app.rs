@@ -135,25 +135,52 @@ pub struct App {
     pub icon_big: nwg::Icon,
     pub data: RefCell<Data>,
     pub ui: RefCell<Ui>,
-    pub fonts: Fonts,
-    pub scale: f64,
+    pub fonts: RefCell<Fonts>,
+    pub scale: Cell<f64>,
     pub edit_brush: Cell<isize>,
+    pub mem_dc: Cell<isize>,
+    pub mem_bmp: Cell<(isize, i32, i32)>,
+    pub mem_old_bmp: Cell<isize>,
     pub search_rect: Cell<R>,
     pub last_tick: Cell<Instant>,
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
+impl Drop for App {
+    fn drop(&mut self) {
+        unsafe {
+            let brush = self.edit_brush.get();
+            if brush != 0 {
+                winapi::um::wingdi::DeleteObject(brush as _);
+            }
+            let dc = self.mem_dc.get();
+            if dc != 0 {
+                let old = self.mem_old_bmp.get();
+                if old != 0 {
+                    winapi::um::wingdi::SelectObject(dc as _, old as _);
+                }
+                let (bmp, _, _) = self.mem_bmp.get();
+                if bmp != 0 {
+                    winapi::um::wingdi::DeleteObject(bmp as _);
+                }
+                winapi::um::wingdi::DeleteDC(dc as _);
+            }
+        }
+    }
 }
 
-fn page_buttons(p: Page) -> Vec<(Btn, &'static str, char)> {
+fn page_buttons(p: Page) -> &'static [(Btn, &'static str, char)] {
+    const PROCS: [(Btn, &str, char); 4] = [(Btn::RunTask, "Run new task", '\u{E710}'), (Btn::EndTask, "End task", '\u{E711}'), (Btn::Efficiency, "Efficiency mode", '\u{E945}'), (Btn::More, "", '\u{E712}')];
+    const PERF: [(Btn, &str, char); 2] = [(Btn::RunTask, "Run new task", '\u{E710}'), (Btn::More, "", '\u{E712}')];
+    const USERS: [(Btn, &str, char); 2] = [(Btn::EndTask, "End task", '\u{E711}'), (Btn::More, "", '\u{E712}')];
+    const DETAILS: [(Btn, &str, char); 3] = [(Btn::RunTask, "Run new task", '\u{E710}'), (Btn::EndTask, "End task", '\u{E711}'), (Btn::More, "", '\u{E712}')];
+    const STARTUP: [(Btn, &str, char); 4] = [(Btn::StartEnable, "Enable", '\u{E73E}'), (Btn::StartDisable, "Disable", '\u{E711}'), (Btn::StartDelete, "Delete", '\u{E74D}'), (Btn::More, "", '\u{E712}')];
     match p {
-        Page::Processes => vec![(Btn::RunTask, "Run new task", '\u{E710}'), (Btn::EndTask, "End task", '\u{E711}'), (Btn::Efficiency, "Efficiency mode", '\u{E945}'), (Btn::More, "", '\u{E712}')],
-        Page::Performance => vec![(Btn::RunTask, "Run new task", '\u{E710}'), (Btn::More, "", '\u{E712}')],
-        Page::Users => vec![(Btn::EndTask, "End task", '\u{E711}'), (Btn::More, "", '\u{E712}')],
-        Page::Details => vec![(Btn::RunTask, "Run new task", '\u{E710}'), (Btn::EndTask, "End task", '\u{E711}'), (Btn::More, "", '\u{E712}')],
-        Page::Startup => vec![(Btn::StartEnable, "Enable", '\u{E73E}'), (Btn::StartDisable, "Disable", '\u{E711}'), (Btn::StartDelete, "Delete", '\u{E74D}'), (Btn::More, "", '\u{E712}')],
-        _ => vec![],
+        Page::Processes => &PROCS,
+        Page::Performance => &PERF,
+        Page::Users => &USERS,
+        Page::Details => &DETAILS,
+        Page::Startup => &STARTUP,
+        _ => &[],
     }
 }
 
@@ -179,7 +206,7 @@ impl App {
         let compact_btns = band.w() < px(860.0);
         let mut buttons = vec![];
         let mut right = band.r - px(12.0);
-        for (btn, label, glyph) in page_buttons(ui.page).into_iter().rev() {
+        for &(btn, label, glyph) in page_buttons(ui.page).iter().rev() {
             let lbl = if compact_btns { "" } else { label };
             let bw = if lbl.is_empty() { px(36.0) } else { g.text_w(lbl, Font::Ui) + px(44.0) };
             let r = R::new(right - bw, px(10.0), right, px(10.0 + 32.0));
@@ -256,7 +283,7 @@ impl App {
                 let auto_w = (body.w() * 24 / 100).clamp(px(136.0), px(256.0)).min((body.w() / 3).max(px(120.0)));
                 let list_w = ui.perf_split.map_or(auto_w, |v| (v * s).round() as i32).clamp(min_w, max_w);
                 lay.perf_list = R::new(body.l, body.t, body.l + list_w, body.b);
-                let n = perf_kinds(d).len().max(1) as i32;
+                let n = (2 + d.disks.len() + d.nics.len() + d.gpus.len()).max(1) as i32;
                 let item_h = px(76.0).min((body.h() - px(16.0)) / n);
                 lay.perf_items = (0..n).map(|i| R::new(lay.perf_list.l + px(6.0), body.t + px(8.0) + i * item_h, lay.perf_list.r - px(6.0), body.t + px(8.0) + (i + 1) * item_h)).collect();
                 lay.perf_main = R::new(lay.perf_list.r + px(16.0), body.t + px(10.0), body.r - px(16.0), body.b - px(10.0));
@@ -287,22 +314,26 @@ impl App {
             GetClientRect(hwnd, &mut rc);
             let (w, h) = (rc.right, rc.bottom);
             if w > 0 && h > 0 {
-                thread_local! { static TM_BUF: Cell<(isize, isize, i32, i32)> = const { Cell::new((0, 0, 0, 0)) }; }
-                let (mut mem_i, mut bmp_i, bw, bh) = TM_BUF.get();
+                let mut mem_i = self.mem_dc.get();
                 if mem_i == 0 {
                     mem_i = winapi::um::wingdi::CreateCompatibleDC(hdc) as isize;
+                    self.mem_dc.set(mem_i);
                 }
                 let mem = mem_i as winapi::shared::windef::HDC;
+                let (mut bmp_i, bw, bh) = self.mem_bmp.get();
                 if bmp_i == 0 || bw != w || bh != h {
                     let nb = winapi::um::wingdi::CreateCompatibleBitmap(hdc, w, h);
                     let prev = winapi::um::wingdi::SelectObject(mem, nb as *mut _);
                     if bmp_i != 0 {
                         winapi::um::wingdi::DeleteObject(prev);
+                    } else {
+                        self.mem_old_bmp.set(prev as isize);
                     }
                     bmp_i = nb as isize;
-                    TM_BUF.set((mem_i, bmp_i, w, h));
+                    self.mem_bmp.set((bmp_i, w, h));
                 }
-                let g = G { dc: mem, s: self.scale, th: ui.th, fonts: &self.fonts };
+                let fonts = self.fonts.borrow();
+                let g = G { dc: mem, s: self.scale.get(), th: ui.th, fonts: &fonts };
                 let lay = self.compute_layout(&g, &ui, &d, w, h);
                 let area_h = if ui.has_table() { lay.rows_area.h() } else { lay.body.h() } as f64;
                 let max_scroll = (self.content_height(&g, &ui, &lay, &d) - area_h).max(0.0);
@@ -328,16 +359,42 @@ impl App {
     pub fn place_search(&self) {
         let ui = self.ui.borrow();
         let Some(lay) = &ui.lay else { return };
-        let show = ui.page_has_search() && lay.search.w() >= (60.0 * self.scale) as i32;
-        let s = self.scale;
+        let s = self.scale.get();
+        let show = ui.page_has_search() && lay.search.w() >= (60.0 * s) as i32;
         let r = lay.search;
         if self.search_rect.get() != r || self.search.visible() != show {
             self.search_rect.set(r);
-            let lg = |v: i32| (v as f64 / s).round() as i32;
-            self.search.set_position(lg(r.l) + 10, lg(r.t) + 7);
-            self.search.set_size((lg(r.w()) - 44).max(40) as u32, 20);
+            let px = |v: f64| (v * s).round() as i32;
+            if let Some(h) = self.search.handle.hwnd() {
+                let eh = px(20.0).max(16);
+                unsafe {
+                    SetWindowPos(
+                        h,
+                        null_mut(),
+                        r.l + px(10.0),
+                        r.t + (r.h() - eh) / 2,
+                        (r.w() - px(44.0)).max(px(40.0)),
+                        eh,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
             self.search.set_visible(show);
         }
+    }
+
+    pub fn on_dpi_changed(&self, hwnd: HWND, dpi: u32, rc: &winapi::shared::windef::RECT) {
+        let s = (dpi as f64 / 96.0).max(0.5);
+        self.scale.set(s);
+        self.fonts.borrow_mut().rebuild(s);
+        if let Some(sh) = self.search.handle.hwnd() {
+            unsafe { SendMessageW(sh, WM_SETFONT, self.fonts.borrow().get(Font::Ui) as usize, 1) };
+        }
+        unsafe {
+            SetWindowPos(hwnd, null_mut(), rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        self.search_rect.set(R::new(0, 0, 0, 0));
+        self.invalidate();
     }
 
     pub fn invalidate(&self) {
@@ -357,9 +414,10 @@ impl App {
         if lay.band.contains(x, y) {
             return lay.buttons.iter().find(|b| b.0.contains(x, y)).map_or(Hit::None, |b| Hit::Button(b.1));
         }
+        let s = self.scale.get();
         match ui.page {
             Page::Performance => {
-                if (x - lay.perf_list.r).abs() <= (5.0 * self.scale) as i32 && y >= lay.perf_list.t && y <= lay.perf_list.b {
+                if (x - lay.perf_list.r).abs() <= (5.0 * s) as i32 && y >= lay.perf_list.t && y <= lay.perf_list.b {
                     return Hit::PerfSplit;
                 }
                 lay.perf_items.iter().position(|r| r.contains(x, y)).map_or(Hit::None, Hit::PerfItem)
@@ -371,19 +429,19 @@ impl App {
                     return (0..cols.len()).find(|&i| x >= lay.col_x[i] && x < lay.col_x[i + 1]).map_or(Hit::None, Hit::Header);
                 }
                 if lay.rows_area.contains(x, y) {
-                    let content = ui.rows.len() as f64 * (ROW_H * self.scale).round();
-                    if content > lay.rows_area.h() as f64 && x >= lay.rows_area.r - (10.0 * self.scale) as i32 {
+                    let content = ui.rows.len() as f64 * (ROW_H * s).round();
+                    if content > lay.rows_area.h() as f64 && x >= lay.rows_area.r - (10.0 * s) as i32 {
                         return Hit::VBar;
                     }
-                    let i = ((y - lay.rows_area.t) as f64 + ui.scroll) / (ROW_H * self.scale).round();
+                    let i = ((y - lay.rows_area.t) as f64 + ui.scroll) / (ROW_H * s).round();
                     let i = i.floor() as usize;
                     if i < ui.rows.len() {
                         let r = &ui.rows[i];
                         if r.is_section {
                             return Hit::None;
                         }
-                        let chev_x = lay.col_x[0] + (12.0 * self.scale) as i32 + r.depth as i32 * (22.0 * self.scale) as i32;
-                        if matches!(ui.page, Page::Processes | Page::Users) && r.expandable && x >= chev_x - (4.0 * self.scale) as i32 && x < chev_x + (22.0 * self.scale) as i32 {
+                        let chev_x = lay.col_x[0] + (12.0 * s) as i32 + r.depth as i32 * (22.0 * s) as i32;
+                        if matches!(ui.page, Page::Processes | Page::Users) && r.expandable && x >= chev_x - (4.0 * s) as i32 && x < chev_x + (22.0 * s) as i32 {
                             return Hit::Chevron(i);
                         }
                         return Hit::Row(i);
@@ -409,24 +467,25 @@ impl App {
         let hit = self.hit_test(&ui, x, y);
         let mut redraw = hit != ui.hit;
         ui.hit = hit;
+        let s = self.scale.get();
         if ui.perf_drag
-            && let Some(lay) = ui.lay.clone()
+            && let Some((body_l, body_w)) = ui.lay.as_ref().map(|l| (l.body.l, l.body.w()))
         {
-            let max_w = ((lay.body.w() as f64 / self.scale) - 240.0).max(120.0);
-            ui.perf_split = Some(((x - lay.body.l) as f64 / self.scale).clamp(120.0, max_w));
+            let max_w = ((body_w as f64 / s) - 240.0).max(120.0);
+            ui.perf_split = Some(((x - body_l) as f64 / s).clamp(120.0, max_w));
             redraw = true;
         }
         if ui.drag.is_some()
             && let Some((sy, s0)) = ui.drag
-            && let Some(lay) = ui.lay.clone() {
-                let content = ui.rows.len() as f64 * (ROW_H * self.scale).round();
-                let area = lay.rows_area.h() as f64;
-                if content > area {
-                    let thumb = ((area / content) * area).max(24.0 * self.scale);
-                    ui.scroll = (s0 + (y - sy) as f64 * (content - area) / (area - thumb)).clamp(0.0, content - area);
-                    redraw = true;
-                }
+            && let Some(area_h) = ui.lay.as_ref().map(|l| l.rows_area.h() as f64)
+        {
+            let content = ui.rows.len() as f64 * (ROW_H * s).round();
+            if content > area_h {
+                let thumb = ((area_h / content) * area_h).max(24.0 * s);
+                ui.scroll = (s0 + (y - sy) as f64 * (content - area_h) / (area_h - thumb)).clamp(0.0, content - area_h);
+                redraw = true;
             }
+        }
         drop(ui);
         unsafe {
             let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
@@ -529,7 +588,7 @@ impl App {
 
     pub fn on_wheel(&self, delta: i16) {
         let mut ui = self.ui.borrow_mut();
-        ui.scroll -= delta as f64 / 120.0 * 3.0 * (ROW_H * self.scale).round();
+        ui.scroll -= delta as f64 / 120.0 * 3.0 * (ROW_H * self.scale.get()).round();
         drop(ui);
         self.invalidate();
     }
@@ -578,7 +637,7 @@ impl App {
             let ui = self.ui.borrow();
             ui.sel.as_ref().and_then(|k| ui.rows.iter().position(|r| &r.key == k))
         };
-        let step = ((self.ui.borrow().lay.as_ref().map_or(10, |l| l.rows_area.h()) as f64 / (ROW_H * self.scale).round()) as usize).max(1);
+        let step = ((self.ui.borrow().lay.as_ref().map_or(10, |l| l.rows_area.h()) as f64 / (ROW_H * self.scale.get()).round()) as usize).max(1);
         let target = match vk as i32 {
             VK_DOWN => Some(cur.map_or(0, |c| (c + 1).min(n - 1))),
             VK_UP => Some(cur.map_or(0, |c| c.saturating_sub(1))),
@@ -619,13 +678,13 @@ impl App {
             }
             if ui.rows.get(t).is_some_and(|r| !r.is_section) {
                 ui.sel = Some(ui.rows[t].key.clone());
-                if let Some(lay) = ui.lay.clone() {
-                    let rh = (ROW_H * self.scale).round();
+                if let Some(area_h) = ui.lay.as_ref().map(|l| l.rows_area.h() as f64) {
+                    let rh = (ROW_H * self.scale.get()).round();
                     let (top, bot) = (t as f64 * rh, (t as f64 + 1.0) * rh);
                     if top < ui.scroll {
                         ui.scroll = top;
-                    } else if bot > ui.scroll + lay.rows_area.h() as f64 {
-                        ui.scroll = bot - lay.rows_area.h() as f64;
+                    } else if bot > ui.scroll + area_h {
+                        ui.scroll = bot - area_h;
                     }
                 }
             }
@@ -697,12 +756,7 @@ impl App {
             let ui = self.ui.borrow();
             self.data.borrow_mut().want_gpu_temp = ui.page == Page::Performance && matches!(ui.perf_sel, PerfKind::Gpu(_));
         }
-        let notes = self.data.borrow_mut().refresh();
-        if !notes.is_empty() {
-            let msg = notes.join("; ");
-            self.toast(&msg);
-            self.tray.show(&msg, Some("Task Manager"), None, None);
-        }
+        self.data.borrow_mut().refresh();
         if self.hidden() {
             return;
         }
@@ -758,8 +812,9 @@ impl App {
         let Some((id, r)) = id else { return };
         match id {
             SettingId::Theme => {
-                let ctl_l = r.r - (200.0 * self.scale) as i32;
-                let seg = ((x - ctl_l) / (((200.0 * self.scale) as i32 - (16.0 * self.scale) as i32) / 3).max(1)).clamp(0, 2);
+                let s = self.scale.get();
+                let ctl_l = r.r - (200.0 * s) as i32;
+                let seg = ((x - ctl_l) / (((200.0 * s) as i32 - (16.0 * s) as i32) / 3).max(1)).clamp(0, 2);
                 self.do_act(Act::SetTheme(seg as u8));
             }
             SettingId::Tray => self.do_act(Act::ToggleTray),
@@ -1172,6 +1227,9 @@ impl App {
 
     pub fn quit(&self) {
         self.save_settings();
+        if let Some(h) = self.win.handle.hwnd() {
+            unsafe { UnregisterHotKey(h, 1) };
+        }
         if let Some(s) = self.data.borrow_mut().etw.take() {
             crate::net::stop(s);
         }
@@ -1222,22 +1280,28 @@ fn build_menu(items: &[MI], acts: &mut Vec<Act>) -> HMENU {
 }
 
 pub fn set_menu_theme(dark: bool) {
+    use std::sync::OnceLock;
     use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryW};
-    unsafe {
+    type SetFn = extern "system" fn(i32) -> i32;
+    type FlushFn = extern "system" fn();
+    static FUNCS: OnceLock<(Option<SetFn>, Option<FlushFn>)> = OnceLock::new();
+    let (set, flush) = *FUNCS.get_or_init(|| unsafe {
         let lib = LoadLibraryW(wide("uxtheme.dll").as_ptr());
         if lib.is_null() {
-            return;
+            return (None, None);
         }
-        let set = GetProcAddress(lib, 135 as *const i8);
-        let flush = GetProcAddress(lib, 136 as *const i8);
-        if !set.is_null() {
-            let f: extern "system" fn(i32) -> i32 = std::mem::transmute(set);
-            f(if dark { 2 } else { 3 });
-        }
-        if !flush.is_null() {
-            let f: extern "system" fn() = std::mem::transmute(flush);
-            f();
-        }
+        let s = GetProcAddress(lib, 135 as *const i8);
+        let f = GetProcAddress(lib, 136 as *const i8);
+        (
+            (!s.is_null()).then(|| std::mem::transmute::<_, SetFn>(s)),
+            (!f.is_null()).then(|| std::mem::transmute::<_, FlushFn>(f)),
+        )
+    });
+    if let Some(f) = set {
+        f(if dark { 2 } else { 3 });
+    }
+    if let Some(f) = flush {
+        f();
     }
 }
 

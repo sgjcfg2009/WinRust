@@ -2,7 +2,7 @@ use std::{collections::HashMap, ptr::null_mut};
 use winapi::um::{
     errhandlingapi::GetLastError,
     handleapi::CloseHandle,
-    processthreadsapi::{GetPriorityClass, OpenProcess, SetPriorityClass},
+    processthreadsapi::{OpenProcess, SetPriorityClass},
     winbase::{
         ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetProcessAffinityMask, HIGH_PRIORITY_CLASS,
         IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
@@ -11,9 +11,7 @@ use winapi::um::{
     winsvc::*,
 };
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
+use crate::ui::wide;
 
 unsafe fn from_wide(p: *const u16) -> String {
     if p.is_null() {
@@ -68,31 +66,14 @@ pub fn services() -> Vec<Svc> {
     out
 }
 
-pub fn service_ctl(name: &str, start: bool) -> Result<(), u32> {
-    unsafe {
-        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
-        if scm.is_null() {
-            return Err(GetLastError());
-        }
-        let n = wide(name);
-        let svc = OpenServiceW(scm, n.as_ptr(), if start { SERVICE_START } else { SERVICE_STOP });
-        let res = if svc.is_null() {
-            Err(GetLastError())
-        } else {
-            let ok = if start {
-                StartServiceW(svc, 0, null_mut())
-            } else {
-                let mut st: SERVICE_STATUS = std::mem::zeroed();
-                ControlService(svc, SERVICE_CONTROL_STOP, &mut st)
-            };
-            let r = if ok != 0 { Ok(()) } else { Err(GetLastError()) };
-            CloseServiceHandle(svc);
-            r
-        };
-        CloseServiceHandle(scm);
-        res
-    }
-}
+pub const PRIORITIES: &[(&str, u32)] = &[
+    ("Realtime", 0x0000_0100),
+    ("High", HIGH_PRIORITY_CLASS),
+    ("Above normal", ABOVE_NORMAL_PRIORITY_CLASS),
+    ("Normal", NORMAL_PRIORITY_CLASS),
+    ("Below normal", BELOW_NORMAL_PRIORITY_CLASS),
+    ("Low", IDLE_PRIORITY_CLASS),
+];
 
 fn with_proc<T>(pid: u32, access: u32, f: impl FnOnce(HANDLE) -> T) -> Option<T> {
     unsafe {
@@ -106,21 +87,8 @@ fn with_proc<T>(pid: u32, access: u32, f: impl FnOnce(HANDLE) -> T) -> Option<T>
     }
 }
 
-pub static PRIORITIES: std::sync::LazyLock<[(&'static str, u32); 5]> = std::sync::LazyLock::new(|| [
-    ("Low", IDLE_PRIORITY_CLASS),
-    ("Below normal", BELOW_NORMAL_PRIORITY_CLASS),
-    ("Normal", NORMAL_PRIORITY_CLASS),
-    ("Above normal", ABOVE_NORMAL_PRIORITY_CLASS),
-    ("High", HIGH_PRIORITY_CLASS),
-]);
-
 pub fn set_priority(pid: u32, class: u32) -> bool {
     with_proc(pid, PROCESS_SET_INFORMATION, |h| unsafe { SetPriorityClass(h, class) != 0 }).unwrap_or(false)
-}
-
-pub fn priority_name(pid: u32) -> String {
-    let c = with_proc(pid, PROCESS_QUERY_LIMITED_INFORMATION, |h| unsafe { GetPriorityClass(h) }).unwrap_or(0);
-    PRIORITIES.iter().find(|p| p.1 == c).map_or("—".into(), |p| p.0.into())
 }
 
 pub fn set_affinity(pid: u32, half: bool) -> bool {
@@ -359,8 +327,9 @@ pub fn process_user(pid: u32) -> Option<String> {
             return None;
         }
         let (n, dm) = (String::from_utf16_lossy(&name[..nl as usize]), String::from_utf16_lossy(&dom[..dl as usize]));
-        let local = std::env::var("COMPUTERNAME").unwrap_or_default();
-        Some(if dm.is_empty() || dm.eq_ignore_ascii_case(&local) || dm.eq_ignore_ascii_case("NT AUTHORITY") { n } else { format!("{dm}\\{n}") })
+        static LOCAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let local = LOCAL.get_or_init(|| std::env::var("COMPUTERNAME").unwrap_or_default());
+        Some(if dm.is_empty() || dm.eq_ignore_ascii_case(local) || dm.eq_ignore_ascii_case("NT AUTHORITY") { n } else { format!("{dm}\\{n}") })
     })
     .flatten()
 }
@@ -423,53 +392,6 @@ pub fn hung_windows() -> Vec<(u32, String)> {
     v
 }
 
-pub fn run_unelevated(donors: &[u32], cmdline: &str) -> bool {
-    use winapi::um::{
-        processthreadsapi::{OpenProcessToken, PROCESS_INFORMATION, ProcessIdToSessionId, STARTUPINFOW},
-        securitybaseapi::DuplicateTokenEx,
-        winnt::{SecurityImpersonation, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary, MAXIMUM_ALLOWED},
-    };
-    #[link(name = "advapi32")]
-    unsafe extern "system" {
-        fn CreateProcessWithTokenW(tok: HANDLE, logon: u32, app: *const u16, cmd: *mut u16, flags: u32, env: *mut std::ffi::c_void, dir: *const u16, si: *mut STARTUPINFOW, pi: *mut PROCESS_INFORMATION) -> i32;
-    }
-    let mut mine = 0u32;
-    unsafe { ProcessIdToSessionId(std::process::id(), &mut mine) };
-    for &pid in donors {
-        let mut s = u32::MAX;
-        if unsafe { ProcessIdToSessionId(pid, &mut s) } == 0 || s != mine {
-            continue;
-        }
-        let ok = with_proc(pid, PROCESS_QUERY_LIMITED_INFORMATION, |h| unsafe {
-            let mut tok: HANDLE = null_mut();
-            if OpenProcessToken(h, TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &mut tok) == 0 {
-                return false;
-            }
-            let mut prim: HANDLE = null_mut();
-            let dup = DuplicateTokenEx(tok, MAXIMUM_ALLOWED, null_mut(), SecurityImpersonation, TokenPrimary, &mut prim) != 0;
-            CloseHandle(tok);
-            if !dup {
-                return false;
-            }
-            let mut si: STARTUPINFOW = std::mem::zeroed();
-            si.cb = size_of::<STARTUPINFOW>() as u32;
-            let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-            let mut cmd = wide(cmdline);
-            let r = CreateProcessWithTokenW(prim, 0, std::ptr::null(), cmd.as_mut_ptr(), 0x0400 , null_mut(), std::ptr::null(), &mut si, &mut pi) != 0;
-            if r {
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
-            }
-            CloseHandle(prim);
-            r
-        });
-        if ok == Some(true) {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod diag_tests {
     use super::*;
@@ -482,9 +404,4 @@ mod diag_tests {
         assert!(t.0 > 0 && t.1 >= 0 && t.2 >= 0);
         let _ = hung_windows();
     }
-}
-
-pub fn kill(pid: u32) -> bool {
-    use winapi::um::{processthreadsapi::TerminateProcess, winnt::PROCESS_TERMINATE};
-    with_proc(pid, PROCESS_TERMINATE, |h| unsafe { TerminateProcess(h, 1) != 0 }).unwrap_or(false)
 }

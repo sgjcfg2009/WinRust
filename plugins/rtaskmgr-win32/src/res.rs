@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
-    ptr::{null, null_mut},
+    ptr::null_mut,
     sync::{mpsc, Arc, Mutex},
 };
 use winapi::um::{
     shellapi::ExtractIconExW,
+    winuser::DestroyIcon,
     winver::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
 };
 
@@ -21,14 +22,17 @@ pub struct ResCache {
     pub generic_icon: isize,
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
+use crate::ui::wide;
 
-unsafe fn version_string(buf: &[u8], lang: &str, key: &str) -> Option<String> {
-    let q = wide(&format!(r"\StringFileInfo\{lang}\{key}"));
+unsafe fn version_string(buf: &[u8], lang: &str, key: &str, qbuf: &mut Vec<u16>) -> Option<String> {
+    qbuf.clear();
+    qbuf.extend(r"\StringFileInfo\".encode_utf16());
+    qbuf.extend(lang.encode_utf16());
+    qbuf.push(b'\\' as u16);
+    qbuf.extend(key.encode_utf16());
+    qbuf.push(0);
     let (mut p, mut len) = (null_mut(), 0u32);
-    let ok = unsafe { VerQueryValueW(buf.as_ptr() as *const _, q.as_ptr(), &mut p, &mut len) };
+    let ok = unsafe { VerQueryValueW(buf.as_ptr() as *const _, qbuf.as_ptr(), &mut p, &mut len) };
     if ok == 0 || p.is_null() || len == 0 {
         return None;
     }
@@ -61,18 +65,21 @@ fn load(path: &str) -> Res {
                 }
                 langs.push("040904b0".into());
                 langs.push("040904e4".into());
+                let mut qbuf = Vec::with_capacity(64);
                 for l in &langs {
                     if r.desc.is_empty() {
-                        r.desc = version_string(&buf, l, "FileDescription").unwrap_or_default();
+                        r.desc = version_string(&buf, l, "FileDescription", &mut qbuf).unwrap_or_default();
                     }
                     if r.company.is_empty() {
-                        r.company = version_string(&buf, l, "CompanyName").unwrap_or_default();
+                        r.company = version_string(&buf, l, "CompanyName", &mut qbuf).unwrap_or_default();
+                    }
+                    if !r.desc.is_empty() && !r.company.is_empty() {
+                        break;
                     }
                 }
             }
         }
     }
-    let _ = null::<u8>();
     let bad = |s: &str| s.chars().any(|c| c.is_control() || c == '\u{FFFD}');
     if bad(&r.desc) {
         r.desc.clear();
@@ -113,6 +120,38 @@ impl ResCache {
                 g.insert(key, None);
                 let _ = self.tx.send(path.to_string());
                 None
+            }
+        }
+    }
+
+    pub fn icon(&self, path: &str) -> isize {
+        let key = path.to_lowercase();
+        let Ok(mut g) = self.map.lock() else { return 0 };
+        match g.get(&key) {
+            Some(Some(v)) => v.icon,
+            Some(None) => 0,
+            None => {
+                g.insert(key, None);
+                let _ = self.tx.send(path.to_string());
+                0
+            }
+        }
+    }
+}
+
+impl Drop for ResCache {
+    fn drop(&mut self) {
+        unsafe {
+            if self.generic_icon != 0 {
+                DestroyIcon(self.generic_icon as _);
+            }
+            if let Ok(mut g) = self.map.lock() {
+                for v in g.values_mut().flatten() {
+                    if v.icon != 0 {
+                        DestroyIcon(v.icon as _);
+                        v.icon = 0;
+                    }
+                }
             }
         }
     }

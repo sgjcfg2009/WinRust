@@ -9,12 +9,21 @@ mod topbar;
 pub(crate) use {explorer::*, journal::*, search::*, session::*, taskmgr::*, tools::*, topbar::*};
 
 pub(crate) fn out(prog: &str, args: &[&str]) -> Result<String, String> {
-    let owned: Vec<String> = if prog == "reg" { i18n::reg::user_args(args) } else { args.iter().map(|a| a.to_string()).collect() };
-    let o = Command::new(prog).args(&owned).creation_flags(0x0800_0000).output().map_err(|e| format!("{prog}: {e}"))?;
+    let owned;
+    let mut cmd = Command::new(prog);
+    if prog == "reg" {
+        owned = i18n::reg::user_args(args);
+        cmd.args(&owned);
+    } else {
+        owned = Vec::new();
+        cmd.args(args);
+    }
+    let o = cmd.creation_flags(0x0800_0000).output().map_err(|e| format!("{prog}: {e}"))?;
     if o.status.success() {
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
     } else {
-        Err(format!("{prog} {}: {}{}", owned.join(" "), String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()))
+        let joined = if owned.is_empty() { args.join(" ") } else { owned.join(" ") };
+        Err(format!("{prog} {joined}: {}{}", String::from_utf8_lossy(&o.stdout).trim(), String::from_utf8_lossy(&o.stderr).trim()))
     }
 }
 
@@ -236,8 +245,7 @@ fn delete_on_reboot(path: &Path) -> bool {
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
     }
-    let w: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
-    unsafe { MoveFileExW(w.as_ptr(), null(), 4) != 0 }
+    with_wide(&path.as_os_str().to_string_lossy(), |w| unsafe { MoveFileExW(w, null(), 4) != 0 })
 }
 
 fn move_file_win32(src: &Path, dst: &Path) -> Result<(), u32> {
@@ -246,13 +254,15 @@ fn move_file_win32(src: &Path, dst: &Path) -> Result<(), u32> {
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
         fn GetLastError() -> u32;
     }
-    let ws: Vec<u16> = src.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
-    let wd: Vec<u16> = dst.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
-    if unsafe { MoveFileExW(ws.as_ptr(), wd.as_ptr(), 1 | 8) } != 0 {
-        Ok(())
-    } else {
-        Err(unsafe { GetLastError() })
-    }
+    with_wide(&src.as_os_str().to_string_lossy(), |ws| {
+        with_wide(&dst.as_os_str().to_string_lossy(), |wd| {
+            if unsafe { MoveFileExW(ws, wd, 1 | 8) } != 0 {
+                Ok(())
+            } else {
+                Err(unsafe { GetLastError() })
+            }
+        })
+    })
 }
 
 fn clear_readonly(path: &Path) {
@@ -260,15 +270,7 @@ fn clear_readonly(path: &Path) {
     unsafe extern "system" {
         fn SetFileAttributesW(name: *const u16, attrs: u32) -> i32;
     }
-    let w: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
-    unsafe { SetFileAttributesW(w.as_ptr(), 0x80) };
-    if let Ok(m) = fs::symlink_metadata(path) {
-        let mut p = m.permissions();
-        if p.readonly() {
-            p.set_readonly(false);
-            let _ = fs::set_permissions(path, p);
-        }
-    }
+    with_wide(&path.as_os_str().to_string_lossy(), |w| unsafe { SetFileAttributesW(w, 0x80) });
 }
 
 fn unlock_file_holders(path: &Path) -> Vec<String> {
@@ -646,12 +648,19 @@ pub(crate) fn verify_uninstalled(i: usize) -> Result<(), String> {
     }
 }
 
+fn reg_key(key: &str) -> std::borrow::Cow<'_, str> {
+    match env::var(i18n::reg::SID_ENV).ok().filter(|s| i18n::reg::valid_sid(s)) {
+        Some(sid) => std::borrow::Cow::Owned(i18n::reg::for_user(key, &sid)),
+        None => std::borrow::Cow::Borrowed(key),
+    }
+}
+
 pub(crate) fn reg_dword(key: &str, name: &str) -> Option<u32> {
-    i18n::reg::dword(&out("reg", &["query", key, "/v", name]).ok()?)
+    i18n::reg::get_dword(&reg_key(key), name)
 }
 
 pub(crate) fn reg_str(key: &str, name: &str) -> Option<String> {
-    i18n::reg::value(&out("reg", &["query", key, "/v", name]).ok()?).map(|(_, d)| d.to_string())
+    i18n::reg::get_str(&reg_key(key), name)
 }
 
 include!(concat!(env!("OUT_DIR"), "/payload.rs"));

@@ -1,12 +1,14 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, os::windows::process::CommandExt, path::PathBuf, process::Command};
 use windows_sys::Win32::Graphics::Gdi::*;
+
+const NO_WINDOW: u32 = 0x0800_0000;
 
 const NAME: &str = "SuperSaver";
 const SAVER: &str = "a1841308-3541-4fab-bc81-f71556f20b4a";
 const BALANCED: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
 const BRIGHTNESS: &str = "aded5e82-b909-4619-9949-f5d71dac0bcb";
 const SUB_VIDEO: &str = "7516b95f-f776-4464-8c53-06167f40cc99";
-const LAUNCHERS: &[&str] = &["steam", "steamwebhelper", "Discord", "EpicGamesLauncher", "Battle.net", "RiotClientServices", "GalaxyClient", "EADesktop", "Origin"];
+const LAUNCHERS: &[&str] = &["steam.exe", "steamwebhelper.exe", "Discord.exe", "EpicGamesLauncher.exe", "Battle.net.exe", "RiotClientServices.exe", "GalaxyClient.exe", "EADesktop.exe", "Origin.exe"];
 
 fn hz_file() -> PathBuf {
     let dir = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("reshell");
@@ -31,7 +33,7 @@ fn set_hz(hz: u32) -> bool {
 }
 
 fn powercfg(args: &[&str]) -> String {
-    Command::new("powercfg").args(args).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+    Command::new("powercfg").args(args).creation_flags(NO_WINDOW).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
 }
 
 fn find_scheme() -> Option<String> {
@@ -45,22 +47,23 @@ fn guid_in(s: &str) -> Option<String> {
 
 pub fn run(on: bool) -> i32 {
     let existing = find_scheme();
+    let hz_path = hz_file();
     if !on {
         powercfg(&["/setactive", BALANCED]);
         if let Some(g) = existing { powercfg(&["/d", &g]); }
-        if let Some(hz) = fs::read_to_string(hz_file()).ok().and_then(|s| s.trim().parse().ok()) {
-            if set_hz(hz) { let _ = fs::remove_file(hz_file()); }
+        if let Some(hz) = fs::read_to_string(&hz_path).ok().and_then(|s| s.trim().parse().ok()) {
+            if set_hz(hz) { let _ = fs::remove_file(&hz_path); }
         }
         return 0;
     }
     let cur = get_hz();
     if cur != 60 {
-        if !hz_file().exists() { let _ = fs::write(hz_file(), cur.to_string()); }
+        if !hz_path.exists() { let _ = fs::write(&hz_path, cur.to_string()); }
         if !set_hz(60) { eprintln!("60 Hz not supported on this display"); }
     }
     let mut kill = Command::new("taskkill");
-    kill.arg("/F");
-    for n in LAUNCHERS { kill.args(["/IM", &format!("{n}.exe")]); }
+    kill.arg("/F").creation_flags(NO_WINDOW);
+    for n in LAUNCHERS { kill.args(["/IM", n]); }
     let _ = kill.output();
 
     let g = match existing.or_else(|| guid_in(&powercfg(&["/duplicatescheme", SAVER]))) {

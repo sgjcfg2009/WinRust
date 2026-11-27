@@ -60,8 +60,13 @@ fn net_selftest(out: &str) {
     let _ = std::fs::write(out, report.unwrap_or_else(|e| format!("ERROR: {e}")));
 }
 
-fn xy(l: isize) -> (i32, i32) {
-    ((l & 0xFFFF) as i16 as i32, ((l >> 16) & 0xFFFF) as i16 as i32)
+struct MutexGuard(winapi::um::winnt::HANDLE);
+impl Drop for MutexGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { winapi::um::handleapi::CloseHandle(self.0) };
+        }
+    }
 }
 
 fn focus_existing_taskmgr() {
@@ -112,9 +117,9 @@ fn main() {
         }
         let _ = std::fs::remove_file(&tray_flag);
     }
-    let _single_guard = unsafe {
+    let _single_guard = MutexGuard(unsafe {
         let m = winapi::um::synchapi::CreateMutexW(std::ptr::null_mut(), 0, mtx_name.as_ptr());
-        if m.is_null() || winapi::um::errhandlingapi::GetLastError() == 183  {
+        if m.is_null() || winapi::um::errhandlingapi::GetLastError() == 183 {
             if !m.is_null() {
                 winapi::um::handleapi::CloseHandle(m);
             }
@@ -122,7 +127,7 @@ fn main() {
             return;
         }
         m
-    };
+    });
     let ifeo = sys::taskmgr_args(&args);
     let fallback_args = ifeo.clone().unwrap_or_default();
     std::panic::set_hook(Box::new(move |info| {
@@ -155,14 +160,17 @@ fn main() {
     load_icon(&mut tray_icon, (16, 16));
 
     let mut win = nwg::Window::default();
-    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-    let win_w = (cfg.size.0 as i32).clamp((600.0 * scale) as i32, (sw - 20).max(600));
-    let win_h = (cfg.size.1 as i32).clamp((400.0 * scale) as i32, (sh - 40).max(400));
+    let wa = winrust_common::ui::work_area();
+    let (ww, wh) = ((wa.right - wa.left).max(600), (wa.bottom - wa.top).max(400));
+    let win_w = (cfg.size.0 as i32).clamp(((600.0 * scale) as i32).min(ww), (ww - 20).max(600));
+    let win_h = (cfg.size.1 as i32).clamp(((400.0 * scale) as i32).min(wh), (wh - 40).max(400));
+    let win_x = cfg.pos.0.clamp(wa.left, (wa.right - win_w).max(wa.left));
+    let win_y = cfg.pos.1.clamp(wa.top, (wa.bottom - win_h).max(wa.top));
     nwg::Window::builder()
         .flags(if hidden { nwg::WindowFlags::MAIN_WINDOW } else { nwg::WindowFlags::MAIN_WINDOW | nwg::WindowFlags::VISIBLE })
         .icon(Some(&icon_big))
         .size((win_w, win_h))
-        .position(cfg.pos)
+        .position((win_x, win_y))
         .title("Task Manager")
         .build(&mut win)
         .unwrap();
@@ -211,12 +219,18 @@ fn main() {
         icon_big,
         data: RefCell::new(Data::new(cfg.clone())),
         ui: RefCell::new(ui),
-        fonts: Fonts::new(scale),
-        scale,
+        fonts: RefCell::new(Fonts::new(scale)),
+        scale: Cell::new(scale),
         edit_brush: Cell::new(0),
+        mem_dc: Cell::new(0),
+        mem_bmp: Cell::new((0, 0, 0)),
+        mem_old_bmp: Cell::new(0),
         search_rect: Cell::new(R::new(0, 0, 0, 0)),
         last_tick: Cell::new(Instant::now()),
     });
+    if let Some(sh) = app.search.handle.hwnd() {
+        unsafe { SendMessageW(sh, WM_SETFONT, app.fonts.borrow().get(Font::Ui) as usize, 1) };
+    }
     app.apply_theme();
     {
         let mut d = app.data.borrow_mut();
@@ -239,13 +253,19 @@ fn main() {
             WM_ERASEBKGND => Some(1),
             WM_GETMINMAXINFO => unsafe {
                 let mmi = &mut *(l as *mut MINMAXINFO);
-                let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+                let wa = winrust_common::ui::work_area();
+                let (ww, wh) = ((wa.right - wa.left).max(480), (wa.bottom - wa.top).max(360));
+                let s = a.scale.get();
                 mmi.ptMinTrackSize = winapi::shared::windef::POINT {
-                    x: ((620.0 * a.scale) as i32).min((sw * 85 / 100).max(480)),
-                    y: ((420.0 * a.scale) as i32).min((sh * 85 / 100).max(360)),
+                    x: ((620.0 * s) as i32).min((ww * 85 / 100).max(480)),
+                    y: ((420.0 * s) as i32).min((wh * 85 / 100).max(360)),
                 };
                 Some(0)
             },
+            0x02E0 => {
+                a.on_dpi_changed(hwnd, (w & 0xFFFF) as u32, unsafe { &*(l as *const winapi::shared::windef::RECT) });
+                Some(0)
+            }
             WM_SIZE => {
                 a.invalidate();
                 None
@@ -261,8 +281,7 @@ fn main() {
                 None
             }
             WM_MOUSEMOVE => {
-                let (x, y) = xy(l);
-                a.on_mouse_move(hwnd, x, y);
+                a.on_mouse_move(hwnd, (l & 0xFFFF) as i16 as i32, ((l >> 16) & 0xFFFF) as i16 as i32);
                 None
             }
             WM_MOUSELEAVE => {
@@ -270,8 +289,7 @@ fn main() {
                 None
             }
             WM_LBUTTONDOWN => {
-                let (x, y) = xy(l);
-                a.on_lbutton_down(hwnd, x, y);
+                a.on_lbutton_down(hwnd, (l & 0xFFFF) as i16 as i32, ((l >> 16) & 0xFFFF) as i16 as i32);
                 Some(0)
             }
             WM_LBUTTONUP => {
@@ -279,8 +297,7 @@ fn main() {
                 None
             }
             WM_RBUTTONUP => {
-                let (x, y) = xy(l);
-                a.on_rbutton_up(hwnd, x, y);
+                a.on_rbutton_up(hwnd, (l & 0xFFFF) as i16 as i32, ((l >> 16) & 0xFFFF) as i16 as i32);
                 Some(0)
             }
             WM_MOUSEWHEEL => {

@@ -15,6 +15,10 @@ pub fn com_init() {
     }
 }
 
+pub fn create_factory() -> Result<IWICImagingFactory> {
+    unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
+}
+
 fn transform(orientation: u16) -> i32 {
     match orientation {
         2 => 8,
@@ -28,9 +32,8 @@ fn transform(orientation: u16) -> i32 {
     }
 }
 
-pub fn decode(path: &str, bg: [u8; 3]) -> Result<Img> {
+pub fn decode_with(f: &IWICImagingFactory, path: &str, bg: [u8; 3]) -> Result<Img> {
     unsafe {
-        let f: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let dec = f.CreateDecoderFromFilename(&HSTRING::from(path), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)?;
         let frame = dec.GetFrame(0)?;
         let orientation = frame
@@ -55,11 +58,14 @@ pub fn decode(path: &str, bg: [u8; 3]) -> Result<Img> {
         let mut bgra = vec![0u8; w as usize * h as usize * 4];
         src.CopyPixels(std::ptr::null(), w * 4, &mut bgra)?;
         for p in bgra.chunks_exact_mut(4) {
-            let inv = 255 - p[3] as u32;
-            for c in 0..3 {
-                p[c] = (p[c] as u32 + bg[c] as u32 * inv / 255).min(255) as u8;
+            let a = p[3];
+            if a < 255 {
+                let inv = 255 - a as u32;
+                p[0] = (p[0] as u32 + bg[0] as u32 * inv / 255).min(255) as u8;
+                p[1] = (p[1] as u32 + bg[1] as u32 * inv / 255).min(255) as u8;
+                p[2] = (p[2] as u32 + bg[2] as u32 * inv / 255).min(255) as u8;
+                p[3] = 255;
             }
-            p[3] = 255;
         }
         Ok(Img { w: w as i32, h: h as i32, bgra })
     }
@@ -104,7 +110,7 @@ mod tests {
         let p = std::env::temp_dir().join("photoview-test.png");
         std::fs::write(&p, png).unwrap();
         com_init();
-        let img = decode(p.to_str().unwrap(), [10, 20, 30]).unwrap();
+        let img = decode_with(&create_factory().unwrap(), p.to_str().unwrap(), [10, 20, 30]).unwrap();
         let _ = std::fs::remove_file(p);
         assert_eq!((img.w, img.h), (2, 1));
         assert_eq!(img.bgra[..4], [0, 0, 255, 255]);

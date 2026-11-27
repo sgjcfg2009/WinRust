@@ -18,9 +18,7 @@ fn is_kernel_network(g: &GUID) -> bool {
     (g.data1, g.data2, g.data3, g.data4) == (KERNEL_NETWORK.data1, KERNEL_NETWORK.data2, KERNEL_NETWORK.data3, KERNEL_NETWORK.data4)
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
-}
+use crate::ui::wide;
 
 fn props_buffer(name: &[u16]) -> Vec<u64> {
     let head = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
@@ -94,6 +92,9 @@ pub fn stop(s: Session) {
     let name = wide(SESSION);
     let mut props = props_buffer(&name);
     unsafe { ControlTraceW(ctl(s.handle), null(), props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES, EVENT_TRACE_CONTROL_STOP) };
+    if let Ok(mut g) = TOTALS.lock() {
+        *g = None;
+    }
 }
 
 pub fn drain() -> HashMap<u32, (u64, u64)> {

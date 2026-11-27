@@ -71,17 +71,34 @@ fn active() -> Option<GUID> {
 }
 
 fn name_of(g: &GUID) -> String {
-    let mut n = 0u32;
-    unsafe { PowerReadFriendlyName(null_mut(), g, null(), null(), null_mut(), &mut n) };
-    if n < 2 {
+    let mut buf = [0u8; 256];
+    let mut n = buf.len() as u32;
+    let rc = unsafe { PowerReadFriendlyName(null_mut(), g, null(), null(), buf.as_mut_ptr(), &mut n) };
+    let v: Vec<u8>;
+    let slice = if rc == ERROR_SUCCESS {
+        &buf[..(n as usize).min(buf.len())]
+    } else if rc == ERROR_MORE_DATA && n >= 2 {
+        v = vec![0u8; n as usize];
+        let mut v = v;
+        if unsafe { PowerReadFriendlyName(null_mut(), g, null(), null(), v.as_mut_ptr(), &mut n) } != ERROR_SUCCESS {
+            return "?".into();
+        }
+        let mut out = String::new();
+        for c in char::decode_utf16(v[..(n as usize).min(v.len())].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0)) {
+            out.push(c.unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+        return out;
+    } else {
+        return "?".into();
+    };
+    if slice.len() < 2 {
         return "?".into();
     }
-    let mut buf = vec![0u8; n as usize];
-    if unsafe { PowerReadFriendlyName(null_mut(), g, null(), null(), buf.as_mut_ptr(), &mut n) } != ERROR_SUCCESS {
-        return "?".into();
+    let mut out = String::new();
+    for c in char::decode_utf16(slice.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0)) {
+        out.push(c.unwrap_or(char::REPLACEMENT_CHARACTER));
     }
-    let w: Vec<u16> = buf.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
-    String::from_utf16_lossy(&w)
+    out
 }
 
 pub fn plan_text() -> String {

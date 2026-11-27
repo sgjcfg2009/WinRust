@@ -25,26 +25,7 @@ pub(crate) unsafe fn screenshot() -> Option<String> {
 }
 
 pub(crate) unsafe fn save_bitmap(bmp: HBITMAP) -> Option<String> {
-    use windows_sys::Win32::{
-        Graphics::GdiPlus::{GdipCreateBitmapFromHBITMAP, GdipDisposeImage, GdipSaveImageToFile, GpBitmap, GpImage},
-        System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
-    };
-    let mut t: SYSTEMTIME = zeroed();
-    GetLocalTime(&mut t);
-    let name = format!("Screenshot {:04}-{:02}-{:02} {:02}-{:02}-{:02}.png", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let dir = DIR.get_or_init(|| {
-        let d = PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default()).join(r"Pictures\Screenshots");
-        let _ = std::fs::create_dir_all(&d);
-        d
-    });
-    let mut gb: *mut GpBitmap = null_mut();
-    let mut saved = false;
-    if GdipCreateBitmapFromHBITMAP(bmp, null_mut(), &mut gb) == 0 && !gb.is_null() {
-        let png = windows_sys::core::GUID { data1: 0x557c_f406, data2: 0x1a04, data3: 0x11d3, data4: [0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e] };
-        saved = GdipSaveImageToFile(gb as *mut GpImage, wide(&dir.join(&name).to_string_lossy()).as_ptr(), &png, null()) == 0;
-        GdipDisposeImage(gb as *mut GpImage);
-    }
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
     let mut clip = false;
     if OpenClipboard(null_mut()) != 0 {
         EmptyClipboard();
@@ -54,15 +35,15 @@ pub(crate) unsafe fn save_bitmap(bmp: HBITMAP) -> Option<String> {
     if !clip {
         DeleteObject(bmp);
     }
-    (saved || clip).then_some(name)
+    clip.then(String::new)
 }
 
 pub(crate) unsafe fn screenshot_notice(bar: HWND) {
     let msg = match screenshot() {
-        Some(n) => format!("Screenshot saved: {n}\nand copied to the clipboard"),
-        None => "Could not take a screenshot".to_string(),
+        Some(_) => "Screenshot copied to clipboard",
+        None => "Could not take a screenshot",
     };
     KillTimer(bar, 2);
-    show_tip(msg, GetSystemMetrics(SM_CXSCREEN) / 2);
+    show_tip(msg.to_string(), GetSystemMetrics(SM_CXSCREEN) / 2);
     SetTimer(bar, 6, 2500, None);
 }

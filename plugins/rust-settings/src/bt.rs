@@ -31,6 +31,7 @@ pub struct State {
 
 static STATE: Mutex<State> = Mutex::new(State { bt: None, air: None, paired: vec![], nearby: vec![], scanning: false, note: String::new() });
 static BUSY: AtomicBool = AtomicBool::new(false);
+static ACCESS: std::sync::Once = std::sync::Once::new();
 
 pub fn state() -> State {
     STATE.lock().map(|s| s.clone()).unwrap_or_default()
@@ -41,7 +42,9 @@ fn with<T>(f: impl FnOnce(&mut State) -> T) -> Option<T> {
 }
 
 fn radios() -> Vec<Radio> {
-    let _ = Radio::RequestAccessAsync().and_then(|a| a.join());
+    ACCESS.call_once(|| {
+        let _ = Radio::RequestAccessAsync().and_then(|a| a.join());
+    });
     Radio::GetRadiosAsync().and_then(|a| a.join()).map(|v| v.into_iter().collect()).unwrap_or_default()
 }
 
@@ -67,19 +70,24 @@ fn list(paired: bool) -> Vec<Dev> {
     let mut out: Vec<Dev> = all
         .into_iter()
         .filter_map(|d| {
-            let (id, name) = (d.Id().ok()?.to_string(), d.Name().ok()?.to_string());
+            let name = d.Name().ok()?.to_string();
+            if name.trim().is_empty() {
+                return None;
+            }
+            let id = d.Id().ok()?.to_string();
             let connected = paired && BluetoothDevice::FromIdAsync(&HSTRING::from(&id)).and_then(|a| a.join()).and_then(|b| b.ConnectionStatus()).is_ok_and(|c| c.0 == 1);
-            (!name.trim().is_empty()).then_some(Dev { id, name, connected })
+            Some(Dev { id, name, connected })
         })
         .collect();
-    out.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    out.sort_by_cached_key(|d| (!d.connected, d.name.to_lowercase()));
     out
 }
 
-pub fn set(kind: Option<RadioKind>, on: bool, done: impl FnOnce() + Send + 'static) {
+fn set_radios(filter: impl Fn(RadioKind) -> bool + Send + 'static, on: bool, done: impl FnOnce() + Send + 'static) {
     std::thread::spawn(move || {
-        for r in radios().into_iter().filter(|r| kind.is_none_or(|k| r.Kind().is_ok_and(|rk| rk == k))) {
-            let _ = r.SetStateAsync(if on { RadioState::On } else { RadioState::Off }).and_then(|a| a.join());
+        let target = if on { RadioState::On } else { RadioState::Off };
+        for r in radios().into_iter().filter(|r| r.Kind().is_ok_and(&filter)) {
+            let _ = r.SetStateAsync(target).and_then(|a| a.join());
         }
         BUSY.store(false, Relaxed);
         refresh(done);
@@ -87,20 +95,11 @@ pub fn set(kind: Option<RadioKind>, on: bool, done: impl FnOnce() + Send + 'stat
 }
 
 pub fn set_bluetooth(on: bool, done: impl FnOnce() + Send + 'static) {
-    set(Some(RadioKind::Bluetooth), on, done);
+    set_radios(|k| k == RadioKind::Bluetooth, on, done);
 }
 
 pub fn set_airplane(on: bool, done: impl FnOnce() + Send + 'static) {
-    std::thread::spawn(move || {
-        for r in radios() {
-            let kind = r.Kind().ok();
-            if on || matches!(kind, Some(RadioKind::WiFi | RadioKind::Bluetooth)) {
-                let _ = r.SetStateAsync(if on { RadioState::Off } else { RadioState::On }).and_then(|a| a.join());
-            }
-        }
-        BUSY.store(false, Relaxed);
-        refresh(done);
-    });
+    set_radios(move |k| on || matches!(k, RadioKind::WiFi | RadioKind::Bluetooth), !on, done);
 }
 
 pub fn scan(done: impl FnOnce() + Send + 'static) {
@@ -146,8 +145,7 @@ pub fn pair(id: String, done: impl FnOnce() + Send + 'static) {
         .unwrap_or_else(|e| format!("Could not pair: {}", e.message()));
         with(|s| s.note = msg);
         BUSY.store(false, Relaxed);
-        refresh(|| {});
-        done();
+        refresh(done);
     });
 }
 
@@ -161,8 +159,7 @@ pub fn unpair(id: String, done: impl FnOnce() + Send + 'static) {
         .unwrap_or_else(|e| format!("Could not remove: {}", e.message()));
         with(|s| s.note = msg);
         BUSY.store(false, Relaxed);
-        refresh(|| {});
-        done();
+        refresh(done);
     });
 }
 

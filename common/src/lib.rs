@@ -60,16 +60,16 @@ pub fn log(component: &str, msg: &str) {
     }
     let mut st = [0u16; 8];
     unsafe { GetLocalTime(&mut st) };
-    let ts = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", st[0], st[1], st[3], st[4], st[5], st[6]);
-    let p = log_file();
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if std::fs::metadata(&p).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
-        let _ = std::fs::rename(&p, p.with_extension("log.old"));
+    let p = LOG_FILE.get_or_init(|| {
+        let dir = log_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("winrust.log")
+    });
+    if std::fs::metadata(p).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
+        let _ = std::fs::rename(p, p.with_extension("log.old"));
     }
     let open = |path: &PathBuf| std::fs::OpenOptions::new().create(true).append(true).open(path);
-    let file = open(&p).or_else(|_| {
+    let file = open(p).or_else(|_| {
         let fb = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("WinRust").join("winrust.log");
         if let Some(dir) = fb.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -77,7 +77,7 @@ pub fn log(component: &str, msg: &str) {
         open(&fb)
     });
     if let Ok(mut f) = file {
-        let _ = writeln!(f, "[{ts}] [{component}] {msg}");
+        let _ = writeln!(f, "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] [{component}] {msg}", st[0], st[1], st[3], st[4], st[5], st[6]);
     }
 }
 
@@ -148,7 +148,7 @@ pub fn wait_shell_ready() {
             return false;
         }
         let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
-        String::from_utf16_lossy(&buf[..n]).eq_ignore_ascii_case("Default")
+        n == 7 && buf[..n].iter().zip(b"Default").all(|(&u, &c)| u <= 0x7F && (u as u8).eq_ignore_ascii_case(&c))
     };
 
     let t0 = Instant::now();

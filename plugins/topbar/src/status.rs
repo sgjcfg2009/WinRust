@@ -110,11 +110,6 @@ pub(crate) fn arcs_lit(q: i32) -> i32 {
     if q >= 67 { 3 } else if q >= 34 { 2 } else { 1 }
 }
 
-#[inline]
-fn argb(c: u32) -> u32 {
-    0xFF00_0000 | (c & 255) << 16 | (c & 0xFF00) | (c >> 16 & 255)
-}
-
 thread_local! {
     static ROUND_PEN: Cell<usize> = const { Cell::new(0) };
 }
@@ -123,7 +118,7 @@ unsafe fn round_pen(c: u32, w: f32) -> *mut GpPen {
     use windows_sys::Win32::Graphics::GdiPlus::{GdipSetPenColor, GdipSetPenWidth};
     let mut p = ROUND_PEN.get() as *mut GpPen;
     if p.is_null() {
-        GdipCreatePen1(argb(c), w, UnitPixel, &mut p);
+        GdipCreatePen1(crate::argb(c, 255), w, UnitPixel, &mut p);
         if !p.is_null() {
             GdipSetPenStartCap(p, LineCapRound);
             GdipSetPenEndCap(p, LineCapRound);
@@ -131,90 +126,62 @@ unsafe fn round_pen(c: u32, w: f32) -> *mut GpPen {
             ROUND_PEN.set(p as usize);
         }
     } else {
-        GdipSetPenColor(p, argb(c));
+        GdipSetPenColor(p, crate::argb(c, 255));
         GdipSetPenWidth(p, w);
     }
     p
 }
 
 pub(crate) unsafe fn wifi_glyph(dc: HDC, cx: i32, cy: i32, s: i32, lit: i32, on: u32, off: u32, mark: u8) {
-    let fg = FRAME_G.get();
-    let owned = fg.is_null();
-    let g = if !owned {
-        fg
-    } else {
-        let mut g: *mut GpGraphics = null_mut();
-        if GdipCreateFromHDC(dc, &mut g) != 0 || g.is_null() {
-            return;
-        }
-        GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-        GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
-        g
-    };
-    let (sf, w) = (s as f32, (s as f32 * 0.12).max(1.6));
-    let (bx, by) = (cx as f32, cy as f32 + sf * 0.36);
-    let p = round_pen(on, w);
-    if !p.is_null() {
-        for i in 0..3 {
-            let r = sf * (0.30 + 0.25 * i as f32);
-            windows_sys::Win32::Graphics::GdiPlus::GdipSetPenColor(p, argb(if i < lit { on } else { off }));
-            GdipDrawArc(g, p, bx - r, by - r, 2.0 * r, 2.0 * r, 225.0, 90.0);
-        }
-    }
-    let br = cached_gdip_brush(argb(if lit > 0 { on } else { off }));
-    if !br.is_null() {
-        GdipFillEllipse(g, br as *mut GpBrush, bx - w * 0.9, by - w * 0.9, w * 1.8, w * 1.8);
-    }
-    let (mx, my, mr) = (bx + sf * 0.42, by - sf * 0.08, sf * 0.26);
-    if mark > 0 {
-        let bg = cached_gdip_brush(argb(pal().bg));
-        if !bg.is_null() {
-            GdipFillEllipse(g, bg as *mut GpBrush, mx - mr, my - mr, 2.0 * mr, 2.0 * mr);
-        }
-        let c = if mark == 1 { on } else { WARN };
-        let p = round_pen(c, (w * 0.8).max(1.4));
+    with_gp(dc, |g| {
+        let (sf, w) = (s as f32, (s as f32 * 0.12).max(1.6));
+        let (bx, by) = (cx as f32, cy as f32 + sf * 0.36);
+        let p = round_pen(on, w);
         if !p.is_null() {
-            let d = mr * 0.5;
-            if mark == 1 {
-                GdipDrawLine(g, p, mx - d, my - d, mx + d, my + d);
-                GdipDrawLine(g, p, mx + d, my - d, mx - d, my + d);
-            } else {
-                GdipDrawLine(g, p, mx, my - d * 1.2, mx, my + d * 0.2);
-                GdipDrawLine(g, p, mx, my + d * 0.95, mx, my + d * 1.0);
+            for i in 0..3 {
+                let r = sf * (0.30 + 0.25 * i as f32);
+                windows_sys::Win32::Graphics::GdiPlus::GdipSetPenColor(p, crate::argb(if i < lit { on } else { off }, 255));
+                GdipDrawArc(g, p, bx - r, by - r, 2.0 * r, 2.0 * r, 225.0, 90.0);
             }
         }
-    }
-    if owned {
-        GdipDeleteGraphics(g);
-    }
+        let br = cached_gdip_brush(crate::argb(if lit > 0 { on } else { off }, 255));
+        if !br.is_null() {
+            GdipFillEllipse(g, br as *mut GpBrush, bx - w * 0.9, by - w * 0.9, w * 1.8, w * 1.8);
+        }
+        let (mx, my, mr) = (bx + sf * 0.42, by - sf * 0.08, sf * 0.26);
+        if mark > 0 {
+            let bg = cached_gdip_brush(crate::argb(pal().bg, 255));
+            if !bg.is_null() {
+                GdipFillEllipse(g, bg as *mut GpBrush, mx - mr, my - mr, 2.0 * mr, 2.0 * mr);
+            }
+            let c = if mark == 1 { on } else { WARN };
+            let p = round_pen(c, (w * 0.8).max(1.4));
+            if !p.is_null() {
+                let d = mr * 0.5;
+                if mark == 1 {
+                    GdipDrawLine(g, p, mx - d, my - d, mx + d, my + d);
+                    GdipDrawLine(g, p, mx + d, my - d, mx - d, my + d);
+                } else {
+                    GdipDrawLine(g, p, mx, my - d * 1.2, mx, my + d * 0.2);
+                    GdipDrawLine(g, p, mx, my + d * 0.95, mx, my + d * 1.0);
+                }
+            }
+        }
+    });
 }
 
 pub(crate) unsafe fn chevron(dc: HDC, cx: i32, cy: i32, s: i32, deg: f32, c: u32) {
-    let fg = FRAME_G.get();
-    let owned = fg.is_null();
-    let g = if !owned {
-        fg
-    } else {
-        let mut g: *mut GpGraphics = null_mut();
-        if GdipCreateFromHDC(dc, &mut g) != 0 || g.is_null() {
-            return;
+    with_gp(dc, |g| {
+        let p = round_pen(c, (s as f32 * 0.32).max(1.4));
+        if !p.is_null() {
+            let (sn, cs) = deg.to_radians().sin_cos();
+            let pt = |x: f32, y: f32| (cx as f32 + x * cs - y * sn, cy as f32 + x * sn + y * cs);
+            let (sf, h) = (s as f32, s as f32 * 0.5);
+            let (a, b, d) = (pt(-sf, h), pt(0.0, -h), pt(sf, h));
+            GdipDrawLine(g, p, a.0, a.1, b.0, b.1);
+            GdipDrawLine(g, p, b.0, b.1, d.0, d.1);
         }
-        GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-        GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
-        g
-    };
-    let p = round_pen(c, (s as f32 * 0.32).max(1.4));
-    if !p.is_null() {
-        let (sn, cs) = deg.to_radians().sin_cos();
-        let pt = |x: f32, y: f32| (cx as f32 + x * cs - y * sn, cy as f32 + x * sn + y * cs);
-        let (sf, h) = (s as f32, s as f32 * 0.5);
-        let (a, b, d) = (pt(-sf, h), pt(0.0, -h), pt(sf, h));
-        GdipDrawLine(g, p, a.0, a.1, b.0, b.1);
-        GdipDrawLine(g, p, b.0, b.1, d.0, d.1);
-    }
-    if owned {
-        GdipDeleteGraphics(g);
-    }
+    });
 }
 
 unsafe fn with_gp(dc: HDC, f: impl FnOnce(*mut GpGraphics)) {
@@ -319,14 +286,14 @@ pub(crate) unsafe fn volume_glyph(dc: HDC, cx: i32, cy: i32, s: i32, vol: i32, m
             let waves = if vol <= 0 { 0 } else if vol < 34 { 1 } else if vol < 67 { 2 } else { 3 };
             for i in 0..3 {
                 let r = (2.6 + 2.1 * i as f32) * u;
-                windows_sys::Win32::Graphics::GdiPlus::GdipSetPenColor(p, argb(if i < waves { c } else { off }));
+                windows_sys::Win32::Graphics::GdiPlus::GdipSetPenColor(p, crate::argb(if i < waves { c } else { off }, 255));
                 GdipDrawArc(g, p, x2 - r * 0.35, fy - r, 2.0 * r, 2.0 * r, -48.0, 96.0);
             }
         }
     });
 }
 
-pub(crate) unsafe fn net_icon(dc: HDC, cx: i32, cy: i32, s: i32, _f_glyph: HFONT) {
+pub(crate) unsafe fn net_icon(dc: HDC, cx: i32, cy: i32, s: i32) {
     let (on, off) = (pal().text, mix(pal().dim, pal().bg, 0.45));
     match net() {
         Link::Wifi(q) => wifi_glyph(dc, cx, cy, s, arcs_lit(q), on, off, 0),

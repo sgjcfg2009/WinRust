@@ -20,7 +20,7 @@ pub fn state() -> State {
     STATE.lock().map(|s| s.clone()).unwrap_or_default()
 }
 
-fn with<T>(f: impl FnOnce(&mut State) -> T) {
+fn with(f: impl FnOnce(&mut State)) {
     if let Ok(mut s) = STATE.lock() {
         f(&mut s);
     }

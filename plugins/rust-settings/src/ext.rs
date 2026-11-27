@@ -99,7 +99,9 @@ fn active() -> Vec<(String, HRASCONN)> {
 pub fn vpns() -> Vec<Vpn> {
     let on = active();
     let mut out: Vec<Vpn> = vec![];
-    for (pbk, names) in [(None, entries(None)), (user_pbk(), user_pbk().map_or(vec![], |p| entries(Some(&p))))] {
+    let upbk = user_pbk();
+    let unames = upbk.as_deref().map_or(vec![], |p| entries(Some(p)));
+    for (pbk, names) in [(None, entries(None)), (upbk, unames)] {
         for name in names {
             if !out.iter().any(|v| v.name == name) {
                 out.push(Vpn { on: on.iter().any(|c| c.0 == name), name, pbk: pbk.clone() });
@@ -167,15 +169,16 @@ pub fn clean_dir(dir: &Path, min_age: Duration) -> (u64, u32) {
     let (mut bytes, mut files) = (0u64, 0u32);
     let Ok(rd) = std::fs::read_dir(dir) else { return (0, 0) };
     for e in rd.flatten() {
-        let Ok(m) = std::fs::symlink_metadata(e.path()) else { continue };
+        let p = e.path();
+        let Ok(m) = std::fs::symlink_metadata(&p) else { continue };
         if reparse(&m) {
             continue;
         }
         if m.is_dir() {
-            let (b, f) = clean_dir(&e.path(), min_age);
+            let (b, f) = clean_dir(&p, min_age);
             (bytes, files) = (bytes + b, files + f);
-            let _ = std::fs::remove_dir(e.path());
-        } else if old_enough(&m, min_age) && std::fs::remove_file(e.path()).is_ok() {
+            let _ = std::fs::remove_dir(&p);
+        } else if old_enough(&m, min_age) && std::fs::remove_file(&p).is_ok() {
             (bytes, files) = (bytes + m.len(), files + 1);
         }
     }
@@ -279,9 +282,9 @@ fn ramp(k: u32) -> [[u16; 256]; 3] {
     r
 }
 
-fn apply_ramp(k: u32) {
+fn apply_ramp(r: &[[u16; 256]; 3]) {
     use windows_sys::Win32::{Graphics::Gdi::*, UI::ColorSystem::SetDeviceGammaRamp};
-    let r = ramp(k);
+    let disp = wide("DISPLAY");
     for i in 0.. {
         let mut dd: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
         dd.cb = size_of::<DISPLAY_DEVICEW>() as u32;
@@ -292,7 +295,7 @@ fn apply_ramp(k: u32) {
             continue;
         }
         unsafe {
-            let dc = CreateDCW(wide("DISPLAY").as_ptr(), dd.DeviceName.as_ptr(), null(), null());
+            let dc = CreateDCW(disp.as_ptr(), dd.DeviceName.as_ptr(), null(), null());
             if !dc.is_null() {
                 SetDeviceGammaRamp(dc, r.as_ptr() as _);
                 DeleteDC(dc);
@@ -309,9 +312,17 @@ pub fn night_helper() {
             return;
         }
     }
+    let mut cached: Option<(u32, [[u16; 256]; 3])> = None;
     loop {
         let k = night_kelvin();
-        apply_ramp(k);
+        let r = match cached {
+            Some((ck, ref cr)) if ck == k => cr,
+            _ => {
+                cached = Some((k, ramp(k)));
+                &cached.as_ref().unwrap().1
+            }
+        };
+        apply_ramp(r);
         if k == 0 {
             return;
         }
@@ -343,7 +354,7 @@ pub fn programs() -> Vec<App> {
             }
         }
     }
-    out.sort_by_key(|a| a.name.to_lowercase());
+    out.sort_by_cached_key(|a| a.name.to_lowercase());
     out
 }
 

@@ -59,8 +59,8 @@ pub fn subkeys(root: HKEY, key: &str) -> Vec<String> {
         if RegOpenKeyExW(root, wide(key).as_ptr(), 0, KEY_READ, &mut h) != ERROR_SUCCESS {
             return out;
         }
+        let mut buf = [0u16; 256];
         for i in 0.. {
-            let mut buf = [0u16; 256];
             let mut n = buf.len() as u32;
             if RegEnumKeyExW(h, i, buf.as_mut_ptr(), &mut n, null_mut(), null_mut(), null_mut(), null_mut()) != ERROR_SUCCESS {
                 break;

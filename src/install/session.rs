@@ -20,6 +20,7 @@ pub(crate) struct Session {
 static SESSION: OnceLock<Result<Session, String>> = OnceLock::new();
 
 fn sid_text(sid: *mut core::ffi::c_void) -> String {
+    use std::fmt::Write;
     let p = sid as *const u8;
     unsafe {
         let (revision, count) = (*p, *p.add(1) as usize);
@@ -31,8 +32,7 @@ fn sid_text(sid: *mut core::ffi::c_void) -> String {
         for i in 0..count {
             let o = 8 + i * 4;
             let v = u32::from_le_bytes([*p.add(o), *p.add(o + 1), *p.add(o + 2), *p.add(o + 3)]);
-            s.push('-');
-            s.push_str(&v.to_string());
+            let _ = write!(s, "-{v}");
         }
         s
     }
@@ -52,7 +52,14 @@ fn process_sid(pid: u32) -> Option<String> {
         }
         let mut need = 0u32;
         GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut need);
-        let mut buf = vec![0u8; need.max(1) as usize];
+        let mut stack = [0u8; 128];
+        let mut heap = Vec::new();
+        let buf: &mut [u8] = if (need.max(1) as usize) <= stack.len() {
+            &mut stack[..need.max(1) as usize]
+        } else {
+            heap.resize(need as usize, 0);
+            &mut heap
+        };
         let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), need, &mut need);
         CloseHandle(token);
         if ok == 0 || need < size_of::<TOKEN_USER>() as u32 {
@@ -109,8 +116,11 @@ fn shell_sid(session: u32) -> Option<String> {
         let mut more = Process32FirstW(snap, &mut e) != 0;
         while more {
             let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
-            let name = String::from_utf16_lossy(&e.szExeFile[..len]);
-            if let Some(rank) = NAMES.iter().position(|n| n.eq_ignore_ascii_case(&name)) {
+            let exe = &e.szExeFile[..len];
+            if let Some(rank) = NAMES.iter().position(|n| {
+                let b = n.as_bytes();
+                exe.len() == b.len() && exe.iter().zip(b).all(|(&u, &c)| u <= 0x7F && (u as u8).eq_ignore_ascii_case(&c))
+            }) {
                 let mut s = 0u32;
                 let same = ProcessIdToSessionId(e.th32ProcessID, &mut s) != 0 && s == session;
                 if let Some(sid) = process_sid(e.th32ProcessID) {

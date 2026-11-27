@@ -54,30 +54,34 @@ const fn mcol(title: &'static str, m: Metric) -> Col {
     Col { title, w: 84.0, align: Align::Right, metric: Some(m) }
 }
 
-pub fn columns(p: Page) -> Vec<Col> {
+pub fn columns(p: Page) -> &'static [Col] {
     use Align::*;
     use Metric::*;
+    const PROCS: [Col; 6] = [
+        col("Name", 0.0, Left),
+        mcol("CPU", Cpu),
+        mcol("Memory", Mem),
+        mcol("Disk", Disk),
+        mcol("Network", Net),
+        mcol("GPU", Gpu),
+    ];
+    const USERS: [Col; 7] = [
+        col("User", 270.0, Left),
+        col("Processes", 112.0, Right),
+        mcol("CPU", Cpu),
+        mcol("Memory", Mem),
+        mcol("Disk", Disk),
+        mcol("Network", Net),
+        mcol("GPU", Gpu),
+    ];
+    const DETAILS: [Col; 5] = [col("Name", 220.0, Left), col("PID", 70.0, Right), col("Status", 100.0, Left), col("CPU", 70.0, Right), col("Memory", 110.0, Right)];
+    const STARTUP: [Col; 5] = [col("Name", 240.0, Left), col("Publisher", 180.0, Left), col("Status", 100.0, Left), col("Slows boot by", 150.0, Right), col("Command", 0.0, Left)];
     match p {
-        Page::Processes => vec![
-            col("Name", 0.0, Left),
-            mcol("CPU", Cpu),
-            mcol("Memory", Mem),
-            mcol("Disk", Disk),
-            mcol("Network", Net),
-            mcol("GPU", Gpu),
-        ],
-        Page::Users => vec![
-            col("User", 270.0, Left),
-            col("Processes", 112.0, Right),
-            mcol("CPU", Cpu),
-            mcol("Memory", Mem),
-            mcol("Disk", Disk),
-            mcol("Network", Net),
-            mcol("GPU", Gpu),
-        ],
-        Page::Details => vec![col("Name", 220.0, Left), col("PID", 70.0, Right), col("Status", 100.0, Left), col("CPU", 70.0, Right), col("Memory", 110.0, Right)],
-        Page::Startup => vec![col("Name", 240.0, Left), col("Publisher", 180.0, Left), col("Status", 100.0, Left), col("Slows boot by", 150.0, Right), col("Command", 0.0, Left)],
-        _ => vec![],
+        Page::Processes => &PROCS,
+        Page::Users => &USERS,
+        Page::Details => &DETAILS,
+        Page::Startup => &STARTUP,
+        _ => &[],
     }
 }
 
@@ -101,9 +105,7 @@ pub struct Row {
     pub cells: Vec<String>,
     pub heat: Vec<Option<(f64, f64)>>,
     pub sortv: Vec<f64>,
-    pub tip: String,
     pub pids: Vec<u32>,
-    pub aux: String,
 }
 
 pub fn dec(v: f64, digits: usize) -> String {
@@ -111,17 +113,17 @@ pub fn dec(v: f64, digits: usize) -> String {
 }
 
 pub fn fmt_cpu(v: f32) -> String {
-    if v < 0.05 { "0%".into() } else { format!("{}%", dec(v as f64, 1)) }
+    if v < 0.05 { "0%".into() } else { format!("{v:.1}%") }
 }
 
 pub fn fmt_mem_ru(b: u64) -> String {
     let mb = b as f64 / 1_048_576.0;
-    if mb >= 1000.0 { format!("{} MB", group_thousands(mb as u64)) } else if mb >= 100.0 { format!("{} MB", dec(mb, 0)) } else { format!("{} MB", dec(mb, 1)) }
+    if mb >= 1000.0 { format!("{} MB", group_thousands(mb as u64)) } else if mb >= 100.0 { format!("{mb:.0} MB") } else { format!("{mb:.1} MB") }
 }
 
 pub fn fmt_disk_ru(bps: f64) -> String {
     let mb = bps / 1_048_576.0;
-    if mb < 0.05 { "0 MB/s".into() } else { format!("{} MB/s", dec(mb, 1)) }
+    if mb < 0.05 { "0 MB/s".into() } else { format!("{mb:.1} MB/s") }
 }
 
 pub fn fmt_net_ru(bps: f64, known: bool) -> String {
@@ -129,7 +131,7 @@ pub fn fmt_net_ru(bps: f64, known: bool) -> String {
         return "—".into();
     }
     let mbit = bps * 8.0 / 1e6;
-    if mbit < 0.05 { "0 Mbps".into() } else { format!("{} Mbps", dec(mbit, 1)) }
+    if mbit < 0.05 { "0 Mbps".into() } else { format!("{mbit:.1} Mbps") }
 }
 
 fn friendly(d: &Data, p: &Proc) -> String {
@@ -163,7 +165,7 @@ fn proc_row(d: &Data, key: String, depth: u8, name: String, members: &[&Proc], e
     let net: f64 = members.iter().map(|p| p.net).sum();
     let gpu: f32 = members.iter().map(|p| p.gpu).fold(0.0, f32::max);
     let etw = d.etw.is_some();
-    let gpu_s = if gpu >= 0.05 { format!("{}%", dec(gpu as f64, 0)) } else { "0%".into() };
+    let gpu_s = if gpu >= 0.05 { format!("{gpu:.0}%") } else { "0%".into() };
     let mut cells = vec![name];
     let mut heat = vec![None];
     let mut sortv = vec![f64::NAN];
@@ -192,9 +194,7 @@ fn proc_row(d: &Data, key: String, depth: u8, name: String, members: &[&Proc], e
         cells,
         heat,
         sortv,
-        tip: String::new(),
         pids: members.iter().map(|p| p.pid).collect(),
-        aux: String::new(),
     }
 }
 
@@ -205,12 +205,23 @@ pub struct BuildCtx<'a> {
     pub sort: (usize, bool),
 }
 
+fn contains_ci(hay: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.is_ascii() && hay.is_ascii() {
+        let nb = needle_lower.as_bytes();
+        return hay.as_bytes().windows(nb.len()).any(|w| w.eq_ignore_ascii_case(nb));
+    }
+    hay.to_lowercase().contains(needle_lower)
+}
+
 fn matches(d: &Data, p: &Proc, q: &str) -> bool {
-    p.name.to_lowercase().contains(q)
-        || p.pid.to_string() == q
-        || friendly(d, p).to_lowercase().contains(q)
-        || p.exe.as_deref().and_then(|e| d.res.get(e)).is_some_and(|r| r.company.to_lowercase().contains(q))
-        || p.title.as_deref().is_some_and(|t| t.to_lowercase().contains(q))
+    contains_ci(&p.name, q)
+        || q.parse::<u32>().ok() == Some(p.pid)
+        || contains_ci(&friendly(d, p), q)
+        || p.exe.as_deref().and_then(|e| d.res.get(e)).is_some_and(|r| contains_ci(&r.company, q))
+        || p.title.as_deref().is_some_and(|t| contains_ci(t, q))
 }
 
 pub fn build_rows(d: &Data, c: &BuildCtx) -> Vec<Row> {
@@ -279,7 +290,7 @@ pub fn build_rows(d: &Data, c: &BuildCtx) -> Vec<Row> {
             }
             let mut out: Vec<(Row, Vec<Row>)> = vec![];
             for (user, mut members) in groups {
-                if !q.is_empty() && !user.to_lowercase().contains(&q) && !members.iter().any(|p| matches(d, p, &q)) {
+                if !q.is_empty() && !contains_ci(&user, &q) && !members.iter().any(|p| matches(d, p, &q)) {
                     continue;
                 }
                 members.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
@@ -289,7 +300,6 @@ pub fn build_rows(d: &Data, c: &BuildCtx) -> Vec<Row> {
                 head.cells[1] = members.len().to_string();
                 head.sortv[1] = members.len() as f64;
                 head.icon_path = None;
-                head.tip = String::new();
                 let kids: Vec<Row> = if expanded { members.iter().map(|p| proc_row(d, format!("{key}#{}", p.pid), 1, child_name(d, p), &[p], false, false, true)).collect() } else { vec![] };
                 out.push((head, kids));
             }
@@ -313,13 +323,13 @@ pub fn build_rows(d: &Data, c: &BuildCtx) -> Vec<Row> {
         Page::Startup => d
             .startup
             .iter()
-            .filter(|s| q.is_empty() || s.name.to_lowercase().contains(&q) || s.command.to_lowercase().contains(&q))
+            .filter(|s| q.is_empty() || contains_ci(&s.name, &q) || contains_ci(&s.command, &q))
             .map(|s| {
                 let exe = exe_from_command(&s.command);
                 let company = exe.as_deref().and_then(|e| d.res.get(e)).map(|r| r.company).unwrap_or_default();
                 let impact = if d.is_admin { crate::startup::boot_impact(s, crate::startup::boot_log()) } else { None };
                 let impact_txt = match impact {
-                    Some(ms) => format!("+{} s", dec(ms as f64 / 1000.0, 1)),
+                    Some(ms) => format!("+{:.1} s", ms as f64 / 1000.0),
                     None if d.is_admin => "—".into(),
                     None => "administrator needed".into(),
                 };
@@ -329,7 +339,6 @@ pub fn build_rows(d: &Data, c: &BuildCtx) -> Vec<Row> {
                     cells: vec![s.name.clone(), company, (if s.enabled { "Enabled" } else { "Disabled" }).into(), impact_txt, s.command.clone()],
                     sortv: vec![f64::NAN, f64::NAN, f64::NAN, impact.unwrap_or(0) as f64, f64::NAN],
                     heat: vec![None; 5],
-                    tip: format!("Source: {}.{}", s.source_label(), if s.needs_admin() && !d.is_admin { " Administrator rights are needed to change it." } else { "" }),
                     ..Default::default()
                 }
             })

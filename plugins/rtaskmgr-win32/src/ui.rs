@@ -1,4 +1,4 @@
-use std::ptr::null_mut;
+use std::{cell::RefCell, collections::HashMap, ptr::null_mut};
 use winapi::shared::windef::{HBRUSH, HDC, HFONT, HGDIOBJ, POINT, RECT};
 use winapi::um::{wingdi::*, winuser::*};
 
@@ -6,7 +6,7 @@ use winapi::um::{wingdi::*, winuser::*};
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
-    pub fn c(self) -> u32 {
+    pub const fn c(self) -> u32 {
         self.0 as u32 | (self.1 as u32) << 8 | (self.2 as u32) << 16
     }
     pub fn lerp(self, o: Rgb, t: f32) -> Rgb {
@@ -115,35 +115,48 @@ pub enum Font {
 
 pub struct Fonts {
     f: [HFONT; 8],
+    pens: RefCell<HashMap<(i32, u32), isize>>,
+}
+
+pub(crate) fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
 }
 
 fn mk(face: &str, px: i32, weight: i32) -> HFONT {
-    let w: Vec<u16> = face.encode_utf16().chain(Some(0)).collect();
+    let w = wide(face);
     unsafe { CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, w.as_ptr()) }
-}
-
-fn icon_face() -> &'static str {
-    winrust_common::style::icon_face()
 }
 
 impl Fonts {
     pub fn new(s: f64) -> Fonts {
         let p = |x: f64| (x * s).round() as i32;
+        let sans = winrust_common::style::sans_face();
+        let icon = winrust_common::style::icon_face();
         Fonts {
             f: [
-                mk(winrust_common::style::sans_face(), p(13.0), 400),
-                mk(winrust_common::style::sans_face(), p(12.0), 400),
-                mk(winrust_common::style::sans_face(), p(13.0), 600),
-                mk(winrust_common::style::sans_face(), p(22.0), 600),
-                mk(winrust_common::style::sans_face(), p(20.0), 400),
-                mk(winrust_common::style::sans_face(), p(30.0), 300),
-                mk(icon_face(), p(16.0), 400),
-                mk(icon_face(), p(13.0), 400),
+                mk(sans, p(13.0), 400),
+                mk(sans, p(12.0), 400),
+                mk(sans, p(13.0), 600),
+                mk(sans, p(22.0), 600),
+                mk(sans, p(20.0), 400),
+                mk(sans, p(30.0), 300),
+                mk(icon, p(16.0), 400),
+                mk(icon, p(13.0), 400),
             ],
+            pens: RefCell::new(HashMap::new()),
         }
     }
     pub fn get(&self, f: Font) -> HFONT {
         self.f[f as usize]
+    }
+    fn pen(&self, width: i32, color: u32) -> HGDIOBJ {
+        let mut m = self.pens.borrow_mut();
+        *m.entry((width, color)).or_insert_with(|| unsafe { CreatePen(PS_SOLID as i32, width, color) } as isize) as HGDIOBJ
+    }
+    pub fn rebuild(&mut self, s: f64) {
+        let mut next = Fonts::new(s);
+        std::mem::swap(&mut self.f, &mut next.f);
+        std::mem::swap(&mut self.pens, &mut next.pens);
     }
 }
 
@@ -151,6 +164,9 @@ impl Drop for Fonts {
     fn drop(&mut self) {
         for f in self.f {
             unsafe { DeleteObject(f as HGDIOBJ) };
+        }
+        for (_, p) in self.pens.get_mut().drain() {
+            unsafe { DeleteObject(p as HGDIOBJ) };
         }
     }
 }
@@ -273,11 +289,8 @@ impl<'a> G<'a> {
                 Polyline(self.dc, pts.as_ptr(), pts.len() as i32);
                 SelectObject(self.dc, old);
             } else {
-                thread_local! { static PENS: std::cell::RefCell<std::collections::HashMap<(i32, u32), isize>> = std::cell::RefCell::new(std::collections::HashMap::new()); }
-                let pen = PENS.with_borrow_mut(|m| {
-                    *m.entry((width, c.c())).or_insert_with(|| CreatePen(PS_SOLID as i32, width, c.c()) as isize)
-                });
-                let old = SelectObject(self.dc, pen as HGDIOBJ);
+                let pen = self.fonts.pen(width, c.c());
+                let old = SelectObject(self.dc, pen);
                 Polyline(self.dc, pts.as_ptr(), pts.len() as i32);
                 SelectObject(self.dc, old);
             }
@@ -319,16 +332,24 @@ pub fn heat(th: &Theme, value: f64, scale: f64) -> Rgb {
     th.heat0.lerp(th.heat1, ((value / scale).max(0.0).sqrt()) as f32)
 }
 
-pub fn group_thousands(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
+pub fn group_thousands(mut n: u64) -> String {
+    let mut buf = [0u8; 32];
+    let mut idx = buf.len();
+    let mut digits = 0u8;
+    loop {
+        if digits > 0 && digits % 3 == 0 {
+            idx -= 1;
+            buf[idx] = b',';
         }
-        out.push(c);
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+        digits += 1;
+        if n == 0 {
+            break;
+        }
     }
-    out
+    unsafe { std::str::from_utf8_unchecked(&buf[idx..]) }.to_string()
 }
 
 pub fn fmt_uptime(secs: u64) -> String {

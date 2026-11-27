@@ -194,10 +194,13 @@ pub enum Side {
 
 impl Side {
     pub fn parse(s: &str) -> Side {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "left" => Side::Left,
-            "right" => Side::Right,
-            _ => Side::Bottom,
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("left") {
+            Side::Left
+        } else if t.eq_ignore_ascii_case("right") {
+            Side::Right
+        } else {
+            Side::Bottom
         }
     }
     pub fn name(self) -> &'static str {
@@ -243,8 +246,12 @@ pub fn msg() -> u32 {
     static M: AtomicU32 = AtomicU32::new(0);
     match M.load(Relaxed) {
         0 => {
-            let n: Vec<u16> = "WinRustStyleChanged\0".encode_utf16().collect();
-            let m = unsafe { RegisterWindowMessageW(n.as_ptr()) };
+            const NAME: [u16; 20] = [
+                b'W' as u16, b'i' as u16, b'n' as u16, b'R' as u16, b'u' as u16, b's' as u16, b't' as u16,
+                b'S' as u16, b't' as u16, b'y' as u16, b'l' as u16, b'e' as u16,
+                b'C' as u16, b'h' as u16, b'a' as u16, b'n' as u16, b'g' as u16, b'e' as u16, b'd' as u16, 0,
+            ];
+            let m = unsafe { RegisterWindowMessageW(NAME.as_ptr()) };
             M.store(m, Relaxed);
             m
         }
@@ -442,7 +449,12 @@ pub fn themes() -> Vec<Theme> {
 pub fn save_themes(t: &[Theme]) {
     if let Some(f) = themes_file() {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
-        let _ = std::fs::write(f, t.iter().map(|t| t.line() + "\n").collect::<String>());
+        let mut out = String::with_capacity(t.len() * 48);
+        for item in t {
+            out.push_str(&item.line());
+            out.push('\n');
+        }
+        let _ = std::fs::write(f, out);
     }
 }
 

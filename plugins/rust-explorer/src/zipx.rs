@@ -94,23 +94,32 @@ fn rev_bits(mut c: u32, n: u32) -> u32 {
     r
 }
 
-fn code_lengths(freq: &[u32], limit: u32) -> Vec<u8> {
-    let mut len = vec![0u8; freq.len()];
-    let used: Vec<usize> = (0..freq.len()).filter(|&i| freq[i] > 0).collect();
-    match used.len() {
-        0 => return len,
+fn code_lengths(freq: &[u32], limit: u32, len: &mut [u8]) {
+    let n = freq.len();
+    len[..n].fill(0);
+    let mut used = [0usize; 286];
+    let mut ulen = 0usize;
+    for (i, &f) in freq.iter().enumerate() {
+        if f > 0 {
+            used[ulen] = i;
+            ulen += 1;
+        }
+    }
+    match ulen {
+        0 => return,
         1 => {
             len[used[0]] = 1;
-            return len;
+            return;
         }
         _ => {}
     }
-    let mut parent = vec![usize::MAX; freq.len() + used.len()];
-    let mut heap = std::collections::BinaryHeap::new();
-    for &i in &used {
+    let used = &mut used[..ulen];
+    let mut parent = [usize::MAX; 572];
+    let mut heap = std::collections::BinaryHeap::with_capacity(ulen);
+    for &i in used.iter() {
         heap.push(std::cmp::Reverse((freq[i] as u64, i)));
     }
-    let mut next = freq.len();
+    let mut next = n;
     while heap.len() > 1 {
         let std::cmp::Reverse((fa, a)) = heap.pop().unwrap();
         let std::cmp::Reverse((fb, b)) = heap.pop().unwrap();
@@ -119,10 +128,10 @@ fn code_lengths(freq: &[u32], limit: u32) -> Vec<u8> {
         heap.push(std::cmp::Reverse((fa + fb, next)));
         next += 1;
     }
-    for &i in &used {
-        let (mut d, mut n) = (0u32, i);
-        while parent[n] != usize::MAX {
-            n = parent[n];
+    for &i in used.iter() {
+        let (mut d, mut p) = (0u32, i);
+        while parent[p] != usize::MAX {
+            p = parent[p];
             d += 1;
         }
         len[i] = d.min(limit) as u8;
@@ -130,8 +139,7 @@ fn code_lengths(freq: &[u32], limit: u32) -> Vec<u8> {
     let unit = |l: u8| 1u64 << (limit - l as u32);
     let mut kraft: u64 = used.iter().map(|&i| unit(len[i])).sum();
     let full = 1u64 << limit;
-    let mut by_freq = used.clone();
-    by_freq.sort_by_key(|&i| std::cmp::Reverse(freq[i]));
+    used.sort_by_key(|&i| std::cmp::Reverse(freq[i]));
     while kraft > full {
         let i = *used.iter().filter(|&&i| (len[i] as u32) < limit).max_by_key(|&&i| (len[i], std::cmp::Reverse(freq[i]))).unwrap();
         kraft -= unit(len[i]) / 2;
@@ -139,7 +147,7 @@ fn code_lengths(freq: &[u32], limit: u32) -> Vec<u8> {
     }
     loop {
         let mut changed = false;
-        for &i in &by_freq {
+        for &i in used.iter() {
             if kraft < full && len[i] > 1 && full - kraft >= unit(len[i]) {
                 kraft += unit(len[i]);
                 len[i] -= 1;
@@ -150,10 +158,9 @@ fn code_lengths(freq: &[u32], limit: u32) -> Vec<u8> {
             break;
         }
     }
-    len
 }
 
-fn codes(len: &[u8]) -> Vec<u32> {
+fn codes(len: &[u8], out: &mut [u32]) {
     let mut count = [0u32; 16];
     for &l in len {
         count[l as usize] += 1;
@@ -164,16 +171,15 @@ fn codes(len: &[u8]) -> Vec<u32> {
         code = (code + count[b - 1]) << 1;
         next[b] = code;
     }
-    len.iter()
-        .map(|&l| {
-            if l == 0 {
-                return 0;
-            }
+    for (i, &l) in len.iter().enumerate() {
+        if l == 0 {
+            out[i] = 0;
+        } else {
             let c = next[l as usize];
             next[l as usize] += 1;
-            rev_bits(c, l as u32)
-        })
-        .collect()
+            out[i] = rev_bits(c, l as u32);
+        }
+    }
 }
 
 struct BitW {
@@ -211,6 +217,8 @@ pub struct Deflater {
     prev: Vec<u32>,
     next_ins: usize,
     hist: Vec<u8>,
+    buf: Vec<u8>,
+    syms: Vec<u32>,
 }
 
 fn looks_random(d: &[u8]) -> bool {
@@ -230,7 +238,7 @@ fn looks_random(d: &[u8]) -> bool {
 
 impl Deflater {
     pub fn new() -> Self {
-        Deflater { bw: BitW { acc: 0, n: 0 }, head: vec![u32::MAX; 1 << HASH_BITS], prev: vec![u32::MAX; WIN], next_ins: 0, hist: Vec::new() }
+        Deflater { bw: BitW { acc: 0, n: 0 }, head: vec![u32::MAX; 1 << HASH_BITS], prev: vec![u32::MAX; WIN], next_ins: 0, hist: Vec::new(), buf: Vec::new(), syms: Vec::new() }
     }
 
     fn hash(d: &[u8], i: usize) -> usize {
@@ -301,24 +309,33 @@ impl Deflater {
         } else {
             self.matched(data, out);
         }
-        self.hist.extend_from_slice(data);
-        if self.hist.len() > WIN {
-            self.hist.drain(..self.hist.len() - WIN);
+        if data.len() >= WIN {
+            self.hist.clear();
+            self.hist.extend_from_slice(&data[data.len() - WIN..]);
+        } else {
+            self.hist.extend_from_slice(data);
+            if self.hist.len() > WIN {
+                self.hist.drain(..self.hist.len() - WIN);
+            }
         }
     }
 
     fn matched(&mut self, data: &[u8], out: &mut Vec<u8>) {
         let h = self.hist.len();
-        let mut buf = Vec::with_capacity(h + data.len());
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.clear();
+        buf.reserve(h + data.len());
         buf.extend_from_slice(&self.hist);
         buf.extend_from_slice(data);
+        let mut syms = std::mem::take(&mut self.syms);
+        syms.clear();
+        syms.reserve(data.len() / 2 + 16);
         let d = &buf[..];
         self.head.fill(u32::MAX);
         self.next_ins = 0;
         for j in 0..h {
             self.ins(d, j);
         }
-        let mut syms: Vec<u32> = Vec::with_capacity(data.len() / 2 + 16);
         let n = d.len();
         let mut i = h;
         while i < n {
@@ -347,6 +364,8 @@ impl Deflater {
             }
         }
         self.block(data, &syms, out);
+        self.buf = buf;
+        self.syms = syms;
     }
 
     fn stored(&mut self, raw: &[u8], out: &mut Vec<u8>) {
@@ -373,44 +392,55 @@ impl Deflater {
         if df.iter().all(|&f| f == 0) {
             df[0] = 1;
         }
-        let ll = code_lengths(&lf, 15);
-        let dl = code_lengths(&df, 15);
+        let (mut ll, mut dl) = ([0u8; 286], [0u8; 30]);
+        code_lengths(&lf, 15, &mut ll);
+        code_lengths(&df, 15, &mut dl);
         let hlit = (257..=286).rev().find(|&n| ll[n - 1] != 0).unwrap_or(257);
         let hdist = (1..=30).rev().find(|&n| dl[n - 1] != 0).unwrap_or(1);
-        let all: Vec<u8> = ll[..hlit].iter().chain(&dl[..hdist]).copied().collect();
-        let mut rl: Vec<(u8, u8)> = vec![];
+        let mut all = [0u8; 316];
+        all[..hlit].copy_from_slice(&ll[..hlit]);
+        all[hlit..hlit + hdist].copy_from_slice(&dl[..hdist]);
+        let all_len = hlit + hdist;
+        let mut rl = [(0u8, 0u8); 316];
+        let mut rlen = 0usize;
         let mut k = 0;
-        while k < all.len() {
+        while k < all_len {
             let v = all[k];
             let mut run = 1;
-            while k + run < all.len() && all[k + run] == v {
+            while k + run < all_len && all[k + run] == v {
                 run += 1;
             }
             k += run;
             if v == 0 {
                 while run >= 3 {
                     let r = run.min(138);
-                    if r >= 11 { rl.push((18, (r - 11) as u8)) } else { rl.push((17, (r - 3) as u8)) }
+                    rl[rlen] = if r >= 11 { (18, (r - 11) as u8) } else { (17, (r - 3) as u8) };
+                    rlen += 1;
                     run -= r;
                 }
             } else {
-                rl.push((v, 0));
+                rl[rlen] = (v, 0);
+                rlen += 1;
                 run -= 1;
                 while run >= 3 {
                     let r = run.min(6);
-                    rl.push((16, (r - 3) as u8));
+                    rl[rlen] = (16, (r - 3) as u8);
+                    rlen += 1;
                     run -= r;
                 }
             }
             for _ in 0..run {
-                rl.push((v, 0));
+                rl[rlen] = (v, 0);
+                rlen += 1;
             }
         }
+        let rl = &rl[..rlen];
         let mut cf = [0u32; 19];
-        for &(s, _) in &rl {
+        for &(s, _) in rl {
             cf[s as usize] += 1;
         }
-        let cl = code_lengths(&cf, 7);
+        let mut cl = [0u8; 19];
+        code_lengths(&cf, 7, &mut cl);
         let hclen = (4..=19).rev().find(|&n| cl[CL_ORDER[n - 1]] != 0).unwrap_or(4);
         let mut bits: u64 = 17 + 3 * hclen as u64;
         bits += rl.iter().map(|&(s, _)| cl[s as usize] as u64 + [0, 0, 0, 2, 3, 7][if s >= 16 { s as usize - 13 } else { 0 }]).sum::<u64>();
@@ -421,7 +451,10 @@ impl Deflater {
             self.stored(raw, out);
             return;
         }
-        let (lc, dc, cc) = (codes(&ll), codes(&dl), codes(&cl));
+        let (mut lc, mut dc, mut cc) = ([0u32; 286], [0u32; 30], [0u32; 19]);
+        codes(&ll, &mut lc);
+        codes(&dl, &mut dc);
+        codes(&cl, &mut cc);
         let bw = &mut self.bw;
         bw.put(out, 0b100, 3);
         bw.put(out, (hlit - 257) as u32, 5);
@@ -430,7 +463,7 @@ impl Deflater {
         for &o in &CL_ORDER[..hclen] {
             bw.put(out, cl[o] as u32, 3);
         }
-        for &(s, x) in &rl {
+        for &(s, x) in rl {
             bw.put(out, cc[s as usize], cl[s as usize] as u32);
             match s {
                 16 => bw.put(out, x as u32, 2),
@@ -690,7 +723,11 @@ pub fn inflate<R: Read, W: Write>(r: R, w: &mut W, progress: &mut dyn FnMut(u64)
                         let from = out.len() - dist;
                         if dist >= len {
                             out.extend_from_within(from..from + len);
+                        } else if dist == 1 {
+                            let b = out[from];
+                            out.resize(out.len() + len, b);
                         } else {
+                            out.reserve(len);
                             for k in 0..len {
                                 out.push(out[from + k]);
                             }
@@ -755,6 +792,7 @@ pub struct Writer<W: Write> {
     pos: u64,
     cd: Vec<Cd>,
     limit: u64,
+    hdr: Vec<u8>,
 }
 
 fn le16(v: &mut Vec<u8>, x: u16) {
@@ -769,7 +807,7 @@ fn le64(v: &mut Vec<u8>, x: u64) {
 
 impl<W: Write> Writer<W> {
     pub fn new(w: W) -> Self {
-        Writer { w, pos: 0, cd: vec![], limit: U32_MAX }
+        Writer { w, pos: 0, cd: vec![], limit: U32_MAX, hdr: Vec::with_capacity(128) }
     }
 
     #[cfg(test)]
@@ -787,18 +825,24 @@ impl<W: Write> Writer<W> {
     pub fn add_dir(&mut self, name: &str, time: (u16, u16)) -> io::Result<()> {
         let name = format!("{}/", name.trim_end_matches('/'));
         let offset = self.pos;
-        let mut h = vec![];
+        let mut h = std::mem::take(&mut self.hdr);
+        h.clear();
         local_header(&mut h, &name, time, 0, 0, 0, 0, false);
-        self.put(&h)?;
+        let r = self.put(&h);
+        self.hdr = h;
+        r?;
         self.cd.push(Cd { name, time, method: 0, crc: 0, csize: 0, usize: 0, offset, dir: true });
         Ok(())
     }
 
     pub fn add_prepared(&mut self, f: Prepared) -> io::Result<()> {
         let offset = self.pos;
-        let mut h = vec![];
+        let mut h = std::mem::take(&mut self.hdr);
+        h.clear();
         local_header(&mut h, &f.name, f.time, f.method, f.crc, f.data.len() as u32, f.usize as u32, false);
-        self.put(&h)?;
+        let r = self.put(&h);
+        self.hdr = h;
+        r?;
         self.put(&f.data)?;
         self.cd.push(Cd { name: f.name, time: f.time, method: f.method, crc: f.crc, csize: f.data.len() as u64, usize: f.usize, offset, dir: false });
         Ok(())
@@ -808,44 +852,52 @@ impl<W: Write> Writer<W> {
         let time = dos_time(path);
         let mut f = fs::File::open(path)?;
         let offset = self.pos;
-        let mut h = vec![];
+        let mut h = std::mem::take(&mut self.hdr);
+        h.clear();
         local_header(&mut h, &name, time, 8, 0, U32_MAX as u32, U32_MAX as u32, true);
-        self.put(&h)?;
+        let r = self.put(&h);
+        self.hdr = h;
+        r?;
         let (mut d, mut out) = (Deflater::new(), Vec::new());
         let (mut crc, mut total, mut csize) = (0u32, 0u64, 0u64);
-        let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<Vec<u8>>>(2);
+        let (tx_full, rx_full) = std::sync::mpsc::sync_channel::<io::Result<(Vec<u8>, usize)>>(2);
+        let (tx_empty, rx_empty) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let _ = tx_empty.send(vec![0u8; CHUNK]);
+        let _ = tx_empty.send(vec![0u8; CHUNK]);
         std::thread::scope(|s| -> io::Result<()> {
-            s.spawn(move || loop {
-                let mut buf = vec![0u8; CHUNK];
-                let mut n = 0;
-                let r = loop {
-                    if n == CHUNK {
-                        break Ok(n);
+            s.spawn(move || {
+                while let Ok(mut buf) = rx_empty.recv() {
+                    let mut n = 0;
+                    let r = loop {
+                        if n == CHUNK {
+                            break Ok(n);
+                        }
+                        match f.read(&mut buf[n..]) {
+                            Ok(0) => break Ok(n),
+                            Ok(k) => n += k,
+                            Err(e) => break Err(e),
+                        }
+                    };
+                    let last = !matches!(r, Ok(n) if n == CHUNK);
+                    let msg = r.map(|n| (buf, n));
+                    if tx_full.send(msg).is_err() || last {
+                        break;
                     }
-                    match f.read(&mut buf[n..]) {
-                        Ok(0) => break Ok(n),
-                        Ok(k) => n += k,
-                        Err(e) => break Err(e),
-                    }
-                };
-                let last = !matches!(r, Ok(n) if n == CHUNK);
-                let msg = r.map(|n| { buf.truncate(n); buf });
-                if tx.send(msg).is_err() || last {
-                    break;
                 }
             });
-            for r in rx {
-                let buf = r?;
-                if buf.is_empty() {
+            for r in rx_full {
+                let (buf, n) = r?;
+                if n == 0 {
                     break;
                 }
-                crc = crc32(crc, &buf);
-                total += buf.len() as u64;
+                crc = crc32(crc, &buf[..n]);
+                total += n as u64;
                 out.clear();
-                d.chunk(&buf, &mut out);
+                d.chunk(&buf[..n], &mut out);
+                let _ = tx_empty.send(buf);
                 csize += out.len() as u64;
                 self.put(&out)?;
-                if !done(buf.len() as u64) {
+                if !done(n as u64) {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
                 }
             }
@@ -855,11 +907,11 @@ impl<W: Write> Writer<W> {
         d.finish(&mut out);
         csize += out.len() as u64;
         self.put(&out)?;
-        let mut dd = vec![];
-        le32(&mut dd, 0x0807_4b50);
-        le32(&mut dd, crc);
-        le64(&mut dd, csize);
-        le64(&mut dd, total);
+        let mut dd = [0u8; 24];
+        dd[0..4].copy_from_slice(&0x0807_4b50u32.to_le_bytes());
+        dd[4..8].copy_from_slice(&crc.to_le_bytes());
+        dd[8..16].copy_from_slice(&csize.to_le_bytes());
+        dd[16..24].copy_from_slice(&total.to_le_bytes());
         self.put(&dd)?;
         self.cd.push(Cd { name, time, method: 8, crc, csize, usize: total, offset, dir: false });
         Ok(())
@@ -867,23 +919,27 @@ impl<W: Write> Writer<W> {
 
     pub fn finish(mut self) -> io::Result<W> {
         let start = self.pos;
-        let mut v = vec![];
+        let mut v = Vec::with_capacity(self.cd.len() * 64 + 128);
         for e in &self.cd {
-            let mut x = vec![];
+            let mut x = [0u8; 24];
+            let mut xlen = 0usize;
             let (us, cs, of) = (e.usize >= self.limit, e.csize >= self.limit, e.offset >= self.limit);
             if us {
-                le64(&mut x, e.usize);
+                x[xlen..xlen + 8].copy_from_slice(&e.usize.to_le_bytes());
+                xlen += 8;
             }
             if cs {
-                le64(&mut x, e.csize);
+                x[xlen..xlen + 8].copy_from_slice(&e.csize.to_le_bytes());
+                xlen += 8;
             }
             if of {
-                le64(&mut x, e.offset);
+                x[xlen..xlen + 8].copy_from_slice(&e.offset.to_le_bytes());
+                xlen += 8;
             }
             let big = |b: bool, v: u64| if b { U32_MAX as u32 } else { v as u32 };
             le32(&mut v, 0x0201_4b50);
             le16(&mut v, 45 | 10 << 8);
-            le16(&mut v, if x.is_empty() { 20 } else { 45 });
+            le16(&mut v, if xlen == 0 { 20 } else { 45 });
             le16(&mut v, 0x0800);
             le16(&mut v, e.method);
             le16(&mut v, e.time.0);
@@ -892,17 +948,17 @@ impl<W: Write> Writer<W> {
             le32(&mut v, big(cs, e.csize));
             le32(&mut v, big(us, e.usize));
             le16(&mut v, e.name.len() as u16);
-            le16(&mut v, if x.is_empty() { 0 } else { x.len() as u16 + 4 });
+            le16(&mut v, if xlen == 0 { 0 } else { xlen as u16 + 4 });
             le16(&mut v, 0);
             le16(&mut v, 0);
             le16(&mut v, 0);
             le32(&mut v, if e.dir { 0x10 } else { 0x20 });
             le32(&mut v, big(of, e.offset));
             v.extend_from_slice(e.name.as_bytes());
-            if !x.is_empty() {
+            if xlen > 0 {
                 le16(&mut v, 1);
-                le16(&mut v, x.len() as u16);
-                v.extend_from_slice(&x);
+                le16(&mut v, xlen as u16);
+                v.extend_from_slice(&x[..xlen]);
             }
         }
         let (n, size) = (self.cd.len() as u64, v.len() as u64);
@@ -1048,7 +1104,7 @@ fn central_directory<F: Read + Seek>(f: &mut F) -> io::Result<Vec<Entry>> {
         return Err(bad("central directory is too big"));
     }
     let cd = read_at(f, start, size as usize)?;
-    let (mut v, mut i) = (vec![], 0usize);
+    let (mut v, mut i) = (Vec::with_capacity((count as usize).min(cd.len() / 46)), 0usize);
     for _ in 0..count {
         if i + 46 > cd.len() || u32_at(&cd, i) != 0x0201_4b50 {
             return Err(bad("broken central directory"));
@@ -1091,16 +1147,22 @@ fn central_directory<F: Read + Seek>(f: &mut F) -> io::Result<Vec<Entry>> {
     Ok(v)
 }
 
-const CP437_HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}";
+const CP437_HIGH_CHARS: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å',
+    'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ',
+    'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»',
+    '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐',
+    '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧',
+    '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀',
+    'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩',
+    '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{a0}',
+];
 
 fn decode_name(b: &[u8], flags: u16) -> String {
     match std::str::from_utf8(b) {
         Ok(s) => s.to_string(),
         Err(_) if flags & 0x800 != 0 => String::from_utf8_lossy(b).into_owned(),
-        Err(_) => {
-            let high: Vec<char> = CP437_HIGH.chars().collect();
-            b.iter().map(|&c| if c < 0x80 { c as char } else { high[c as usize - 0x80] }).collect()
-        }
+        Err(_) => b.iter().map(|&c| if c < 0x80 { c as char } else { CP437_HIGH_CHARS[c as usize - 0x80] }).collect(),
     }
 }
 
@@ -1151,9 +1213,18 @@ pub fn list_dir(archive: &Path, inner: &str) -> Result<Vec<Item>, String> {
 }
 
 pub fn split_zip(p: &Path) -> Option<(PathBuf, String)> {
-    let anc: Vec<&Path> = p.ancestors().collect();
-    let a = anc.iter().rev().find(|a| a.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) && a.is_file())?;
-    let inner = p.strip_prefix(a).ok()?.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+    let raw = p.as_os_str().as_encoded_bytes();
+    if !raw.windows(4).any(|w| w.eq_ignore_ascii_case(b".zip")) {
+        return None;
+    }
+    let mut found = None;
+    for a in p.ancestors() {
+        if a.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) && a.is_file() {
+            found = Some(a);
+        }
+    }
+    let a = found?;
+    let inner = p.strip_prefix(a).ok()?.to_string_lossy().replace('\\', "/");
     Some((a.to_path_buf(), inner))
 }
 
@@ -1424,7 +1495,7 @@ mod tests {
 
     #[test]
     fn old_dos_names_and_cancel() {
-        assert_eq!(CP437_HIGH.chars().count(), 128);
+        assert_eq!(CP437_HIGH_CHARS.len(), 128);
         assert_eq!(decode_name(&[0x82, b'a', 0x94], 0), "éaö");
         assert_eq!(decode_name("é.txt".as_bytes(), 0), "é.txt");
         assert_eq!(decode_name(&[b'a', 0xFF], 0x800), "a\u{FFFD}");

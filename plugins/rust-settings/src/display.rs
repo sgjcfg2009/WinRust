@@ -51,22 +51,39 @@ fn name_text(n: &[u16]) -> String {
     String::from_utf16_lossy(n).trim_end_matches('\0').to_string()
 }
 
+fn display_label(name: &Name, primary: bool, total: usize, paths: &[DISPLAYCONFIG_PATH_INFO]) -> String {
+    let label = paths
+        .iter()
+        .find(|p| path_matches(p, Some(*name)))
+        .and_then(friendly_name)
+        .unwrap_or_default();
+    if !label.is_empty() {
+        return label;
+    }
+    if primary && total == 1 {
+        "Built-in display".to_string()
+    } else {
+        format!("Display {}", name_text(name).trim_start_matches(r"\\.\DISPLAY"))
+    }
+}
+
 pub fn monitor_info() -> Option<(usize, usize, String, bool)> {
-    let total = attached().len();
-    let (name, primary) = selected()?;
-    let label = selected_path().and_then(|p| friendly_name(&p)).unwrap_or_default();
-    let fallback = || if primary && total == 1 { "Built-in display".to_string() } else { format!("Display {}", name_text(&name).trim_start_matches(r"\\.\DISPLAY")) };
-    Some((SEL.get() % total.max(1) + 1, total, if label.is_empty() { fallback() } else { label }, primary))
+    let a = attached();
+    let total = a.len();
+    let idx = SEL.get() % total.max(1);
+    let (name, primary) = a.into_iter().nth(idx)?;
+    let paths = active_paths();
+    Some((idx + 1, total, display_label(&name, primary, total, &paths), primary))
 }
 
 pub fn monitor_names() -> Vec<String> {
-    let keep = SEL.get();
-    let v = (0..attached().len()).map(|i| {
-        SEL.set(i);
-        monitor_info().map_or(format!("{}", i + 1), |m| format!("{} · {}", i + 1, m.2))
-    }).collect();
-    SEL.set(keep);
-    v
+    let a = attached();
+    let total = a.len();
+    let paths = active_paths();
+    a.iter()
+        .enumerate()
+        .map(|(i, (name, primary))| format!("{} · {}", i + 1, display_label(name, *primary, total, &paths)))
+        .collect()
 }
 
 pub fn selected_index() -> usize {
@@ -169,85 +186,73 @@ fn change(d: &DEVMODEW, save: bool) -> bool {
     }
 }
 
-fn force_stretch(save: bool) {
-    let want = selected().map(|s| s.0);
+fn path_matches(p: &DISPLAYCONFIG_PATH_INFO, want: Option<Name>) -> bool {
+    let Some(w) = want else { return true };
+    unsafe {
+        let mut n: DISPLAYCONFIG_SOURCE_DEVICE_NAME = std::mem::zeroed();
+        n.header = header(DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(), p, false);
+        DisplayConfigGetDeviceInfo(&mut n.header) == 0 && n.viewGdiDeviceName == w
+    }
+}
+
+fn active_config() -> Option<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)> {
     unsafe {
         let (mut np, mut nm) = (0u32, 0u32);
         if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != 0 {
-            return;
+            return None;
         }
         let mut paths = vec![std::mem::zeroed::<DISPLAYCONFIG_PATH_INFO>(); np as usize];
         let mut modes = vec![std::mem::zeroed::<DISPLAYCONFIG_MODE_INFO>(); nm as usize];
         if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), null_mut()) != 0 {
-            return;
+            return None;
         }
         paths.truncate(np as usize);
         modes.truncate(nm as usize);
-        let mut changed = false;
-        for p in &mut paths {
-            let matches = match want {
-                Some(w) => {
-                    let mut n: DISPLAYCONFIG_SOURCE_DEVICE_NAME = std::mem::zeroed();
-                    n.header = header(DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(), p, false);
-                    DisplayConfigGetDeviceInfo(&mut n.header) == 0 && n.viewGdiDeviceName == w
-                }
-                None => true,
-            };
-            if matches && p.targetInfo.scaling != DISPLAYCONFIG_SCALING_STRETCHED {
-                p.targetInfo.scaling = DISPLAYCONFIG_SCALING_STRETCHED;
-                changed = true;
-            }
+        Some((paths, modes))
+    }
+}
+
+fn force_stretch(save: bool) {
+    let want = selected().map(|s| s.0);
+    let Some((mut paths, modes)) = active_config() else { return };
+    let mut changed = false;
+    for p in &mut paths {
+        if path_matches(p, want) && p.targetInfo.scaling != DISPLAYCONFIG_SCALING_STRETCHED {
+            p.targetInfo.scaling = DISPLAYCONFIG_SCALING_STRETCHED;
+            changed = true;
         }
-        if changed {
-            let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | if save { SDC_SAVE_TO_DATABASE } else { 0 };
-            SetDisplayConfig(paths.len() as u32, paths.as_ptr(), modes.len() as u32, modes.as_ptr(), flags);
-        }
+    }
+    if changed {
+        let flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | if save { SDC_SAVE_TO_DATABASE } else { 0 };
+        unsafe { SetDisplayConfig(paths.len() as u32, paths.as_ptr(), modes.len() as u32, modes.as_ptr(), flags) };
     }
 }
 
 fn apply_via_display_config(m: Mode, save: bool) -> bool {
     let want = selected().map(|s| s.0);
+    let Some((mut paths, mut modes)) = active_config() else { return false };
+    let mut touched = false;
+    for p in &mut paths {
+        if !path_matches(p, want) {
+            continue;
+        }
+        let sidx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx as usize };
+        if let Some(sm) = modes.get_mut(sidx).filter(|mi| mi.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+            sm.Anonymous.sourceMode.width = m.w;
+            sm.Anonymous.sourceMode.height = m.h;
+            p.targetInfo.scaling = DISPLAYCONFIG_SCALING_STRETCHED;
+            if m.hz > 0 {
+                p.targetInfo.refreshRate.Numerator = m.hz;
+                p.targetInfo.refreshRate.Denominator = 1;
+            }
+            touched = true;
+        }
+    }
+    if !touched {
+        return false;
+    }
+    let base_flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | if save { SDC_SAVE_TO_DATABASE } else { 0 };
     unsafe {
-        let (mut np, mut nm) = (0u32, 0u32);
-        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != 0 {
-            return false;
-        }
-        let mut paths = vec![std::mem::zeroed::<DISPLAYCONFIG_PATH_INFO>(); np as usize];
-        let mut modes = vec![std::mem::zeroed::<DISPLAYCONFIG_MODE_INFO>(); nm as usize];
-        if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), null_mut()) != 0 {
-            return false;
-        }
-        paths.truncate(np as usize);
-        modes.truncate(nm as usize);
-        let mut touched = false;
-        for p in &mut paths {
-            let matches = match want {
-                Some(w) => {
-                    let mut n: DISPLAYCONFIG_SOURCE_DEVICE_NAME = std::mem::zeroed();
-                    n.header = header(DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(), p, false);
-                    DisplayConfigGetDeviceInfo(&mut n.header) == 0 && n.viewGdiDeviceName == w
-                }
-                None => true,
-            };
-            if !matches {
-                continue;
-            }
-            let sidx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
-            if let Some(sm) = modes.get_mut(sidx).filter(|mi| mi.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
-                sm.Anonymous.sourceMode.width = m.w;
-                sm.Anonymous.sourceMode.height = m.h;
-                p.targetInfo.scaling = DISPLAYCONFIG_SCALING_STRETCHED;
-                if m.hz > 0 {
-                    p.targetInfo.refreshRate.Numerator = m.hz;
-                    p.targetInfo.refreshRate.Denominator = 1;
-                }
-                touched = true;
-            }
-        }
-        if !touched {
-            return false;
-        }
-        let base_flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | if save { SDC_SAVE_TO_DATABASE } else { 0 };
         if SetDisplayConfig(paths.len() as u32, paths.as_ptr(), modes.len() as u32, modes.as_ptr(), base_flags) == 0 {
             return true;
         }
@@ -351,12 +356,8 @@ fn paths_of(flags: u32) -> Option<(Vec<DISPLAYCONFIG_PATH_INFO>, i32)> {
 }
 
 fn selected_path() -> Option<DISPLAYCONFIG_PATH_INFO> {
-    let want = selected()?.0;
-    active_paths().into_iter().find(|p| unsafe {
-        let mut n: DISPLAYCONFIG_SOURCE_DEVICE_NAME = std::mem::zeroed();
-        n.header = header(DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(), p, false);
-        DisplayConfigGetDeviceInfo(&mut n.header) == 0 && n.viewGdiDeviceName == want
-    })
+    let want = Some(selected()?.0);
+    active_paths().into_iter().find(|p| path_matches(p, want))
 }
 
 #[repr(C)]

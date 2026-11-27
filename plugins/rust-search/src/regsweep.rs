@@ -45,7 +45,41 @@ fn boundary_after(c: Option<char>) -> bool {
     c.is_none_or(|c| matches!(c, '\\' | '"' | '\'' | ',' | ';' | ' ' | '\n' | '/'))
 }
 
+fn contains_ci(hay: &str, needle: &str) -> Option<usize> {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return Some(0);
+    }
+    if n.len() > h.len() {
+        return None;
+    }
+    'at: for i in 0..=h.len() - n.len() {
+        if h[i].to_ascii_lowercase() != n[0] {
+            continue;
+        }
+        for j in 1..n.len() {
+            if h[i + j].to_ascii_lowercase() != n[j] {
+                continue 'at;
+            }
+        }
+        return Some(i);
+    }
+    None
+}
+
 fn refs(hay: &str, needle: &str) -> bool {
+    if hay.is_ascii() && needle.is_ascii() {
+        let mut from = 0;
+        while let Some(i) = contains_ci(&hay[from..], needle) {
+            let (s, e) = (from + i, from + i + needle.len());
+            let before_ok = hay[..s].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+            if before_ok && boundary_after(hay[e..].chars().next()) {
+                return true;
+            }
+            from = e;
+        }
+        return false;
+    }
     let h = hay.to_lowercase();
     let mut from = 0;
     while let Some(i) = h[from..].find(needle) {
@@ -60,7 +94,13 @@ fn refs(hay: &str, needle: &str) -> bool {
 }
 
 fn under(hay: &str, needle: &str) -> bool {
-    let h = hay.trim_start_matches([' ', '"']).to_lowercase();
+    let trimmed = hay.trim_start_matches([' ', '"']);
+    if trimmed.is_ascii() && needle.is_ascii() {
+        return trimmed.len() >= needle.len()
+            && trimmed.as_bytes()[..needle.len()].eq_ignore_ascii_case(needle.as_bytes())
+            && boundary_after(trimmed[needle.len()..].chars().next());
+    }
+    let h = trimmed.to_lowercase();
     h.starts_with(needle) && boundary_after(h[needle.len()..].chars().next())
 }
 
@@ -78,38 +118,48 @@ impl Val {
     }
 }
 
+struct Scratch {
+    name: Vec<u16>,
+    data: Vec<u8>,
+    sub: [u16; 256],
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self { name: vec![0u16; 16384], data: vec![0u8; 1024], sub: [0u16; 256] }
+    }
+}
+
 unsafe fn open(parent: HKEY, sub: &str, write: bool) -> Option<HKEY> {
     let mut k: HKEY = std::ptr::null_mut();
     let acc = if write { KEY_READ | KEY_SET_VALUE | DELETE } else { KEY_READ };
     (RegOpenKeyExW(parent, wide(sub).as_ptr(), 0, acc, &mut k) == ERROR_SUCCESS).then_some(k)
 }
 
-unsafe fn read_values(key: HKEY) -> Vec<Val> {
-    let (mut out, mut i, mut data) = (Vec::new(), 0u32, vec![0u8; 1024]);
-    let mut name = vec![0u16; 16384];
+unsafe fn read_values(key: HKEY, sc: &mut Scratch) -> Vec<Val> {
+    let (mut out, mut i) = (Vec::new(), 0u32);
     loop {
-        let (mut nlen, mut dlen, mut ty) = (name.len() as u32, data.len() as u32, 0u32);
-        match RegEnumValueW(key, i, name.as_mut_ptr(), &mut nlen, std::ptr::null(), &mut ty, data.as_mut_ptr(), &mut dlen) {
+        let (mut nlen, mut dlen, mut ty) = (sc.name.len() as u32, sc.data.len() as u32, 0u32);
+        match RegEnumValueW(key, i, sc.name.as_mut_ptr(), &mut nlen, std::ptr::null(), &mut ty, sc.data.as_mut_ptr(), &mut dlen) {
             ERROR_SUCCESS => {
-                out.push(Val { name: String::from_utf16_lossy(&name[..nlen as usize]), ty, data: data[..dlen as usize].to_vec() });
+                out.push(Val { name: String::from_utf16_lossy(&sc.name[..nlen as usize]), ty, data: sc.data[..dlen as usize].to_vec() });
                 i += 1;
             }
-            ERROR_MORE_DATA => data.resize((dlen as usize).max(data.len() * 2), 0),
+            ERROR_MORE_DATA => sc.data.resize((dlen as usize).max(sc.data.len() * 2), 0),
             _ => break,
         }
     }
     out
 }
 
-unsafe fn subkeys(key: HKEY) -> Vec<String> {
+unsafe fn subkeys(key: HKEY, sc: &mut Scratch) -> Vec<String> {
     let (mut out, mut i) = (Vec::new(), 0u32);
-    let mut buf = vec![0u16; 256];
     loop {
-        let mut len = buf.len() as u32;
-        if RegEnumKeyExW(key, i, buf.as_mut_ptr(), &mut len, std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) != ERROR_SUCCESS {
+        let mut len = sc.sub.len() as u32;
+        if RegEnumKeyExW(key, i, sc.sub.as_mut_ptr(), &mut len, std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) != ERROR_SUCCESS {
             break;
         }
-        out.push(String::from_utf16_lossy(&buf[..len as usize]));
+        out.push(String::from_utf16_lossy(&sc.sub[..len as usize]));
         i += 1;
     }
     out
@@ -117,24 +167,24 @@ unsafe fn subkeys(key: HKEY) -> Vec<String> {
 
 const OWNER_VALUES: [&str; 5] = ["installlocation", "uninstallstring", "quietuninstallstring", "", "path"];
 fn owns(vals: &[Val], needle: &str) -> bool {
-    vals.iter().any(|v| OWNER_VALUES.contains(&v.name.to_lowercase().as_str()) && v.text().is_some_and(|t| !t.is_empty() && under(&t, needle)))
+    vals.iter().any(|v| OWNER_VALUES.iter().any(|&o| o.eq_ignore_ascii_case(&v.name)) && v.text().is_some_and(|t| !t.is_empty() && under(&t, needle)))
 }
 
-unsafe fn walk(root: Root, key: HKEY, path: &str, needle: &str, depth: u32, hits: &mut Vec<Hit>) {
-    for v in read_values(key) {
+unsafe fn walk(root: Root, key: HKEY, path: &str, needle: &str, depth: u32, hits: &mut Vec<Hit>, sc: &mut Scratch) {
+    for v in read_values(key, sc) {
         if refs(&v.name, needle) || v.text().is_some_and(|t| refs(&t, needle)) {
             hits.push(Hit { root, key: path.into(), value: Some(v.name) });
         }
     }
-    let leaf = path.rsplit('\\').next().unwrap_or("").to_lowercase();
-    let container = matches!(leaf.as_str(), "uninstall" | "app paths");
-    for s in subkeys(key) {
+    let leaf = path.rsplit('\\').next().unwrap_or("");
+    let container = leaf.eq_ignore_ascii_case("uninstall") || leaf.eq_ignore_ascii_case("app paths");
+    for s in subkeys(key, sc) {
         let Some(child) = open(key, &s, false) else { continue };
         let child_path = format!("{path}\\{s}");
-        if container && owns(&read_values(child), needle) {
+        if container && owns(&read_values(child, sc), needle) {
             hits.push(Hit { root, key: child_path, value: None });
         } else if depth < 40 {
-            walk(root, child, &child_path, needle, depth + 1, hits);
+            walk(root, child, &child_path, needle, depth + 1, hits, sc);
         }
         RegCloseKey(child);
     }
@@ -143,10 +193,11 @@ unsafe fn walk(root: Root, key: HKEY, path: &str, needle: &str, depth: u32, hits
 pub fn scan(path: &str) -> Vec<Hit> {
     let needle = path.trim_end_matches('\\').to_lowercase();
     let mut hits = Vec::new();
+    let mut sc = Scratch::new();
     for (root, sub) in [(Root::Hkcu, "Software"), (Root::Hklm, "SOFTWARE")] {
         unsafe {
             if let Some(k) = open(root.h(), sub, false) {
-                walk(root, k, sub, &needle, 0, &mut hits);
+                walk(root, k, sub, &needle, 0, &mut hits, &mut sc);
                 RegCloseKey(k);
             }
         }
@@ -166,15 +217,15 @@ fn reg_line(v: &Val) -> String {
     format!("{note}{name}={data}\r\n")
 }
 
-unsafe fn dump_tree(root: Root, key: HKEY, path: &str, out: &mut String, depth: u32) {
+unsafe fn dump_tree(root: Root, key: HKEY, path: &str, out: &mut String, depth: u32, sc: &mut Scratch) {
     out.push_str(&format!("\r\n[{}\\{path}]\r\n", root.name()));
-    for v in read_values(key) {
+    for v in read_values(key, sc) {
         out.push_str(&reg_line(&v));
     }
-    for s in subkeys(key) {
+    for s in subkeys(key, sc) {
         if let Some(c) = open(key, &s, false) {
             if depth < 40 {
-                dump_tree(root, c, &format!("{path}\\{s}"), out, depth + 1);
+                dump_tree(root, c, &format!("{path}\\{s}"), out, depth + 1, sc);
             }
             RegCloseKey(c);
         }
@@ -184,16 +235,17 @@ unsafe fn dump_tree(root: Root, key: HKEY, path: &str, out: &mut String, depth: 
 pub fn backup(hits: &[Hit], file: &Path) -> io::Result<()> {
     let mut out = String::from("Windows Registry Editor Version 5.00\r\n");
     let mut last_header = String::new();
+    let mut sc = Scratch::new();
     for h in hits {
         unsafe {
             let Some(k) = open(h.root.h(), &h.key, false) else { continue };
             match &h.value {
                 None => {
-                    dump_tree(h.root, k, &h.key, &mut out, 0);
+                    dump_tree(h.root, k, &h.key, &mut out, 0, &mut sc);
                     last_header.clear();
                 }
                 Some(name) => {
-                    if let Some(v) = read_values(k).into_iter().find(|v| v.name == *name) {
+                    if let Some(v) = read_values(k, &mut sc).into_iter().find(|v| v.name == *name) {
                         let header = format!("[{}\\{}]", h.root.name(), h.key);
                         if header != last_header {
                             out.push_str(&format!("\r\n{header}\r\n"));

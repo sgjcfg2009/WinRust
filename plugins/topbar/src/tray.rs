@@ -1,17 +1,21 @@
 use super::*;
 
 pub(crate) unsafe fn find_other(class: &str) -> HWND {
-    let (c, mut h) = (wide(class), null_mut());
-    loop {
-        h = FindWindowExW(null_mut(), h, c.as_ptr(), null());
+    let mut h = null_mut();
+    with_wide(class, |c| loop {
+        h = FindWindowExW(null_mut(), h, c, null());
         if h.is_null() || h != HOST.get() {
             return h;
         }
-    }
+    })
 }
 
-pub(crate) unsafe fn tray() -> [HWND; 2] {
-    [find_other("Shell_TrayWnd"), find_other("Shell_SecondaryTrayWnd")]
+fn eq_ascii_ci(buf: &[u16], s: &str) -> bool {
+    buf.len() == s.len() && buf.iter().zip(s.bytes()).all(|(&a, b)| a < 128 && (a as u8).eq_ignore_ascii_case(&b))
+}
+
+fn starts_with_ascii(buf: &[u16], s: &str) -> bool {
+    buf.len() >= s.len() && buf[..s.len()].iter().zip(s.bytes()).all(|(&a, b)| a == b as u16)
 }
 
 pub(crate) unsafe fn foreign_taskbar_windows() -> Vec<HWND> {
@@ -64,11 +68,11 @@ pub(crate) unsafe fn foreign_taskbar_windows() -> Vec<HWND> {
         }
         let mut cls = [0u16; 64];
         let n = GetClassNameW(w, cls.as_mut_ptr(), cls.len() as i32).max(0) as usize;
-        let name = String::from_utf16_lossy(&cls[..n]);
-        let is_start_cls = name.eq_ignore_ascii_case("Start")
-            || name.starts_with("StartAllBack")
-            || name.starts_with("StartIsBack")
-            || (name.eq_ignore_ascii_case("Button") && ctx.tray_pids.contains(&pid));
+        let cls = &cls[..n];
+        let is_start_cls = eq_ascii_ci(cls, "Start")
+            || starts_with_ascii(cls, "StartAllBack")
+            || starts_with_ascii(cls, "StartIsBack")
+            || (eq_ascii_ci(cls, "Button") && ctx.tray_pids.contains(&pid));
         if is_start_cls {
             ctx.out.push(w);
         }
@@ -103,7 +107,6 @@ pub(crate) unsafe fn announce() {
     let own_pid = std::process::id();
     let mut w = null_mut();
     let mut cls = [0u16; 128];
-    let mut name = String::with_capacity(64);
     let mut guard = 0usize;
     while guard < 1024 {
         w = FindWindowExW(HWND_MESSAGE, w, null(), null());
@@ -117,9 +120,7 @@ pub(crate) unsafe fn announce() {
             continue;
         }
         let n = GetClassNameW(w, cls.as_mut_ptr(), cls.len() as i32).max(0) as usize;
-        name.clear();
-        name.extend(char::decode_utf16(cls[..n].iter().copied()).map(|r| r.unwrap_or('\u{FFFD}')));
-        if SKIP_CLASSES.iter().any(|&s| s.eq_ignore_ascii_case(&name)) {
+        if SKIP_CLASSES.iter().any(|&s| eq_ascii_ci(&cls[..n], s)) {
             continue;
         }
         PostMessageW(w, msg, 0, 0);

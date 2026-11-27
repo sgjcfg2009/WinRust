@@ -51,7 +51,13 @@ struct AudioDev {
 
 mod policy_cfg {
     #![allow(non_snake_case)]
-    use windows::core::PCWSTR;
+    use windows::{
+        Win32::{
+            Media::Audio::{eCommunications, eConsole, eMultimedia},
+            System::Com::{CLSCTX_ALL, CoCreateInstance},
+        },
+        core::{GUID, PCWSTR},
+    };
     #[windows::core::interface("f8679f50-850a-41cf-9c72-430f290290c8")]
     pub unsafe trait IPolicyConfig: windows::core::IUnknown {
         fn GetMixFormat(&self, dev: PCWSTR, fmt: *mut *mut std::ffi::c_void) -> windows::core::HRESULT;
@@ -67,11 +73,20 @@ mod policy_cfg {
         fn SetDefaultEndpoint(&self, dev: PCWSTR, role: i32) -> windows::core::HRESULT;
         fn SetEndpointVisibility(&self, dev: PCWSTR, visible: i32) -> windows::core::HRESULT;
     }
-    pub unsafe fn set_default(pc: &IPolicyConfig, dev: PCWSTR, role: i32) {
-        let _ = unsafe { pc.SetDefaultEndpoint(dev, role) };
+
+    pub fn set_audio_device(id: &str) {
+        const POLICY_CONFIG_CLIENT: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+        unsafe {
+            if let Ok(pc) = CoCreateInstance::<_, IPolicyConfig>(&POLICY_CONFIG_CLIENT, None, CLSCTX_ALL) {
+                let w: Vec<u16> = id.encode_utf16().chain([0]).collect();
+                for r in [eConsole, eMultimedia, eCommunications] {
+                    let _ = pc.SetDefaultEndpoint(PCWSTR(w.as_ptr()), r.0);
+                }
+            }
+        }
     }
 }
-use policy_cfg::IPolicyConfig;
+use policy_cfg::set_audio_device;
 
 fn audio_devices() -> Vec<AudioDev> {
     use windows::Win32::{
@@ -91,25 +106,6 @@ fn audio_devices() -> Vec<AudioDev> {
                 Some(AudioDev { default: Some(&id) == cur.as_ref(), name, id })
             })
             .collect()
-    }
-}
-
-fn set_audio_device(id: &str) {
-    use windows::{
-        Win32::{
-            Media::Audio::{eCommunications, eConsole, eMultimedia},
-            System::Com::{CLSCTX_ALL, CoCreateInstance},
-        },
-        core::{GUID, PCWSTR},
-    };
-    const POLICY_CONFIG_CLIENT: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
-    unsafe {
-        if let Ok(pc) = CoCreateInstance::<_, IPolicyConfig>(&POLICY_CONFIG_CLIENT, None, CLSCTX_ALL) {
-            let w: Vec<u16> = id.encode_utf16().chain([0]).collect();
-            for r in [eConsole, eMultimedia, eCommunications] {
-                policy_cfg::set_default(&pc, PCWSTR(w.as_ptr()), r.0);
-            }
-        }
     }
 }
 
@@ -162,12 +158,14 @@ fn phy_name(t: i32) -> &'static str {
 }
 
 static APPS: Mutex<Vec<(String, Vec<u16>)>> = Mutex::new(Vec::new());
+static START_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 pub static PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static BRIGHT: AtomicI32 = AtomicI32::new(-1);
 
 thread_local! {
     static FLY: Cell<Option<Kind>> = const { Cell::new(None) };
     static FH: Cell<HWND> = const { Cell::new(null_mut()) };
+    static OPENING: Cell<bool> = const { Cell::new(false) };
     static CAL: Cell<(i32, i32)> = const { Cell::new((2026, 1)) };
     static NETS: RefCell<Vec<Net>> = const { RefCell::new(Vec::new()) };
     static CONN: RefCell<Option<Conn>> = const { RefCell::new(None) };
@@ -233,43 +231,244 @@ fn weekday_initials() -> [&'static str; 7] {
     ]
 }
 
+fn start_program_dirs() -> Vec<PathBuf> {
+    use windows::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_CommonPrograms, FOLDERID_Desktop, FOLDERID_Programs, FOLDERID_PublicDesktop, IShellItem, KF_FLAG_DEFAULT, SHGetKnownFolderItem, SIGDN_FILESYSPATH},
+    };
+    let mut dirs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |p: PathBuf| {
+        if p.is_dir() && seen.insert(p.to_string_lossy().to_lowercase()) {
+            dirs.push(p);
+        }
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        for fid in [&FOLDERID_CommonPrograms, &FOLDERID_Programs, &FOLDERID_Desktop, &FOLDERID_PublicDesktop] {
+            if let Ok(item) = SHGetKnownFolderItem::<IShellItem>(fid, KF_FLAG_DEFAULT, None) {
+                if let Ok(pw) = item.GetDisplayName(SIGDN_FILESYSPATH) {
+                    if let Ok(s) = pw.to_string() {
+                        push(PathBuf::from(s));
+                    }
+                    CoTaskMemFree(Some(pw.0 as *const _));
+                }
+            }
+        }
+    }
+    for (var, sub) in [("ProgramData", r"Microsoft\Windows\Start Menu\Programs"), ("APPDATA", r"Microsoft\Windows\Start Menu\Programs")] {
+        if let Some(b) = std::env::var_os(var) {
+            push(PathBuf::from(b).join(sub));
+        }
+    }
+    dirs
+}
+
+fn norm_key(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+}
+
+fn is_junk_exe(name_lower: &str) -> bool {
+    const JUNK: &[&str] = &[
+        "uninstall", "unins", "setup", "update", "updater", "crash", "helper", "handler",
+        "redist", "vcredist", "dxsetup", "elevate", "createdump", "webengine", "notification",
+        "daemon", "reporter", "broker", "svc", "service", "stub", "overlay", "driverquery",
+        "browsercore", "imagingdevices", "proxy", "webview", "diag", "troubleshoot", "oalinst",
+    ];
+    name_lower.is_empty() || JUNK.iter().any(|k| name_lower.contains(k))
+}
+
+fn is_gui_exe(path: &std::path::Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut dos = [0u8; 64];
+    if f.read_exact(&mut dos).is_err() || &dos[0..2] != b"MZ" {
+        return false;
+    }
+    let pe_off = u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]) as u64;
+    if f.seek(SeekFrom::Start(pe_off)).is_err() {
+        return false;
+    }
+    let mut pe = [0u8; 96];
+    if f.read_exact(&mut pe).is_err() || &pe[0..4] != b"PE\0\0" {
+        return false;
+    }
+    let sub = u16::from_le_bytes([pe[92], pe[93]]);
+    sub == 2
+}
+
+fn scan_program_roots(v: &mut Vec<(String, Vec<u16>)>, have: &mut std::collections::HashSet<String>, have_exes: &mut std::collections::HashSet<String>) {
+    const SKIP_DIRS: &[&str] = &[
+        "windowsapps", "common files", "windows nt", "reference assemblies", "msbuild",
+        "microsoft.net", "uninstall information", "windows defender", "windows mail",
+        "windows media player", "windows photo viewer", "windows powershell",
+        "windows security", "windows sidebar", "internet explorer", "modifymodules", "winrust",
+    ];
+    let mut roots = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push_root = |p: PathBuf| {
+        if p.is_dir() && seen.insert(p.to_string_lossy().to_ascii_lowercase()) {
+            roots.push(p);
+        }
+    };
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(b) = std::env::var_os(var) {
+            push_root(PathBuf::from(b));
+        }
+    }
+    if let Some(b) = std::env::var_os("LOCALAPPDATA") {
+        push_root(PathBuf::from(b).join("Programs"));
+    }
+    for r in roots {
+        for e in std::fs::read_dir(&r).into_iter().flatten().flatten() {
+            let dir = e.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let dn = dir.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+            if SKIP_DIRS.iter().any(|s| dn == *s) {
+                continue;
+            }
+            let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+            for fe in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let p = fe.path();
+                if p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) {
+                    let stem = p.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                    let nl = stem.to_ascii_lowercase();
+                    if !is_junk_exe(&nl) && is_gui_exe(&p) {
+                        candidates.push((stem, p));
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                continue;
+            }
+            let pick = if let Some(main_i) = candidates.iter().position(|(s, _)| s.eq_ignore_ascii_case(&dn)) {
+                candidates.swap_remove(main_i)
+            } else if candidates.len() == 1 {
+                candidates.swap_remove(0)
+            } else {
+                continue;
+            };
+            let (stem, p) = pick;
+            let p_low = p.to_string_lossy().to_ascii_lowercase();
+            let nk = norm_key(&stem);
+            if !have_exes.contains(&p_low) && !have_exes.contains(&nk) && have.insert(nk.clone()) {
+                have_exes.insert(p_low);
+                have_exes.insert(nk);
+                v.push((stem, wide(&p.to_string_lossy())));
+            }
+        }
+    }
+}
+
+fn start_apps_watcher(dirs: &[PathBuf]) {
+    static WATCHING: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if dirs.is_empty() || WATCHING.set(()).is_err() {
+        return;
+    }
+    let watch_dirs = dirs.to_vec();
+    std::thread::spawn(move || unsafe {
+        use windows_sys::Win32::{
+            Storage::FileSystem::{
+                FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+                FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification,
+            },
+            System::Threading::WaitForMultipleObjects,
+        };
+        let mask = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE;
+        let handles: Vec<HANDLE> = watch_dirs
+            .iter()
+            .filter_map(|d| {
+                let h = FindFirstChangeNotificationW(wide(&d.to_string_lossy()).as_ptr(), 1, mask);
+                (h != INVALID_HANDLE_VALUE && !h.is_null()).then_some(h)
+            })
+            .collect();
+        if handles.is_empty() {
+            return;
+        }
+        loop {
+            let r = WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, u32::MAX);
+            if (r as usize) >= handles.len() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            for &h in &handles {
+                let _ = FindNextChangeNotification(h);
+            }
+            load_apps();
+        }
+        for h in handles {
+            FindCloseChangeNotification(h);
+        }
+    });
+}
+
 pub fn load_apps() {
     fn walk(dir: &std::path::Path, depth: u8, out: &mut Vec<(String, Vec<u16>)>) {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let p = e.path();
-            if p.is_dir() && depth < 4 {
+            if p.is_dir() && depth < 5 {
                 walk(&p, depth + 1, out);
-            } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+            } else if p.extension().is_some_and(|x| {
+                x.eq_ignore_ascii_case("lnk") || x.eq_ignore_ascii_case("url") || x.eq_ignore_ascii_case("exe") || x.eq_ignore_ascii_case("appref-ms")
+            }) {
                 let name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                if !name.to_lowercase().contains("uninstall") {
+                if !name.is_empty() && !name.to_lowercase().contains("uninstall") {
                     out.push((name, wide(&p.to_string_lossy())));
                 }
             }
         }
     }
+    let dirs = start_program_dirs();
+    start_apps_watcher(&dirs);
     let mut v = Vec::new();
-    for (var, sub) in [("ProgramData", r"Microsoft\Windows\Start Menu\Programs"), ("APPDATA", r"Microsoft\Windows\Start Menu\Programs")] {
-        if let Some(b) = std::env::var_os(var) {
-            walk(&PathBuf::from(b).join(sub), 0, &mut v);
+    for d in &dirs {
+        walk(d, 0, &mut v);
+    }
+    let mut have: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(v.len() * 2);
+    let mut have_exes: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(v.len() * 2);
+    for (name, wpath) in &v {
+        have.insert(norm_key(name));
+        let p_str = String::from_utf16_lossy(&wpath[..wpath.len().saturating_sub(1)]);
+        let tgt = if p_str.to_ascii_lowercase().ends_with(".lnk") {
+            unsafe { lnk_target(wpath) }
+        } else {
+            p_str
+        };
+        if !tgt.is_empty() {
+            let tl = tgt.to_ascii_lowercase();
+            if let Some(stem) = std::path::Path::new(&tl).file_stem().and_then(|s| s.to_str()) {
+                have_exes.insert(norm_key(stem));
+            }
+            have_exes.insert(tl);
         }
     }
-    let mut have: std::collections::HashSet<String> = v.iter().map(|a| a.0.to_lowercase()).collect();
     for (name, id) in apps_folder() {
         let id_l = id.to_ascii_lowercase();
         let nl = name.to_ascii_lowercase();
         let sys_junk = id_l.contains("\\windows\\system32\\")
             || id_l.contains("\\windows\\syswow64\\")
             || id_l.contains("\\windows\\winsxs\\")
+            || id_l.contains("\\winrust\\")
             || id_l.starts_with("microsoft.uev.")
-            || nl.contains("uninstall")
+            || is_junk_exe(&nl)
             || nl.contains("controlhost")
-            || nl.contains("broker")
             || nl.contains("copilotupdate");
-        let ok = !sys_junk && id.contains('!');
-        if ok && have.insert(nl) {
+        if sys_junk {
+            continue;
+        }
+        let nk = norm_key(&name);
+        let exe_stem = std::path::Path::new(&id_l).file_stem().and_then(|s| s.to_str()).map(norm_key).unwrap_or_default();
+        if !have_exes.contains(&id_l) && (exe_stem.is_empty() || !have_exes.contains(&exe_stem)) && have.insert(nk) {
+            if !exe_stem.is_empty() {
+                have_exes.insert(exe_stem);
+            }
+            have_exes.insert(id_l);
             v.push((name, wide(&format!(r"shell:AppsFolder\{id}"))));
         }
     }
+    scan_program_roots(&mut v, &mut have, &mut have_exes);
     let sys_root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     for (name, target) in [
         ("Control Panel", sys_root.join(r"System32\control.exe").to_string_lossy().into_owned()),
@@ -286,6 +485,10 @@ pub fn load_apps() {
     v.sort_by_key(|a| a.0.to_lowercase());
     v.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
     *APPS.lock().unwrap() = v;
+    let hw = START_HWND.load(Relaxed);
+    if hw != 0 {
+        unsafe { InvalidateRect(hw as HWND, null(), 0) };
+    }
 }
 
 pub fn apps_folder() -> Vec<(String, String)> {
@@ -320,31 +523,49 @@ pub fn apps_folder() -> Vec<(String, String)> {
     out
 }
 
-const EN_KEYS: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
-const RU_KEYS: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
+const EN_KEYS: &[u8; 33] = b"qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
+const RU_KEYS: [char; 33] = [
+    'й', 'ц', 'у', 'к', 'е', 'н', 'г', 'ш', 'щ', 'з', 'х', 'ъ',
+    'ф', 'ы', 'в', 'а', 'п', 'р', 'о', 'л', 'д', 'ж', 'э',
+    'я', 'ч', 'с', 'м', 'и', 'т', 'ь', 'б', 'ю', 'ё',
+];
 
 fn flip_layout(q: &str) -> String {
-    let (en, ru): (Vec<char>, Vec<char>) = (EN_KEYS.chars().collect(), RU_KEYS.chars().collect());
-    q.chars().map(|c| en.iter().position(|&x| x == c).map(|i| ru[i]).or_else(|| ru.iter().position(|&x| x == c).map(|i| en[i])).unwrap_or(c)).collect()
+    q.chars()
+        .map(|c| {
+            if c.is_ascii() {
+                EN_KEYS.iter().position(|&x| x == c as u8).map(|i| RU_KEYS[i]).unwrap_or(c)
+            } else {
+                RU_KEYS.iter().position(|&x| x == c).map(|i| EN_KEYS[i] as char).unwrap_or(c)
+            }
+        })
+        .collect()
 }
 
 fn score(name: &str, q: &str) -> Option<u8> {
     if q.is_empty() {
         return None;
     }
-    let words: Vec<&str> = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
-    let initials: String = words.iter().filter_map(|w| w.chars().next()).collect();
     if name.starts_with(q) {
-        Some(0)
-    } else if words.iter().any(|w| w.starts_with(q)) {
-        Some(1)
-    } else if q.chars().count() >= 2 && initials.starts_with(q) {
-        Some(2)
-    } else if name.contains(q) {
-        Some(3)
-    } else {
-        None
+        return Some(0);
     }
+    let words = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty());
+    if words.clone().any(|w| w.starts_with(q)) {
+        return Some(1);
+    }
+    let mut q_chars = q.chars();
+    let q0 = q_chars.next()?;
+    if q_chars.clone().next().is_some() {
+        let mut init_chars = words.filter_map(|w| w.chars().next());
+        if init_chars.next() == Some(q0) && q_chars.zip(init_chars.by_ref()).all(|(a, b)| a == b) {
+            let q_len = q.chars().count();
+            let w_len = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).count();
+            if w_len >= q_len {
+                return Some(2);
+            }
+        }
+    }
+    name.contains(q).then_some(3)
 }
 
 static PINNED: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -355,10 +576,6 @@ fn pin_file() -> PathBuf {
 
 fn pinned_load() {
     *PINNED.lock().unwrap() = std::fs::read_to_string(pin_file()).map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default();
-}
-
-fn wstr(w: &[u16]) -> String {
-    String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())])
 }
 
 pub fn start_pinned(path: &str) -> bool {
@@ -623,7 +840,17 @@ unsafe fn wifi_connect(profile: &str, g: &windows_sys::core::GUID) {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 unsafe fn wifi_join(n: &Net, pass: &str) {
@@ -686,12 +913,12 @@ fn quick_fit_scale() -> f32 {
     }
 }
 
-fn qsc(v: i32) -> i32 {
-    (v as f32 * quick_fit_scale()).round() as i32
+fn qsc(v: i32, qs: f32) -> i32 {
+    (v as f32 * qs).round() as i32
 }
 
-fn qr(l: i32, t: i32, rr: i32, b: i32) -> RECT {
-    RECT { left: qsc(l), top: qsc(t), right: qsc(rr), bottom: qsc(b) }
+fn qr(l: i32, t: i32, rr: i32, b: i32, qs: f32) -> RECT {
+    RECT { left: qsc(l, qs), top: qsc(t, qs), right: qsc(rr, qs), bottom: qsc(b, qs) }
 }
 
 fn size(k: Kind) -> (i32, i32) {
@@ -765,31 +992,32 @@ fn rects_into(k: Kind, v: &mut Vec<(RECT, Act)>) {
     match k {
         Kind::Quick => {
             let (w, _h) = quick_base_size();
+            let qs = quick_fit_scale();
             let sub = QUICK_SUB.get();
             if sub == 1 {
-                v.push((qr(12, 12, 44, 44), Act::QuickBack));
+                v.push((qr(12, 12, 44, 44, qs), Act::QuickBack));
                 let dev_n = AUDIO_DEVS.with_borrow(|d| d.len()).min(5);
                 for i in 0..dev_n {
                     let y = 56 + i as i32 * 40;
-                    v.push((qr(12, y, w - 12, y + 36), Act::AudioPick(i)));
+                    v.push((qr(12, y, w - 12, y + 36, qs), Act::AudioPick(i)));
                 }
                 let (_, h) = quick_base_size();
-                v.push((qr(12, h - 40, w - 12, h - 6), Act::Settings("ms-settings:sound")));
+                v.push((qr(12, h - 40, w - 12, h - 6, qs), Act::Settings("ms-settings:sound")));
                 return;
             }
             if sub == 2 {
-                v.push((qr(12, 12, 44, 44), Act::QuickBack));
-                v.push((qr(w - 58, 16, w - 16, 40), Act::WifiSwitch));
+                v.push((qr(12, 12, 44, 44, qs), Act::QuickBack));
+                v.push((qr(w - 58, 16, w - 16, 40, qs), Act::WifiSwitch));
                 let (_, h) = quick_base_size();
                 if PASS.with_borrow(|p| p.is_none()) {
                     let max_n = ((h - 104) / 44).max(1) as usize;
                     let cnt = NETS.with_borrow(|n| n.len()).min(max_n);
                     for i in 0..cnt {
                         let y = 56 + i as i32 * 44;
-                        v.push((qr(12, y, w - 12, y + 40), Act::Net(i)));
+                        v.push((qr(12, y, w - 12, y + 40, qs), Act::Net(i)));
                     }
                 }
-                v.push((qr(12, h - 40, w - 12, h - 6), Act::Settings("ms-settings:network-wifi")));
+                v.push((qr(12, h - 40, w - 12, h - 6, qs), Act::Settings("ms-settings:network-wifi")));
                 return;
             }
             let btn_w = (w - 32 - 12) / 2;
@@ -797,24 +1025,24 @@ fn rects_into(k: Kind, v: &mut Vec<(RECT, Act)>) {
                 let (tl, tt) = (16 + (btn_w + 12) * (i as i32 % 2), 16 + 80 * (i as i32 / 2));
                 if i == 0 {
                     let mid = tl + btn_w / 2;
-                    v.push((qr(tl, tt, mid, tt + 48), Act::Tile(0)));
-                    v.push((qr(mid, tt, tl + btn_w, tt + 48), Act::WifiMore));
+                    v.push((qr(tl, tt, mid, tt + 48, qs), Act::Tile(0)));
+                    v.push((qr(mid, tt, tl + btn_w, tt + 48, qs), Act::WifiMore));
                 } else {
-                    v.push((qr(tl, tt, tl + btn_w, tt + 48), Act::Tile(i)));
+                    v.push((qr(tl, tt, tl + btn_w, tt + 48, qs), Act::Tile(i)));
                 }
             }
             let n = sliders();
             let mut y = 188;
             if BRIGHT.load(Relaxed) >= 0 {
-                v.push((qr(52, y, w - 18, y + 40), Act::BrightSlide));
+                v.push((qr(52, y, w - 18, y + 40, qs), Act::BrightSlide));
                 y += 44;
             }
-            v.push((qr(14, y, 48, y + 40), Act::Mute));
-            v.push((qr(52, y, w - 58, y + 40), Act::VolSlide));
-            v.push((qr(w - 54, y + 2, w - 14, y + 38), Act::AudioOut));
+            v.push((qr(14, y, 48, y + 40, qs), Act::Mute));
+            v.push((qr(52, y, w - 58, y + 40, qs), Act::VolSlide));
+            v.push((qr(w - 54, y + 2, w - 14, y + 38, qs), Act::AudioOut));
             let sl_h = if n == 2 { 86 } else { 42 };
             let foot_top = 188 + sl_h + 10;
-            v.push((qr(w - 48, foot_top + 5, w - 12, foot_top + 39), Act::Settings("ms-settings:")));
+            v.push((qr(w - 48, foot_top + 5, w - 12, foot_top + 39, qs), Act::Settings("ms-settings:")));
         }
         Kind::Cal => {
             v.push((r(w - 84, 10, w - 52, 42), Act::CalPrev));
@@ -968,7 +1196,7 @@ const MHEAD_H: i32 = 44;
 
 pub fn menu(cx: i32, head: Option<(HICON, &'static str, String, String)>, items: Vec<MItem>, pick: impl FnOnce(usize) + 'static) {
     if is_open(Kind::Menu) {
-        close_now();
+        close();
     }
     MITEMS.set(items);
     MHEAD.set(head);
@@ -1019,25 +1247,29 @@ pub fn context_menu(x: i32) {
 }
 
 pub fn close() {
-    let h = FH.replace(null_mut());
+    let h = FH.get();
     FLY.set(None);
-    if !h.is_null() {
-        unsafe { DestroyWindow(h) };
+    START_HWND.store(0, Relaxed);
+    if !h.is_null() && unsafe { IsWindow(h) != 0 } {
+        unsafe {
+            KillTimer(h, 1);
+            KillTimer(h, 2);
+            ShowWindow(h, SW_HIDE);
+        }
     }
 }
 
-pub fn close_now() {
-    close();
-}
-
 pub fn toggle(k: Kind) {
-    if FLY.get() == Some(k) && unsafe { IsWindow(FH.get()) } != 0 {
+    if FLY.get() == Some(k) && unsafe { IsWindowVisible(FH.get()) } != 0 {
         return close();
     }
     if k == Kind::Start && unsafe { now_ms() }.saturating_sub(DEACT_START_MS.get()) < 220 {
         return;
     }
-    close();
+    FLY.set(Some(k));
+    if k != Kind::Start {
+        START_HWND.store(0, Relaxed);
+    }
     unsafe {
         CTX.set(None);
         QUERY.set(String::new());
@@ -1080,30 +1312,49 @@ pub fn toggle(k: Kind) {
         let (sw, sh) = ((wa.right - wa.left).max(240), (wa.bottom - wa.top).max(220));
         w = w.min((sw - sc(24)).max(sc(220)));
         h = h.min((sh - sc(24)).max(sc(200)));
-        let x = if vert() { side_x(w) } else { match k {
-            Kind::Start | Kind::Desktops => (sw - w) / 2,
-            Kind::Widgets => sc(12),
-            Kind::Menu => MENU_X.get().min(sw - w - sc(12)).max(sc(12)),
-            _ => sw - w - sc(12),
-        } };
+        let x = if vert() {
+            side_x(w).clamp(wa.left + sc(4), (wa.right - w - sc(4)).max(wa.left + sc(4)))
+        } else {
+            match k {
+                Kind::Start | Kind::Desktops => wa.left + (sw - w) / 2,
+                Kind::Widgets => wa.left + sc(12),
+                Kind::Menu => MENU_X.get().clamp(wa.left + sc(12), (wa.right - w - sc(12)).max(wa.left + sc(12))),
+                _ => (wa.right - w - sc(12)).max(wa.left + sc(12)),
+            }
+        };
         let class = wide("topbar_fly");
-        let fy = if vert() && k == Kind::Menu { (MENU_X.get() - h / 2).clamp(sc(12), sh - h - sc(12)) } else { pop_y(h).clamp(sc(12), (sh - h - sc(12)).max(sc(12))) };
-        let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
-        let hw = CreateWindowExW(ex, class.as_ptr(), null(), WS_POPUP, x, fy, w, h, null_mut(), null_mut(), GetModuleHandleW(null()), null());
-        if k == Kind::Start {
-            DragAcceptFiles(hw, 1);
-            for m in [WM_DROPFILES, 0x49 , WM_COPYDATA] {
+        let fy = if vert() && k == Kind::Menu {
+            (MENU_X.get() - h / 2).clamp(wa.top + sc(12), (wa.bottom - h - sc(12)).max(wa.top + sc(12)))
+        } else {
+            pop_y(h).clamp(wa.top + sc(12), (wa.bottom - h - sc(12)).max(wa.top + sc(12)))
+        };
+        let mut hw = FH.get();
+        if hw.is_null() || IsWindow(hw) == 0 {
+            let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
+            hw = CreateWindowExW(ex, class.as_ptr(), null(), WS_POPUP, x, fy, w, h, null_mut(), null_mut(), GetModuleHandleW(null()), null());
+            for m in [WM_DROPFILES, 0x49, WM_COPYDATA] {
                 ChangeWindowMessageFilterEx(hw, m, MSGFLT_ALLOW, null_mut());
             }
+            FH.set(hw);
         }
+        DragAcceptFiles(hw, (k == Kind::Start) as i32);
+        START_HWND.store(if k == Kind::Start { hw as isize } else { 0 }, Relaxed);
         FIN.set((x, fy));
         T0.set(now_ms());
-        FH.set(hw);
-        FLY.set(Some(k));
-        ShowWindow(hw, SW_SHOW);
-        InvalidateRect(hw, null(), 0);
-        UpdateWindow(hw);
-        force_fg(hw);
+        OPENING.set(true);
+        SetWindowPos(hw, null_mut(), x, fy, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        let sdc = GetDC(null_mut());
+        paint_layer(hw, k, sdc);
+        ReleaseDC(null_mut(), sdc);
+        ValidateRect(hw, null());
+        SetWindowPos(hw, HWND_TOPMOST, x, fy, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        if crate::FULLSCREEN.load(Relaxed) {
+            SetForegroundWindow(hw);
+            SetFocus(hw);
+        } else {
+            force_fg(hw);
+        }
+        OPENING.set(false);
         SetTimer(hw, 1, 1000, None);
     }
 }
@@ -1130,7 +1381,7 @@ unsafe fn wifi_radio_wlan(on: bool) {
 
 unsafe fn launch(i: usize) -> bool {
     let Some(app) = filtered().get(i).and_then(|&ai| APPS.lock().unwrap().get(ai).cloned()) else { return false };
-    if wstr(&app.1).starts_with("shell:") {
+    if wstr_of(&app.1).starts_with("shell:") {
         bump_name(&app.0);
     }
     open(&app.1);
@@ -1139,7 +1390,7 @@ unsafe fn launch(i: usize) -> bool {
 
 fn start_ctx_items(i: usize) -> Vec<(&'static str, &'static str, u8)> {
     let Some(lnk) = filtered().get(i).and_then(|&ai| APPS.lock().unwrap().get(ai).map(|a| a.1.clone())) else { return vec![] };
-    let path = wstr(&lnk);
+    let path = wstr_of(&lnk);
     let file = !path.starts_with("shell:");
     let pin_label = if start_pinned(&path) { "Remove from Start" } else { "Add to Start" };
     let mut v = vec![("\u{E8E5}", "Open", 1)];
@@ -1151,12 +1402,14 @@ fn start_ctx_items(i: usize) -> Vec<(&'static str, &'static str, u8)> {
     v
 }
 
-unsafe fn app_menu(_hw: HWND, i: usize, x: i32, y: i32) {
+unsafe fn app_menu(hw: HWND, i: usize, x: i32, y: i32) {
     let items = start_ctx_items(i);
     if items.is_empty() {
         return;
     }
-    let (pw, ph) = (sc(size(Kind::Start).0), sc(size(Kind::Start).1));
+    let mut cr: RECT = zeroed();
+    GetClientRect(hw, &mut cr);
+    let (pw, ph) = (cr.right.max(sc(240)), cr.bottom.max(sc(200)));
     let mh = sc(12 + 32 * items.len() as i32);
     let mx = x.min(pw - sc(224)).max(sc(8));
     let my = y.min(ph - mh - sc(8)).max(sc(8));
@@ -1225,7 +1478,7 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
             let Some((i, _, _)) = START_CTX.take() else { return };
             let Some(cmd) = start_ctx_items(i).get(j as usize).map(|x| x.2) else { return };
             let Some(lnk) = filtered().get(i).and_then(|&ai| APPS.lock().unwrap().get(ai).map(|a| a.1.clone())) else { return };
-            let path = wstr(&lnk);
+            let path = wstr_of(&lnk);
             match cmd {
                 1 => {
                     if launch(i) {
@@ -1252,7 +1505,7 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
             }
             close();
             match p {
-                0 => { let _ = Command::new("rundll32.exe").args(["user32.dll,LockWorkStation"]).creation_flags(NO_WINDOW).spawn(); }
+                0 => crate::lock_workstation(),
                 1 => { std::thread::spawn(|| sleep_now()); }
                 2 => { let _ = Command::new("shutdown").args(["/r", "/t", "0"]).creation_flags(NO_WINDOW).spawn(); }
                 _ => { let _ = Command::new("shutdown").args(["/s", "/t", "0"]).creation_flags(NO_WINDOW).spawn(); }
@@ -1467,6 +1720,7 @@ unsafe fn user_display_name() -> String {
         c.get_or_init(|| {
             let m = LoadLibraryW(wide("secur32.dll").as_ptr());
             if !m.is_null() {
+                let mut res = None;
                 if let Some(p) = GetProcAddress(m, b"GetUserNameExW\0".as_ptr()) {
                     let f: unsafe extern "system" fn(i32, *mut u16, *mut u32) -> u8 = std::mem::transmute(p);
                     let mut buf = [0u16; 128];
@@ -1474,9 +1728,13 @@ unsafe fn user_display_name() -> String {
                     if f(3, buf.as_mut_ptr(), &mut sz) != 0 && sz > 1 {
                         let s = String::from_utf16_lossy(&buf[..sz as usize - 1]).trim().to_string();
                         if !s.is_empty() {
-                            return s;
+                            res = Some(s);
                         }
                     }
+                }
+                FreeLibrary(m);
+                if let Some(s) = res {
+                    return s;
                 }
             }
             std::env::var("USERNAME").unwrap_or_default()
@@ -1508,6 +1766,7 @@ unsafe fn user_avatar() -> *mut GpBitmap {
                 }
             }
         }
+        FreeLibrary(m);
     }
     AVATAR.set((bmp as isize, true));
     bmp
@@ -1516,17 +1775,21 @@ unsafe fn user_avatar() -> *mut GpBitmap {
 unsafe fn paint(hw: HWND, k: Kind) {
     let mut ps: PAINTSTRUCT = zeroed();
     let wdc = BeginPaint(hw, &mut ps);
+    paint_layer(hw, k, wdc);
+    EndPaint(hw, &ps);
+}
+
+unsafe fn paint_layer(hw: HWND, k: Kind, wdc: HDC) {
     let mut cr: RECT = zeroed();
     GetClientRect(hw, &mut cr);
     if cr.right <= 0 || cr.bottom <= 0 {
-        EndPaint(hw, &ps);
         return;
     }
     BUSY.set(false);
     let sop = i18n::style::start_opacity();
     let ulw = sop < 100;
     let bg_a = if ulw { ((255 * sop as u32) / 100).max(1) as u8 } else { 255 };
-    let (dc, _, _g) = FLY_LBUF.with_borrow_mut(|b| b.begin(wdc, cr.right, cr.bottom, bg_a));
+    let (dc, _, _g) = FLY_LBUF.with_borrow_mut(|b| b.begin(wdc, cr.right, cr.bottom));
     let rad = rr(16);
     fill_a(cr, pal().bg, bg_a, rad);
     SetBkMode(dc, TRANSPARENT as i32);
@@ -1568,95 +1831,96 @@ unsafe fn paint(hw: HWND, k: Kind) {
         Kind::Quick => 'quick_done: {
             use winrust_common::ui::icons;
             let (w, h) = quick_base_size();
+            let qs = fs_;
             rects_into(k, &mut rs);
             let sub_page = QUICK_SUB.get();
             let hov_a = ((bg_a as u32) + 40).min(230) as u8;
             if sub_page == 1 {
-                let back_rc = qr(12, 12, 44, 44);
+                let back_rc = qr(12, 12, 44, 44, qs);
                 if ulw {
                     if hot(Act::QuickBack) {
-                        fill_a(back_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6));
+                        fill_a(back_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
                     }
                 } else {
-                    g(Act::QuickBack, back_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6));
+                    g(Act::QuickBack, back_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
                 }
                 SelectObject(dc, f_glyph);
                 text(dc, icons::CHEVRON_LEFT, back_rc, pal().text, DT_CENTER);
                 SelectObject(dc, f_title);
-                text(dc, "Select a sound output", qr(50, 12, w - 16, 44), pal().text, DT_LEFT);
+                text(dc, "Select a sound output", qr(50, 12, w - 16, 44, qs), pal().text, DT_LEFT);
                 AUDIO_DEVS.with_borrow(|devs| {
                     for (i, d) in devs.iter().enumerate().take(5) {
                         let y = 56 + i as i32 * 40;
-                        let row = qr(12, y, w - 12, y + 36);
+                        let row = qr(12, y, w - 12, y + 36, qs);
                         if ulw {
                             if hot(Act::AudioPick(i)) || d.default {
-                                fill_a(row, mix(pal().bg, pal().text, if hot(Act::AudioPick(i)) { 0.14 } else { 0.08 }), hov_a, qsc(6));
+                                fill_a(row, mix(pal().bg, pal().text, if hot(Act::AudioPick(i)) { 0.14 } else { 0.08 }), hov_a, qsc(6, qs));
                             }
                         } else {
                             let base = if d.default { mix(pal().bg, pal().text, 0.06) } else { pal().bg };
-                            g(Act::AudioPick(i), row, base, mix(pal().bg, pal().text, 0.09), qsc(6));
+                            g(Act::AudioPick(i), row, base, mix(pal().bg, pal().text, 0.09), qsc(6, qs));
                         }
                         if d.default {
-                            fill(dc, qr(14, y + 8, 17, y + 28), pal().accent, qsc(3));
+                            fill(dc, qr(14, y + 8, 17, y + 28, qs), pal().accent, qsc(3, qs));
                         }
                         let low = d.name.to_lowercase();
                         let dg = if low.contains("headphone") || low.contains("headset") || low.contains("tai nghe") { icons::HEADPHONES } else { icons::SPEAKER };
                         SelectObject(dc, f_glyph);
-                        text(dc, dg, qr(22, y, 48, y + 36), if d.default { pal().accent } else { pal().text }, DT_CENTER);
+                        text(dc, dg, qr(22, y, 48, y + 36, qs), if d.default { pal().accent } else { pal().text }, DT_CENTER);
                         SelectObject(dc, if d.default { f_semi } else { f_txt });
-                        text(dc, &d.name, qr(52, y, w - 20, y + 36), if d.default { pal().accent } else { pal().text }, DT_LEFT);
+                        text(dc, &d.name, qr(52, y, w - 20, y + 36, qs), if d.default { pal().accent } else { pal().text }, DT_LEFT);
                     }
                 });
-                fill_a(qr(16, h - 44, w - 16, h - 43), pal().text, if ulw { 24 } else { 20 }, 0);
-                let more_rc = qr(12, h - 40, w - 12, h - 6);
+                fill_a(qr(16, h - 44, w - 16, h - 43, qs), pal().text, if ulw { 24 } else { 20 }, 0);
+                let more_rc = qr(12, h - 40, w - 12, h - 6, qs);
                 if ulw {
                     if hot(Act::Settings("ms-settings:sound")) {
-                        fill_a(more_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6));
+                        fill_a(more_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
                     }
                 } else {
-                    g(Act::Settings("ms-settings:sound"), more_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6));
+                    g(Act::Settings("ms-settings:sound"), more_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
                 }
                 SelectObject(dc, f_txt);
-                text(dc, "More volume settings", RECT { left: more_rc.left + qsc(8), ..more_rc }, pal().text, DT_LEFT);
+                text(dc, "More volume settings", RECT { left: more_rc.left + qsc(8, qs), ..more_rc }, pal().text, DT_LEFT);
                 break 'quick_done;
             }
             if sub_page == 2 {
                 let on = NETS.with_borrow(|n| !n.is_empty()) || WIFI.get() >= 0;
-                let back_rc = qr(12, 12, 44, 44);
+                let back_rc = qr(12, 12, 44, 44, qs);
                 if ulw {
                     if hot(Act::QuickBack) {
-                        fill_a(back_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6));
+                        fill_a(back_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
                     }
                 } else {
-                    g(Act::QuickBack, back_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6));
+                    g(Act::QuickBack, back_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
                 }
                 SelectObject(dc, f_glyph);
                 text(dc, icons::CHEVRON_LEFT, back_rc, pal().text, DT_CENTER);
                 SelectObject(dc, f_title);
-                text(dc, "Wi‑Fi", qr(50, 12, w - 72, 44), pal().text, DT_LEFT);
-                let sw = qr(w - 58, 16, w - 16, 40);
-                let ts = ease(hv(1_500_000, on));
+                text(dc, "Wi‑Fi", qr(50, 12, w - 72, 44, qs), pal().text, DT_LEFT);
+                let sw = qr(w - 58, 16, w - 16, 40, qs);
+                let ts = if on { 1.0 } else { 0.0 };
                 let swh = sw.bottom - sw.top;
                 fill(dc, sw, mix(mix(card, pal().text, 0.18), pal().accent, ts), swh);
-                let kr = swh / 2 - qsc(2);
+                let kr = swh / 2 - qsc(2, qs);
                 let kx = sw.left + swh / 2 + ((sw.right - sw.left - swh) as f32 * ts) as i32;
                 let ky = (sw.top + sw.bottom) / 2;
                 fill(dc, RECT { left: kx - kr, top: ky - kr, right: kx + kr, bottom: ky + kr }, rgb(255, 255, 255), 2 * kr);
                 if let Some((i, p)) = PASS.with_borrow(|p| p.clone()) {
                     let name = NETS.with_borrow(|n| n.get(i).map(|n| n.ssid.clone()).unwrap_or_default());
                     SelectObject(dc, f_txt);
-                    text(dc, &format!("Password for “{name}”"), qr(18, 62, w - 18, 84), pal().text, DT_LEFT);
+                    text(dc, &format!("Password for “{name}”"), qr(18, 62, w - 18, 84, qs), pal().text, DT_LEFT);
                     if ulw {
-                        fill_a(qr(16, 90, w - 16, 128), mix(pal().bg, pal().text, 0.08), hov_a, qsc(8));
-                        stroke_a(qr(16, 90, w - 16, 128), pal().accent, 220, qsc(8));
+                        fill_a(qr(16, 90, w - 16, 128, qs), mix(pal().bg, pal().text, 0.08), hov_a, qsc(8, qs));
+                        stroke_a(qr(16, 90, w - 16, 128, qs), pal().accent, 220, qsc(8, qs));
                     } else {
-                        fill(dc, qr(16, 90, w - 16, 128), pal().accent, qsc(8));
-                        fill(dc, qr(18, 92, w - 18, 126), card, qsc(6));
+                        fill(dc, qr(16, 90, w - 16, 128, qs), pal().accent, qsc(8, qs));
+                        fill(dc, qr(18, 92, w - 18, 126, qs), card, qsc(6, qs));
                     }
                     let dots = "•".repeat(p.chars().count());
-                    text(dc, &dots, qr(30, 90, w - 30, 128), pal().text, DT_LEFT);
+                    text(dc, &dots, qr(30, 90, w - 30, 128, qs), pal().text, DT_LEFT);
                     SelectObject(dc, f_small);
-                    text(dc, "Enter — connect · Esc — cancel", qr(18, 136, w - 18, 156), pal().dim, DT_LEFT);
+                    text(dc, "Enter — connect · Esc — cancel", qr(18, 136, w - 18, 156, qs), pal().dim, DT_LEFT);
                 } else {
                     let max_n = ((h - 104) / 44).max(1) as usize;
                     let state = net();
@@ -1664,43 +1928,43 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     NETS.with_borrow(|nets| {
                         if nets.is_empty() {
                             SelectObject(dc, f_txt);
-                            text(dc, if on { "No networks nearby" } else { "Turn Wi‑Fi on to see networks" }, qr(18, 70, w - 18, 110), pal().dim, DT_LEFT);
+                            text(dc, if on { "No networks nearby" } else { "Turn Wi‑Fi on to see networks" }, qr(18, 70, w - 18, 110, qs), pal().dim, DT_LEFT);
                         }
                         for (i, n) in nets.iter().enumerate().take(max_n) {
                             let y = 56 + i as i32 * 44;
-                            let rc = qr(12, y, w - 12, y + 40);
+                            let rc = qr(12, y, w - 12, y + 40, qs);
                             if ulw {
                                 if n.connected || hot(Act::Net(i)) {
-                                    fill_a(rc, mix(pal().bg, pal().text, if hot(Act::Net(i)) { 0.14 } else { 0.08 }), hov_a, qsc(6));
+                                    fill_a(rc, mix(pal().bg, pal().text, if hot(Act::Net(i)) { 0.14 } else { 0.08 }), hov_a, qsc(6, qs));
                                 }
                             } else {
                                 let base = if n.connected { mix(pal().bg, pal().text, 0.06) } else { pal().bg };
-                                g(Act::Net(i), rc, base, mix(pal().bg, pal().text, 0.09), qsc(6));
+                                g(Act::Net(i), rc, base, mix(pal().bg, pal().text, 0.09), qsc(6, qs));
                             }
-                            wifi_glyph(dc, rc.left + qsc(20), (rc.top + rc.bottom) / 2 - qsc(1), qsc(14), arcs_lit(n.q), if n.connected { pal().accent } else { pal().text }, mix(pal().dim, card, 0.55), if n.connected && !online { 2 } else { 0 });
+                            wifi_glyph(dc, rc.left + qsc(20, qs), (rc.top + rc.bottom) / 2 - qsc(1, qs), qsc(14, qs), arcs_lit(n.q), if n.connected { pal().accent } else { pal().text }, mix(pal().dim, card, 0.55), if n.connected && !online { 2 } else { 0 });
                             SelectObject(dc, if n.connected { f_semi } else { f_txt });
-                            text(dc, &n.ssid, RECT { left: rc.left + qsc(40), right: rc.right - qsc(44), ..rc }, if n.connected { pal().accent } else { pal().text }, DT_LEFT);
+                            text(dc, &n.ssid, RECT { left: rc.left + qsc(40, qs), right: rc.right - qsc(44, qs), ..rc }, if n.connected { pal().accent } else { pal().text }, DT_LEFT);
                             if n.connected {
                                 SelectObject(dc, f_glyph);
-                                text(dc, icons::CHECK, RECT { left: rc.right - qsc(36), right: rc.right - qsc(8), ..rc }, pal().accent, DT_CENTER);
+                                text(dc, icons::CHECK, RECT { left: rc.right - qsc(36, qs), right: rc.right - qsc(8, qs), ..rc }, pal().accent, DT_CENTER);
                             } else if n.secure {
                                 SelectObject(dc, f_gs);
-                                text(dc, icons::LOCK, RECT { left: rc.right - qsc(36), right: rc.right - qsc(8), ..rc }, pal().dim, DT_CENTER);
+                                text(dc, icons::LOCK, RECT { left: rc.right - qsc(36, qs), right: rc.right - qsc(8, qs), ..rc }, pal().dim, DT_CENTER);
                             }
                         }
                     });
                 }
-                fill_a(qr(16, h - 44, w - 16, h - 43), pal().text, if ulw { 24 } else { 20 }, 0);
-                let more_rc = qr(12, h - 40, w - 12, h - 6);
+                fill_a(qr(16, h - 44, w - 16, h - 43, qs), pal().text, if ulw { 24 } else { 20 }, 0);
+                let more_rc = qr(12, h - 40, w - 12, h - 6, qs);
                 if ulw {
                     if hot(Act::Settings("ms-settings:network-wifi")) {
-                        fill_a(more_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6));
+                        fill_a(more_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
                     }
                 } else {
-                    g(Act::Settings("ms-settings:network-wifi"), more_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6));
+                    g(Act::Settings("ms-settings:network-wifi"), more_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
                 }
                 SelectObject(dc, f_txt);
-                text(dc, "More Wi‑Fi settings", RECT { left: more_rc.left + qsc(8), ..more_rc }, pal().text, DT_LEFT);
+                text(dc, "More Wi‑Fi settings", RECT { left: more_rc.left + qsc(8, qs), ..more_rc }, pal().text, DT_LEFT);
                 break 'quick_done;
             }
             let q = WIFI.get();
@@ -1720,7 +1984,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
             let btn_w = (w - 32 - 12) / 2;
             for (i, (glyph, label)) in tiles.iter().enumerate() {
                 let (tl, tt) = (16 + (btn_w + 12) * (i as i32 % 2), 16 + 80 * (i as i32 / 2));
-                let full = qr(tl, tt, tl + btn_w, tt + 48);
+                let full = qr(tl, tt, tl + btn_w, tt + 48, qs);
                 let on = states[i];
                 let base = if on { pal().accent } else { card };
                 let hover_bg = if on { mix(pal().accent, rgb(255, 255, 255), 0.12) } else { mix(card, pal().text, 0.06) };
@@ -1728,79 +1992,79 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 if ulw {
                     let tile_a = if on { ((bg_a as u32) + 55).min(240) as u8 } else { ((bg_a as u32) + 25).min(215) as u8 };
                     let fill_col = if on { base } else { mix(pal().bg, pal().text, 0.08) };
-                    fill_a(full, fill_col, tile_a, qsc(8));
+                    fill_a(full, fill_col, tile_a, qsc(8, qs));
                     if !on {
-                        stroke_a(full, pal().text, 28, qsc(8));
+                        stroke_a(full, pal().text, 28, qsc(8, qs));
                     }
                     if i == 0 {
                         let mid = tl + btn_w / 2;
-                        let left_rc = qr(tl + 1, tt + 1, mid, tt + 47);
-                        let right_rc = qr(mid + 1, tt + 1, tl + btn_w - 1, tt + 47);
+                        let left_rc = qr(tl + 1, tt + 1, mid, tt + 47, qs);
+                        let right_rc = qr(mid + 1, tt + 1, tl + btn_w - 1, tt + 47, qs);
                         if hot(Act::Tile(0)) {
-                            fill_a(left_rc, if on { rgb(255, 255, 255) } else { pal().text }, if on { 32 } else { 22 }, qsc(7));
+                            fill_a(left_rc, if on { rgb(255, 255, 255) } else { pal().text }, if on { 32 } else { 22 }, qsc(7, qs));
                         }
                         if hot(Act::WifiMore) {
-                            fill_a(right_rc, if on { rgb(255, 255, 255) } else { pal().text }, if on { 32 } else { 22 }, qsc(7));
+                            fill_a(right_rc, if on { rgb(255, 255, 255) } else { pal().text }, if on { 32 } else { 22 }, qsc(7, qs));
                         }
-                        fill_a(qr(mid, tt + 1, mid + 1, tt + 47), if on { on_accent() } else { pal().text }, if on { 70 } else { 30 }, 0);
-                        wifi_glyph(dc, (left_rc.left + left_rc.right) / 2, (left_rc.top + left_rc.bottom) / 2 - qsc(1), qsc(15), if q >= 0 { arcs_lit(q) } else { 0 }, ink, mix(ink, base, 0.55), if q < 0 { 1 } else { 0 });
+                        fill_a(qr(mid, tt + 1, mid + 1, tt + 47, qs), if on { on_accent() } else { pal().text }, if on { 70 } else { 30 }, 0);
+                        wifi_glyph(dc, (left_rc.left + left_rc.right) / 2, (left_rc.top + left_rc.bottom) / 2 - qsc(1, qs), qsc(15, qs), if q >= 0 { arcs_lit(q) } else { 0 }, ink, mix(ink, base, 0.55), if q < 0 { 1 } else { 0 });
                         SelectObject(dc, f_gs);
                         text(dc, icons::CHEVRON_RIGHT, right_rc, ink, DT_CENTER);
                     } else {
                         if hot(Act::Tile(i as u8)) {
-                            fill_a(inset(full, 1), if on { rgb(255, 255, 255) } else { pal().text }, if on { 32 } else { 22 }, qsc(7));
+                            fill_a(inset(full, 1), if on { rgb(255, 255, 255) } else { pal().text }, if on { 32 } else { 22 }, qsc(7, qs));
                         }
                         SelectObject(dc, f_glyph);
                         text(dc, glyph, full, ink, DT_CENTER);
                     }
                 } else {
-                    surface(dc, full, base, qsc(8));
+                    surface(dc, full, base, qsc(8, qs));
                     if i == 0 {
                         let mid = tl + btn_w / 2;
-                        let left_rc = qr(tl + 1, tt + 1, mid, tt + 47);
-                        let right_rc = qr(mid + 1, tt + 1, tl + btn_w - 1, tt + 47);
-                        g(Act::Tile(0), left_rc, base, hover_bg, qsc(7));
-                        g(Act::WifiMore, right_rc, base, hover_bg, qsc(7));
-                        fill(dc, qr(mid, tt + 1, mid + 1, tt + 47), if on { mix(on_accent(), pal().accent, 0.55) } else { mix(card, pal().text, 0.12) }, 0);
-                        wifi_glyph(dc, (left_rc.left + left_rc.right) / 2, (left_rc.top + left_rc.bottom) / 2 - qsc(1), qsc(15), if q >= 0 { arcs_lit(q) } else { 0 }, ink, mix(ink, base, 0.55), if q < 0 { 1 } else { 0 });
+                        let left_rc = qr(tl + 1, tt + 1, mid, tt + 47, qs);
+                        let right_rc = qr(mid + 1, tt + 1, tl + btn_w - 1, tt + 47, qs);
+                        g(Act::Tile(0), left_rc, base, hover_bg, qsc(7, qs));
+                        g(Act::WifiMore, right_rc, base, hover_bg, qsc(7, qs));
+                        fill(dc, qr(mid, tt + 1, mid + 1, tt + 47, qs), if on { mix(on_accent(), pal().accent, 0.55) } else { mix(card, pal().text, 0.12) }, 0);
+                        wifi_glyph(dc, (left_rc.left + left_rc.right) / 2, (left_rc.top + left_rc.bottom) / 2 - qsc(1, qs), qsc(15, qs), if q >= 0 { arcs_lit(q) } else { 0 }, ink, mix(ink, base, 0.55), if q < 0 { 1 } else { 0 });
                         SelectObject(dc, f_gs);
                         text(dc, icons::CHEVRON_RIGHT, right_rc, ink, DT_CENTER);
                     } else {
-                        g(Act::Tile(i as u8), inset(full, 1), base, hover_bg, qsc(7));
+                        g(Act::Tile(i as u8), inset(full, 1), base, hover_bg, qsc(7, qs));
                         SelectObject(dc, f_glyph);
                         text(dc, glyph, full, ink, DT_CENTER);
                     }
                 }
                 SelectObject(dc, f_small);
-                text(dc, label, qr(tl, tt + 51, tl + btn_w, tt + 73), pal().text, DT_CENTER);
+                text(dc, label, qr(tl, tt + 51, tl + btn_w, tt + 73, qs), pal().text, DT_CENTER);
             }
-            fill_a(qr(16, 178, w - 16, 179), pal().text, if ulw { 24 } else { 20 }, 0);
+            fill_a(qr(16, 178, w - 16, 179, qs), pal().text, if ulw { 24 } else { 20 }, 0);
             let n = sliders();
             let mut y = 188;
             let b = BRIGHT.load(Relaxed);
             if b >= 0 {
                 SelectObject(dc, f_glyph);
-                text(dc, icons::BRIGHTNESS, qr(14, y, 48, y + 40), mix(pal().dim, pal().text, 0.5), DT_CENTER);
+                text(dc, icons::BRIGHTNESS, qr(14, y, 48, y + 40, qs), mix(pal().dim, pal().text, 0.5), DT_CENTER);
                 track(dc, rs.iter().find(|(_, a)| *a == Act::BrightSlide).unwrap().0, b as f32 / 100.0, ulw);
                 y += 44;
             }
             if ulw {
                 if hot(Act::Mute) {
-                    fill_a(qr(14, y + 2, 48, y + 38), mix(pal().bg, pal().text, 0.12), hov_a, qsc(6));
+                    fill_a(qr(14, y + 2, 48, y + 38, qs), mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
                 }
             } else {
-                g(Act::Mute, qr(14, y + 2, 48, y + 38), pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6));
+                g(Act::Mute, qr(14, y + 2, 48, y + 38, qs), pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
             }
-            let mrc = qr(14, y, 48, y + 40);
-            volume_glyph(dc, (mrc.left + mrc.right) / 2, (mrc.top + mrc.bottom) / 2, qsc(16), vol, muted, if muted { BAD } else { pal().text });
+            let mrc = qr(14, y, 48, y + 40, qs);
+            volume_glyph(dc, (mrc.left + mrc.right) / 2, (mrc.top + mrc.bottom) / 2, qsc(16, qs), vol, muted, if muted { BAD } else { pal().text });
             track(dc, rs.iter().find(|(_, a)| *a == Act::VolSlide).unwrap().0, if muted || vol < 0 { 0.0 } else { vol as f32 / 100.0 }, ulw);
             let out_rc = rs.iter().find(|(_, a)| *a == Act::AudioOut).unwrap().0;
             if ulw {
                 if hot(Act::AudioOut) {
-                    fill_a(out_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6));
+                    fill_a(out_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
                 }
             } else {
-                g(Act::AudioOut, out_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6));
+                g(Act::AudioOut, out_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
             }
             let dev_glyph = AUDIO_DEVS.with_borrow(|devs| {
                 let is_hp = devs.iter().find(|d| d.default).is_some_and(|d| {
@@ -1810,28 +2074,28 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 if is_hp { icons::HEADPHONES } else { icons::SPEAKER }
             });
             SelectObject(dc, f_glyph);
-            text(dc, dev_glyph, RECT { left: out_rc.left + qsc(2), right: out_rc.right - qsc(12), ..out_rc }, pal().text, DT_CENTER);
+            text(dc, dev_glyph, RECT { left: out_rc.left + qsc(2, qs), right: out_rc.right - qsc(12, qs), ..out_rc }, pal().text, DT_CENTER);
             SelectObject(dc, f_gs);
-            text(dc, icons::CHEVRON_RIGHT, RECT { left: out_rc.right - qsc(16), right: out_rc.right - qsc(2), ..out_rc }, pal().dim, DT_CENTER);
+            text(dc, icons::CHEVRON_RIGHT, RECT { left: out_rc.right - qsc(16, qs), right: out_rc.right - qsc(2, qs), ..out_rc }, pal().dim, DT_CENTER);
             let sl_h = if n == 2 { 86 } else { 42 };
             let foot_top = 188 + sl_h + 10;
             let (pct, ac) = BAT.get();
             if pct >= 0 {
                 SelectObject(dc, f_glyph);
-                text(dc, if ac { icons::BATTERY_CHARGE } else { icons::BATTERY }, qr(14, foot_top + 5, 40, foot_top + 39), if ac { GOOD } else if pct <= 15 { BAD } else { pal().text }, DT_CENTER);
+                text(dc, if ac { icons::BATTERY_CHARGE } else { icons::BATTERY }, qr(14, foot_top + 5, 40, foot_top + 39, qs), if ac { GOOD } else if pct <= 15 { BAD } else { pal().text }, DT_CENTER);
                 SelectObject(dc, f_txt);
-                text(dc, &format!("{pct}%"), qr(42, foot_top + 5, 90, foot_top + 39), pal().text, DT_LEFT);
+                text(dc, &format!("{pct}%"), qr(42, foot_top + 5, 90, foot_top + 39, qs), pal().text, DT_LEFT);
             } else {
                 SelectObject(dc, f_small);
-                text(dc, &if muted { "0%".into() } else if vol < 0 { String::new() } else { format!("{vol}%") }, qr(18, foot_top + 5, 76, foot_top + 39), pal().dim, DT_LEFT);
+                text(dc, &if muted { "0%".into() } else if vol < 0 { String::new() } else { format!("{vol}%") }, qr(18, foot_top + 5, 76, foot_top + 39, qs), pal().dim, DT_LEFT);
             }
             let gear = rs.iter().find(|(_, a)| matches!(a, Act::Settings(_))).unwrap().0;
             if ulw {
                 if hot(Act::Settings("ms-settings:")) {
-                    fill_a(gear, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6));
+                    fill_a(gear, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
                 }
             } else {
-                g(Act::Settings("ms-settings:"), gear, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6));
+                g(Act::Settings("ms-settings:"), gear, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
             }
             SelectObject(dc, f_glyph);
             text(dc, icons::SETTINGS, gear, pal().text, DT_CENTER);
@@ -1893,7 +2157,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 None => text(dc, "Wi‑Fi", r(18, 18, w - 76, 42), pal().text, DT_LEFT),
             }
             let sw = r(w - 58, 18, w - 16, 42);
-            let ts = ease(hv(1_500_000, on));
+            let ts = if on { 1.0 } else { 0.0 };
             let swh = sw.bottom - sw.top;
             fill(dc, sw, mix(mix(card, pal().text, 0.18), pal().accent, ts), swh);
             let kr = swh / 2 - sc(2);
@@ -1935,8 +2199,9 @@ unsafe fn paint(hw: HWND, k: Kind) {
                         SelectObject(dc, f_small);
                         text(dc, "Other networks", r(20, ly + 2, w - 16, ly + 22), pal().dim, DT_LEFT);
                     }
-                    let others: Vec<usize> = (0..nets.len()).filter(|&i| !nets[i].connected).collect();
-                    if let (Some(&a), Some(&b)) = (others.first(), others.last()) {
+                    let first_other = nets.iter().position(|n| !n.connected);
+                    let last_other = nets.iter().rposition(|n| !n.connected);
+                    if let (Some(a), Some(b)) = (first_other, last_other) {
                         surface(dc, r(12, rows[a].0, w - 12, rows[b].1), card, sc(14));
                     }
                     for (i, n) in nets.iter().enumerate() {
@@ -1949,7 +2214,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                         let busy = joining.as_deref() == Some(n.ssid.as_str());
                         if n.connected {
                             surface(dc, rc, card, sc(14));
-                        } else if others.last() != Some(&i) {
+                        } else if last_other != Some(i) {
                             fill(dc, RECT { left: rc.left + sc(48), top: rc.bottom - 1, right: rc.right - sc(14), bottom: rc.bottom }, mix(card, pal().text, 0.08), 0);
                         }
                         let open = hot(Act::Net(i)) || (n.connected && hot(Act::NetOff));
@@ -2216,7 +2481,6 @@ unsafe fn paint(hw: HWND, k: Kind) {
             } else {
                 surface(dc, sr, card, sc(8));
             }
-            fill(dc, r(25, 52, w - 25, 54), pal().accent, 0);
             SelectObject(dc, f_glyph);
             text(dc, icons::SEARCH, r(32, 20, 58, 54), pal().dim, DT_CENTER);
             SelectObject(dc, f_txt);
@@ -2312,7 +2576,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                         if !ic.is_null() {
                             draw_icon(dc, rc.left + sc(13), (rc.top + rc.bottom - icon_sz) / 2, icon_sz, ic);
                         }
-                        let store = wstr(&app.1).starts_with("shell:");
+                        let store = wstr_of(&app.1).starts_with("shell:");
                         SelectObject(dc, f_txt);
                         text(dc, &app.0, RECT { left: rc.left + sc(52), top: rc.top, right: rc.right - sc(110), bottom: rc.bottom }, pal().text, DT_LEFT);
                         SelectObject(dc, f_small);
@@ -2332,21 +2596,35 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     GpTexture, InterpolationModeHighQualityBicubic, WrapModeClamp,
                 };
                 let (aw, ah) = ((av.right - av.left).max(1), (av.bottom - av.top).max(1));
-                let mut scaled: *mut GpBitmap = null_mut();
-                if GdipCreateBitmapFromScan0(aw, ah, 0, 0x000E_200B, null(), &mut scaled) == 0 && !scaled.is_null() {
-                    let mut sg: *mut GpGraphics = null_mut();
-                    if GdipGetImageGraphicsContext(scaled as *mut GpImage, &mut sg) == 0 && !sg.is_null() {
-                        GdipSetInterpolationMode(sg, InterpolationModeHighQualityBicubic);
-                        GdipDrawImageRectI(sg, av_bmp as *mut GpImage, 0, 0, aw, ah);
-                        GdipDeleteGraphics(sg);
+                thread_local! {
+                    static AV_SCALED: Cell<(i32, i32, isize)> = const { Cell::new((0, 0, 0)) };
+                }
+                let (cw, ch, mut scaled_i) = AV_SCALED.get();
+                if cw != aw || ch != ah || scaled_i == 0 {
+                    if scaled_i != 0 {
+                        GdipDisposeImage(scaled_i as *mut GpImage);
                     }
+                    let mut scaled: *mut GpBitmap = null_mut();
+                    if GdipCreateBitmapFromScan0(aw, ah, 0, 0x000E_200B, null(), &mut scaled) == 0 && !scaled.is_null() {
+                        let mut sg: *mut GpGraphics = null_mut();
+                        if GdipGetImageGraphicsContext(scaled as *mut GpImage, &mut sg) == 0 && !sg.is_null() {
+                            GdipSetInterpolationMode(sg, InterpolationModeHighQualityBicubic);
+                            GdipDrawImageRectI(sg, av_bmp as *mut GpImage, 0, 0, aw, ah);
+                            GdipDeleteGraphics(sg);
+                        }
+                        scaled_i = scaled as isize;
+                    } else {
+                        scaled_i = 0;
+                    }
+                    AV_SCALED.set((aw, ah, scaled_i));
+                }
+                if scaled_i != 0 {
                     let mut tx: *mut GpTexture = null_mut();
-                    if GdipCreateTexture(scaled as *mut GpImage, WrapModeClamp, &mut tx) == 0 && !tx.is_null() {
+                    if GdipCreateTexture(scaled_i as *mut GpImage, WrapModeClamp, &mut tx) == 0 && !tx.is_null() {
                         GdipTranslateTextureTransform(tx, av.left as f32, av.top as f32, 0);
                         GdipFillEllipse(fg_av, tx as *mut GpBrush, av.left as f32, av.top as f32, aw as f32, ah as f32);
                         GdipDeleteBrush(tx as *mut GpBrush);
                     }
-                    GdipDisposeImage(scaled as *mut GpImage);
                 }
             } else {
                 fill(dc, av, mix(card, pal().accent, 0.2), sc(30));
@@ -2396,7 +2674,6 @@ unsafe fn paint(hw: HWND, k: Kind) {
 
     PAINT_RECTS.set(rs);
     SelectObject(dc, of);
-    EndPaint(hw, &ps);
     LayeredBuf::present(hw, cr.right, cr.bottom, dc);
     if BUSY.get() {
         SetTimer(hw, 2, 16, None);
@@ -2415,6 +2692,14 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         WM_PAINT => paint(hw, k),
         WM_ERASEBKGND => return 1,
         WM_ACTIVATE if wp & 0xffff == 0 && !PREVIEW.load(Relaxed) => {
+            if OPENING.get() {
+                return 0;
+            }
+            if now_ms().saturating_sub(T0.get()) < 150 {
+                SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                force_fg(hw);
+                return 0;
+            }
             if k == Kind::Start {
                 DEACT_START_MS.set(now_ms());
             }
@@ -2470,7 +2755,9 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                 (Kind::Wifi, Some((_, Act::Net(_) | Act::NetOff))) if PASS.with_borrow(|p| p.is_none()) => {
                     let i = if let Some((_, Act::Net(i))) = act_at(k, x, y) { i } else { NETS.with_borrow(|n| n.iter().position(|n| n.connected)).unwrap_or(0) };
                     if let Some(ssid) = NETS.with_borrow(|n| n.get(i).map(|n| n.ssid.clone())) {
-                        let (pw, ph) = (sc(size(k).0), sc(size(k).1));
+                        let mut cr: RECT = zeroed();
+                        GetClientRect(hw, &mut cr);
+                        let (pw, ph) = (cr.right.max(sc(220)), cr.bottom.max(sc(160)));
                         let mh = sc(12 + CTX_ROW * ctx_items(&ssid).len() as i32);
                         CTX.set(Some((ssid, x.min(pw - sc(CTX_W) - sc(8)).max(sc(8)), y.min(ph - mh - sc(8)).max(sc(8)), now_ms())));
                     }
@@ -2575,7 +2862,7 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
 
 #[cfg(test)]
 mod tests {
-    use super::{flip_layout, score, init, is_open, toggle, close_now, Kind, FLY, FH, GetModuleHandleW, SetProcessDPIAware, null, null_mut, DestroyWindow, IsWindow};
+    use super::{flip_layout, score, init, is_open, toggle, close, Kind, FLY, FH, GetModuleHandleW, SetProcessDPIAware, null, null_mut, DestroyWindow, IsWindow};
 
     #[test]
     fn layout_flip_both_ways() {
@@ -2598,12 +2885,12 @@ mod tests {
             let live = FH.get();
             assert!(!live.is_null() && IsWindow(live) != 0);
             DestroyWindow(live);
-            close_now();
+            close();
             FLY.set(Some(Kind::Start));
             FH.set(null_mut());
             toggle(Kind::Start);
             assert!(is_open(Kind::Start) && IsWindow(FH.get()) != 0, "the press opens a real panel");
-            close_now();
+            close();
         }
     }
 

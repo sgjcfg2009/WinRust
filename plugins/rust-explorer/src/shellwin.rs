@@ -10,20 +10,29 @@ use windows::{
 
 pub const WM_SHELL_SELECT: u32 = WM_APP + 6;
 
-struct Reg { sw: IShellWindows, cookie: i32, live: bool }
+struct Reg { sw: IShellWindows, cookie: i32, live: bool, hwnd: isize }
 thread_local! { static REG: RefCell<Vec<Reg>> = const { RefCell::new(Vec::new()) }; }
 static DIR: Mutex<String> = Mutex::new(String::new());
 
 fn nope<T>() -> Result<T> { Err(E_NOTIMPL.into()) }
-fn url(dir: &str) -> String { format!("file:///{}", cur(dir).replace('\\', "/")) }
-fn cur(dir: &str) -> String { if dir.is_empty() { DIR.lock().unwrap().clone() } else { dir.to_string() } }
-fn wide(s: &std::ffi::OsStr) -> Vec<u16> { s.encode_wide().chain([0]).collect() }
+fn url(dir: &str) -> String {
+    if dir.is_empty() {
+        format!("file:///{}", DIR.lock().unwrap().replace('\\', "/"))
+    } else {
+        format!("file:///{}", dir.replace('\\', "/"))
+    }
+}
+fn wide_buf(s: &std::ffi::OsStr, buf: &mut Vec<u16>) {
+    buf.clear();
+    buf.extend(s.encode_wide());
+    buf.push(0);
+}
 
-fn pidl_variant(dir: &Path) -> Option<(VARIANT, *mut ITEMIDLIST)> {
-    let w = wide(dir.as_os_str());
+fn pidl_variant(dir: &Path, buf: &mut Vec<u16>) -> Option<(VARIANT, *mut ITEMIDLIST)> {
+    wide_buf(dir.as_os_str(), buf);
     unsafe {
         let mut pidl = std::ptr::null_mut();
-        SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None).ok()?;
+        SHParseDisplayName(PCWSTR(buf.as_ptr()), None, &mut pidl, 0, None).ok()?;
         InitVariantFromBuffer(pidl as *const c_void, ILGetSize(Some(pidl))).ok().map(|v| (v, pidl))
     }
 }
@@ -33,16 +42,20 @@ fn add(hwnd: isize, dir: &Path, resident: bool) -> Result<()> {
         let sw: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_ALL)?;
         let me: IWebBrowser2 = Browser { hwnd, dir: if resident { dir.to_string_lossy().into_owned() } else { String::new() }, resident }.into();
         let cookie = sw.Register(&me.cast::<IDispatch>()?, hwnd as i32, SWC_BROWSER)?;
-        if let Some((v, pidl)) = pidl_variant(dir) {
+        let mut buf = Vec::new();
+        if let Some((v, pidl)) = pidl_variant(dir, &mut buf) {
             let _ = sw.OnNavigate(cookie, &v);
             CoTaskMemFree(Some(pidl as *const c_void));
         }
-        REG.with_borrow_mut(|r| r.push(Reg { sw, cookie, live: !resident }));
+        REG.with_borrow_mut(|r| r.push(Reg { sw, cookie, live: !resident, hwnd: if resident { hwnd } else { 0 } }));
     }
     Ok(())
 }
 
-pub fn register(hwnd: isize) { let _ = add(hwnd, Path::new(&DIR.lock().unwrap().clone()), false); }
+pub fn register(hwnd: isize) {
+    let dir = PathBuf::from(DIR.lock().unwrap().clone());
+    let _ = add(hwnd, &dir, false);
+}
 
 pub fn register_resident(dirs: &[PathBuf]) {
     let h = unsafe { CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, w!("STATIC"), w!(""), WS_POPUP, 0, 0, 0, 0, None, None, None, None) };
@@ -52,16 +65,27 @@ pub fn register_resident(dirs: &[PathBuf]) {
 pub fn navigated(dir: &Path) {
     *DIR.lock().unwrap() = dir.to_string_lossy().into_owned();
     REG.with_borrow(|rs| {
+        if !rs.iter().any(|r| r.live) { return; }
+        let mut buf = Vec::new();
+        let Some((v, pidl)) = pidl_variant(dir, &mut buf) else { return };
         for r in rs.iter().filter(|r| r.live) {
-            if let Some((v, pidl)) = pidl_variant(dir) {
-                unsafe { let _ = r.sw.OnNavigate(r.cookie, &v); CoTaskMemFree(Some(pidl as *const c_void)); }
-            }
+            unsafe { let _ = r.sw.OnNavigate(r.cookie, &v); }
         }
+        unsafe { CoTaskMemFree(Some(pidl as *const c_void)); }
     });
 }
 
 pub fn revoke() {
-    for r in REG.take() { unsafe { let _ = r.sw.Revoke(r.cookie); } }
+    let mut destroyed = 0isize;
+    for r in REG.take() {
+        unsafe {
+            let _ = r.sw.Revoke(r.cookie);
+            if r.hwnd != 0 && r.hwnd != destroyed {
+                destroyed = r.hwnd;
+                let _ = DestroyWindow(HWND(r.hwnd as *mut c_void));
+            }
+        }
+    }
 }
 
 #[implement(IWebBrowser2)]
@@ -106,11 +130,17 @@ impl IShellView_Impl for View_Impl {
     fn AddPropertySheetPages(&self, _: u32, _: LPFNSVADDPROPSHEETPAGE, _: LPARAM) -> Result<()> { nope() }
     fn SaveViewState(&self) -> Result<()> { Ok(()) }
     fn SelectItem(&self, pidl: *const ITEMIDLIST, _flags: u32) -> Result<()> {
-       
-        let path = item_path(pidl, &cur(&self.dir)).ok_or(E_FAIL)?;
+        let dir_guard;
+        let dir = if self.dir.is_empty() {
+            dir_guard = DIR.lock().unwrap().clone();
+            dir_guard.as_str()
+        } else {
+            &self.dir
+        };
+        let path = item_path(pidl, dir).ok_or(E_FAIL)?;
         if self.resident {
             let exe = std::env::current_exe().map_err(|_| E_FAIL)?;
-            std::process::Command::new(exe).raw_arg(format!("/select,\"{}\"", path.display())).spawn().map_err(|_| E_FAIL)?;
+            std::process::Command::new(exe).raw_arg(format!("/select,\"{}\"", path.display())).creation_flags(0x0800_0000).spawn().map_err(|_| E_FAIL)?;
         } else {
             unsafe { PostMessageW(Some(HWND(self.hwnd as *mut c_void)), WM_SHELL_SELECT, WPARAM(0), LPARAM(Box::into_raw(Box::new(path)) as isize))? };
         }
@@ -126,16 +156,21 @@ fn item_path(pidl: *const ITEMIDLIST, dir: &str) -> Option<PathBuf> {
         CoTaskMemFree(Some(s.0 as *const c_void));
         r.map(PathBuf::from)
     };
-    let w = wide(std::ffi::OsStr::new(dir));
-    let joined = unsafe {
-        let mut base = std::ptr::null_mut();
-        SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut base, 0, None).ok().and_then(|_| {
-            let abs = ILCombine(Some(base), Some(pidl));
-            let p = name(abs);
-            ILFree(Some(abs));
-            CoTaskMemFree(Some(base as *const c_void));
-            p
-        })
+    let joined = if dir.is_empty() {
+        None
+    } else {
+        let mut w = Vec::new();
+        wide_buf(std::ffi::OsStr::new(dir), &mut w);
+        unsafe {
+            let mut base = std::ptr::null_mut();
+            SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut base, 0, None).ok().and_then(|_| {
+                let abs = ILCombine(Some(base), Some(pidl));
+                let p = name(abs);
+                ILFree(Some(abs));
+                CoTaskMemFree(Some(base as *const c_void));
+                p
+            })
+        }
     };
     joined.filter(|p| p.parent().is_some_and(|d| d.as_os_str().eq_ignore_ascii_case(Path::new(dir).as_os_str()))).or_else(|| name(pidl))
 }

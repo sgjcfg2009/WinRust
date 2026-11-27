@@ -97,6 +97,7 @@ struct App {
     pages: Vec<Page>,
     page: usize,
     dpi: i32,
+    font_dpi: i32,
     fonts: [isize; 6],
     mono: bool,
     pending: u32,
@@ -109,8 +110,10 @@ struct App {
     brush_col: u32,
     mem_dc: isize,
     mem_bmp: isize,
+    mem_old_bmp: isize,
     mem_w: i32,
     mem_h: i32,
+    tracking: bool,
     msg: Option<String>,
     connecting: Option<(String, String, bool)>,
     ticks: u32,
@@ -619,13 +622,13 @@ fn pages() -> Vec<Page> {
     let ram = if unsafe { GlobalMemoryStatusEx(&mut mem) } != 0 { gb(mem.ullTotalPhys) } else { "?".into() };
     let head = |s: &str| Row::Header(s.into());
     vec![
-        Page { title: "Display".into(), rows: display_rows() },
-        Page { title: "Sound".into(), rows: sound_rows() },
-        Page { title: "Power & storage".into(), rows: power_rows() },
-        Page { title: "Network".into(), rows: network_rows() },
-        Page { title: "Bluetooth".into(), rows: bt_rows() },
+        Page { title: "Display".into(), rows: vec![] },
+        Page { title: "Sound".into(), rows: vec![] },
+        Page { title: "Power & storage".into(), rows: vec![] },
+        Page { title: "Network".into(), rows: vec![] },
+        Page { title: "Bluetooth".into(), rows: vec![] },
         Page { title: "Apps".into(), rows: vec![] },
-        Page { title: "Windows Update".into(), rows: wu_rows() },
+        Page { title: "Windows Update".into(), rows: vec![] },
         Page {
             title: "Personalization".into(),
             rows: vec![
@@ -730,12 +733,22 @@ unsafe fn shape(dc: HDC, r: RECT, color: u32, d: i32) {
     }
 }
 
+unsafe fn with_wide<R>(s: &str, f: impl FnOnce(*const u16) -> R) -> R {
+    thread_local! { static BUF: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) }; }
+    BUF.with_borrow_mut(|b| {
+        b.clear();
+        b.extend(s.encode_utf16());
+        b.push(0);
+        f(b.as_ptr())
+    })
+}
+
 unsafe fn text(dc: HDC, font: isize, s: &str, mut r: RECT, color: u32, flags: u32) {
     unsafe {
         SelectObject(dc, font as _);
         SetBkMode(dc, TRANSPARENT as _);
         SetTextColor(dc, color);
-        DrawTextW(dc, wide(s).as_ptr(), -1, &mut r, flags | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        with_wide(s, |p| DrawTextW(dc, p, -1, &mut r, flags | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS));
     }
 }
 
@@ -743,7 +756,7 @@ unsafe fn text_width(dc: HDC, font: isize, s: &str) -> i32 {
     unsafe {
         SelectObject(dc, font as _);
         let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        DrawTextW(dc, wide(s).as_ptr(), -1, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        with_wide(s, |p| DrawTextW(dc, p, -1, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX));
         r.right
     }
 }
@@ -832,7 +845,7 @@ unsafe fn frame(hwnd: HWND) {
 fn refresh_fonts() {
     let mono = winrust_common::style::style().mono();
     APP.with_borrow_mut(|a| {
-        if a.fonts[0] != 0 && a.mono == mono {
+        if a.fonts[0] != 0 && a.mono == mono && a.font_dpi == a.dpi {
             return;
         }
         let font = |h: f32, w: i32, face: &str| unsafe { CreateFontW(-((h * a.dpi as f32 / 96.0).round() as i32), 0, 0, 0, w, 0, 0, 0, 1, 0, 0, 5, 0, wide(face).as_ptr()) as isize };
@@ -841,7 +854,7 @@ fn refresh_fonts() {
         for f in a.fonts.into_iter().filter(|&f| f != 0) {
             unsafe { DeleteObject(f as _) };
         }
-        (a.fonts, a.mono) = (new, mono);
+        (a.fonts, a.mono, a.font_dpi) = (new, mono, a.dpi);
     });
 }
 
@@ -866,6 +879,8 @@ unsafe fn paint(hwnd: HWND) {
                 let prev = SelectObject(a.mem_dc as HDC, nb);
                 if a.mem_bmp != 0 {
                     DeleteObject(prev);
+                } else {
+                    a.mem_old_bmp = prev as isize;
                 }
                 a.mem_bmp = nb as isize;
                 a.mem_w = cw;
@@ -1009,8 +1024,8 @@ unsafe fn paint(hwnd: HWND) {
                         }
                         let tl = inner.left + p(34);
                         text(mem, body, &nw.ssid, RECT { left: tl, top: r.top + p(7), right: inner.right - p(52), bottom: r.top + p(29) }, t.fg, DT_LEFT);
-                        let sub = if busy { "Connecting…".into() } else { note.clone() };
-                        text(mem, small, &sub, RECT { left: tl, top: r.top + p(27), right: inner.right - p(52), bottom: r.bottom - p(7) }, if busy || nw.connected { t.accent } else { t.dim }, DT_LEFT);
+                        let sub = if busy { "Connecting…" } else { note.as_str() };
+                        text(mem, small, sub, RECT { left: tl, top: r.top + p(27), right: inner.right - p(52), bottom: r.bottom - p(7) }, if busy || nw.connected { t.accent } else { t.dim }, DT_LEFT);
                         if nw.connected {
                             text(mem, icon_s, "\u{E73E}", inner, t.accent, DT_RIGHT);
                         } else if nw.sec.is_none_or(|s| s.needs_key()) && nw.profile.is_none() {
@@ -1021,9 +1036,9 @@ unsafe fn paint(hwnd: HWND) {
                         let armed = a.armed.as_deref() == Some(label.as_str());
                         let lw = text_width(mem, body, label).min((inner.right - inner.left) * 3 / 5);
                         text(mem, body, label, RECT { right: inner.left + lw, ..inner }, if armed { winrust_common::style::BAD } else { t.fg }, DT_LEFT);
-                        let value = if armed { "Click again".to_string() } else { value.clone() };
-                        let ink = if armed { winrust_common::style::BAD } else if matches!(cmd, Cmd::Vpn(v) if v.on) || value == "Connected" { t.accent } else { t.dim };
-                        text(mem, body, &value, RECT { left: inner.left + lw + p(16), right: inner.right - p(22), ..inner }, ink, DT_RIGHT);
+                        let val_s = if armed { "Click again" } else { value.as_str() };
+                        let ink = if armed { winrust_common::style::BAD } else if matches!(cmd, Cmd::Vpn(v) if v.on) || val_s == "Connected" { t.accent } else { t.dim };
+                        text(mem, body, val_s, RECT { left: inner.left + lw + p(16), right: inner.right - p(22), ..inner }, ink, DT_RIGHT);
                         text(mem, icon_s, "\u{E76C}", inner, t.dim, DT_RIGHT);
                     }
                     Row::Arrange(k) => {
@@ -1168,8 +1183,9 @@ fn click(x: i32, y: i32, cw: i32) -> Option<Act> {
             return row_at(y, p(NAV_TOP), p(NAV_H), a.pages.len()).map(Act::Page);
         }
         let rows = &a.pages.get(a.page)?.rows;
-        match rows.get(row_at_scrolled(a, y)?)? {
-            Row::Cycle(_, _, op) if listed(*op) => Some(Act::Pick(*op, row_at_scrolled(a, y)?)),
+        let idx = row_at_scrolled(a, y)?;
+        match rows.get(idx)? {
+            Row::Cycle(_, _, op) if listed(*op) => Some(Act::Pick(*op, idx)),
             Row::Cycle(_, _, op) => Some(Act::Do(*op)),
             Row::Slider(_, src) => {
                 let (l, r) = track(cw, a.dpi);
@@ -1648,6 +1664,26 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 0
             }
             WM_ERASEBKGND => 1,
+            0x02E0 => {
+                let dpi = (wp & 0xFFFF) as i32;
+                if dpi > 0 {
+                    APP.with_borrow_mut(|a| a.dpi = dpi);
+                    refresh_fonts();
+                    let r = &*(lp as *const RECT);
+                    SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                    clamp_scroll(hwnd, 0);
+                    let ed = APP.with_borrow(|a| a.edit);
+                    if ed != 0 {
+                        let mut rc: RECT = std::mem::zeroed();
+                        GetClientRect(hwnd, &mut rc);
+                        let (_, e) = bar(rc.right, rc.bottom, dpi);
+                        MoveWindow(ed as HWND, e.left, e.top, e.right - e.left, e.bottom - e.top, 1);
+                        SendMessageW(ed as HWND, WM_SETFONT, APP.with_borrow(|a| a.fonts[0]) as usize, 0);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                0
+            }
             WM_SIZE | WM_SETTINGCHANGE => {
                 clamp_scroll(hwnd, 0);
                 let (ed, dpi) = APP.with_borrow(|a| (a.edit, a.dpi));
@@ -1797,8 +1833,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     });
                     InvalidateRect(hwnd, null(), 0);
                 }
-                let mut te = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
-                TrackMouseEvent(&mut te);
+                if !APP.with_borrow_mut(|a| std::mem::replace(&mut a.tracking, true)) {
+                    let mut te = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                    TrackMouseEvent(&mut te);
+                }
                 let over = APP.with_borrow_mut(|a| {
                     let it = pick_item(a, rc.right, rc.bottom, x, y);
                     let pk = a.pick.as_mut()?;
@@ -1823,7 +1861,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 0
             }
             WM_MOUSELEAVE => {
-                if APP.with_borrow_mut(|a| a.hover.take().is_some()) {
+                if APP.with_borrow_mut(|a| {
+                    a.tracking = false;
+                    a.hover.take().is_some()
+                }) {
                     InvalidateRect(hwnd, null(), 0);
                 }
                 0
@@ -1869,7 +1910,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         a.msg = None;
                     }
                 });
-                match click((lp & 0xFFFF) as i16 as i32, (lp >> 16) as i16 as i32, rc.right) {
+                match click(x, y, rc.right) {
                     Some(Act::Do(Op::Radio)) => {
                         wifi::set_radio(!RADIO.get().is_some_and(|r| r.0));
                         SetTimer(hwnd, 2, 1500, None);
@@ -1883,7 +1924,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         APP.with_borrow_mut(|a| a.drag = Some(src));
                     }
                     Some(Act::Cmd(cmd)) => {
-                        let label = APP.with_borrow(|a| row_at_scrolled(a, (lp >> 16) as i16 as i32).and_then(|i| match a.pages.get(a.page)?.rows.get(i)? {
+                        let label = APP.with_borrow(|a| row_at_scrolled(a, y).and_then(|i| match a.pages.get(a.page)?.rows.get(i)? {
                             Row::Item(l, ..) => Some(l.clone()),
                             _ => None,
                         }));
@@ -1984,13 +2025,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         DeleteObject(a.brush as _);
                         a.brush = 0;
                     }
-                    if a.mem_bmp != 0 {
-                        DeleteObject(a.mem_bmp as _);
-                        a.mem_bmp = 0;
-                    }
                     if a.mem_dc != 0 {
+                        if a.mem_old_bmp != 0 {
+                            SelectObject(a.mem_dc as _, a.mem_old_bmp as _);
+                            a.mem_old_bmp = 0;
+                        }
+                        if a.mem_bmp != 0 {
+                            DeleteObject(a.mem_bmp as _);
+                            a.mem_bmp = 0;
+                        }
                         DeleteDC(a.mem_dc as _);
                         a.mem_dc = 0;
+                    } else if a.mem_bmp != 0 {
+                        DeleteObject(a.mem_bmp as _);
+                        a.mem_bmp = 0;
                     }
                 });
                 PostQuitMessage(0);
@@ -2039,6 +2087,7 @@ fn main() {
             TranslateMessage(&m);
             DispatchMessageW(&m);
         }
+        windows_sys::Win32::Graphics::GdiPlus::GdiplusShutdown(token);
     }
 }
 

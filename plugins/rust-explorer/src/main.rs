@@ -46,9 +46,23 @@ fn save_place(h: HWND) {
     let _ = fs::write(f, format!("{} {} {} {} {}", if wp.showCmd == SW_SHOWMAXIMIZED as u32 { "max" } else { "normal" }, r.left, r.top, r.right, r.bottom));
 }
 fn saved_place() -> Option<(bool, RECT)> {
-    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
-    let (max, r) = parse_place(&fs::read_to_string(place_file()).ok()?)?;
-    (!unsafe { MonitorFromRect(&r, MONITOR_DEFAULTTONULL) }.is_null()).then_some((max, r))
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect};
+    let (max, mut r) = parse_place(&fs::read_to_string(place_file()).ok()?)?;
+    unsafe {
+        let mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut mi) != 0 {
+            let wa = mi.rcWork;
+            let w = (r.right - r.left).clamp(200, (wa.right - wa.left).max(200));
+            let h = (r.bottom - r.top).clamp(150, (wa.bottom - wa.top).max(150));
+            r.left = r.left.clamp(wa.left, (wa.right - w).max(wa.left));
+            r.top = r.top.clamp(wa.top, (wa.bottom - h).max(wa.top));
+            r.right = r.left + w;
+            r.bottom = r.top + h;
+        }
+    }
+    Some((max, r))
 }
 fn work_strips() -> (i32, i32) {
     let mut r: RECT = unsafe { std::mem::zeroed() };
@@ -68,7 +82,6 @@ static GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static TX: std::sync::OnceLock<std::sync::mpsc::Sender<(u32, usize, PathBuf)>> = std::sync::OnceLock::new();
 const WM_GO: u32 = WM_APP + 1;
 static EDIT_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-static LABEL_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 struct Row { name: String, dir: bool, size: u64, time: u64, icon: i32, thumb: i32, hdr: bool }
 
@@ -205,7 +218,7 @@ fn tool(name: &str) -> Option<PathBuf> {
 }
 
 fn is_pic(p: &std::path::Path) -> bool {
-    p.extension().and_then(|e| e.to_str()).is_some_and(|e| ["jpg", "jpeg", "jfif", "png", "bmp", "gif", "tif", "tiff", "webp", "heic", "avif"].contains(&e.to_ascii_lowercase().as_str()))
+    p.extension().and_then(|e| e.to_str()).is_some_and(|e| ["jpg", "jpeg", "jfif", "png", "bmp", "gif", "tif", "tiff", "webp", "heic", "avif"].iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
 fn properties(path: &PathBuf) {
@@ -226,7 +239,7 @@ fn properties_many(h: HWND, paths: &[PathBuf]) {
 }
 
 pub fn is_cut_row(dir: &Path, name: &str) -> bool {
-    if dir == Path::new(THIS_PC_KEY) || zipx::split_zip(dir).is_some() {
+    if !sh::has_cut() || dir == Path::new(THIS_PC_KEY) || zipx::split_zip(dir).is_some() {
         return false;
     }
     let p = if Path::new(name).is_absolute() { PathBuf::from(name) } else { dir.join(name) };
@@ -340,6 +353,13 @@ fn real_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     }
 }
 
+const NO_CONSOLE: u32 = 0x0800_0000;
+
+fn spawn_gui(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    let _ = cmd.creation_flags(NO_CONSOLE).spawn();
+}
+
 unsafe fn activate(h: HWND, p: PathBuf, is_dir: bool) {
     let p = match zip_names(std::slice::from_ref(&p)) {
         Some((arc, names)) if !is_dir => match materialize(&arc, &names) {
@@ -348,10 +368,10 @@ unsafe fn activate(h: HWND, p: PathBuf, is_dir: bool) {
         },
         _ => p,
     };
-    if is_dir && desk() { let _ = std::process::Command::new(env::current_exe().unwrap_or_default()).arg(p).spawn(); }
+    if is_dir && desk() { spawn_gui(std::process::Command::new(env::current_exe().unwrap_or_default()).arg(p)); }
     else if is_dir { load(h, p) }
     else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) && p.is_file() { load(h, p) }
-    else if let Some(exe) = tool("photoview").filter(|_| is_pic(&p)) { let _ = std::process::Command::new(exe).arg(&p).spawn(); }
+    else if let Some(exe) = tool("photoview").filter(|_| is_pic(&p)) { spawn_gui(std::process::Command::new(exe).arg(&p)); }
     else {
         let dir = p.parent().map(|d| w(&d.to_string_lossy()));
         unsafe { ShellExecuteW(h, ptr::null(), w(&p.to_string_lossy()).as_ptr(), ptr::null(), dir.as_ref().map_or(ptr::null(), |d| d.as_ptr()), SW_SHOWNORMAL) };
@@ -433,13 +453,53 @@ fn copy_text(h: HWND, s: &str) {
     }
 }
 
+fn open_terminal(dir: &Path) {
+    if std::process::Command::new("wt.exe").arg("-d").arg(dir).spawn().is_err() {
+        let _ = std::process::Command::new("cmd.exe").args(["/k", "cd", "/d"]).arg(dir).spawn();
+    }
+}
+
+fn begin_rename(h: HWND) {
+    let (list, ..) = selected();
+    let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
+    if i < 0 { return; }
+    unsafe {
+        SetFocus(list);
+        ui::start_rename(h, list, i as usize);
+    }
+}
+
+pub fn commit_rename(h: HWND, idx: usize, new: &str) {
+    ST.with_borrow(|st| {
+        let Some(r) = st.rows.get(idx) else { return };
+        let old_p = st.dir.join(&r.name);
+        let target_name = if desk() {
+            let low = r.name.to_lowercase();
+            if (low.ends_with(".lnk") || low.ends_with(".url")) && !new.to_lowercase().ends_with(&low[low.len() - 4..]) {
+                format!("{new}{}", &r.name[r.name.len() - 4..])
+            } else {
+                new.to_string()
+            }
+        } else {
+            new.to_string()
+        };
+        if let Some(parent) = old_p.parent() {
+            let new_p = parent.join(target_name);
+            if fs::rename(&old_p, &new_p).is_ok() {
+                UNDO.with_borrow_mut(|u| u.push(UndoOp::Rename { from: old_p, to: new_p }));
+            }
+        }
+    });
+    unsafe { PostMessageW(h, WM_APP, 0, 0) };
+}
+
 fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
     if zipx::split_zip(dir).is_some() { return zip_menu(h, paths); }
     let wh = windows::Win32::Foundation::HWND(h);
     if paths.iter().any(|p| p.to_string_lossy().ends_with(THIS_PC_KEY)) {
         if let Some(verb) = sh::native_known_menu(wh, &windows::Win32::UI::Shell::FOLDERID_ComputerFolder) {
             if verb == "open" {
-                if let Ok(me) = env::current_exe() { let _ = std::process::Command::new(me).spawn(); }
+                if let Ok(me) = env::current_exe() { spawn_gui(&mut std::process::Command::new(me)); }
             } else if verb != "\0" {
                 reload(h);
             }
@@ -456,32 +516,29 @@ fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
         }
         return;
     }
-    if !paths.iter().all(|p| p.exists()) { return; }
-    let single_dir = paths.len() == 1 && paths[0].is_dir();
-    let can_runas = paths.len() == 1 && !paths[0].is_dir() && paths[0].extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "exe" | "bat" | "cmd" | "lnk" | "msi" | "ps1" | "com" | "scr" | "msc"));
-    let pinned = single_dir && ui::pins().contains(&paths[0]);
-    let mut items = vec![
-        ui::MenuItem::new(1, "Open", "\u{E8E5}"),
-    ];
+    if paths.is_empty() { return; }
+    let Ok(first_meta) = fs::metadata(&paths[0]) else { return };
+    if paths[1..].iter().any(|p| fs::symlink_metadata(p).is_err()) { return; }
+    let single_dir = paths.len() == 1 && first_meta.is_dir();
+    let can_runas = paths.len() == 1 && !first_meta.is_dir() && paths[0].extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "exe" | "bat" | "cmd" | "lnk" | "msi" | "ps1" | "com" | "scr" | "msc"));
+    let pinned = single_dir && !desk() && ui::pins().contains(&paths[0]);
+    let all_archives = paths.iter().all(|p| jobs::is_archive(p));
+    let mut items = Vec::with_capacity(20);
+    items.push(ui::MenuItem::new(1, "Open", "\u{E8E5}"));
     if can_runas {
         items.push(ui::MenuItem::new(10, "Run as administrator", "\u{E7EF}"));
     }
-    if paths.iter().all(|p| jobs::is_archive(p)) {
+    if all_archives {
         items.push(ui::MenuItem::new(11, "Extract to folder", "\u{E8B7}").sep());
     }
     items.push(ui::MenuItem::new(12, "Compress to ZIP", "\u{F012}").sep());
-    let shell_ext = sh::query_menu(wh, paths);
-    if let Some((_, ref dyn_items)) = shell_ext {
-        for (idx, it) in dyn_items.iter().enumerate() {
-            items.push(if idx == 0 && !it.sep {
-                let mut first = it.clone();
-                first.sep = true;
-                first
-            } else {
-                it.clone()
-            });
+    let shell_sm = sh::query_menu(wh, paths).map(|(sm, dyn_items)| {
+        for (idx, mut it) in dyn_items.into_iter().enumerate() {
+            if idx == 0 { it.sep = true; }
+            items.push(it);
         }
-    }
+        sm
+    });
     if single_dir && !desk() {
         items.push(ui::MenuItem::new(2, "Open in new tab", "\u{E8A7}"));
         items.push(ui::MenuItem::new(3, if pinned { "Unpin from Quick access" } else { "Pin to Quick access" }, "\u{E718}"));
@@ -527,32 +584,24 @@ fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
             confirm_delete(h, dir, paths, perm);
             reload(h);
         }
-        Some(8) => unsafe {
-            let (list, ..) = selected();
-            let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
-            if i >= 0 { SetFocus(list); put(list, LVM_EDITLABELW, i as usize, 0); }
-        },
+        Some(8) => begin_rename(h),
         Some(9) if !paths.is_empty() => properties_many(h, paths),
         Some(10) if can_runas => unsafe {
             let wd = paths[0].parent().unwrap_or(dir);
             ShellExecuteW(h, w("runas").as_ptr(), w(&paths[0].to_string_lossy()).as_ptr(), ptr::null(), w(&wd.to_string_lossy()).as_ptr(), SW_SHOWNORMAL);
         },
-        Some(11) if paths.iter().all(|p| jobs::is_archive(p)) => {
+        Some(11) if all_archives => {
             jobs::extract(h as isize, paths.to_vec(), dir.to_path_buf());
         }
         Some(12) => {
             jobs::compress(h as isize, paths.to_vec(), dir.to_path_buf());
         }
         Some(id) if id >= 0x1000 => {
-            if let Some((ref sm, _)) = shell_ext {
+            if let Some(ref sm) = shell_sm {
                 sh::invoke(sm, wh, id);
             }
         }
-        Some(14) if single_dir => {
-            if std::process::Command::new("wt.exe").arg("-d").arg(&paths[0]).spawn().is_err() {
-                let _ = std::process::Command::new("cmd.exe").args(["/k", "cd", "/d"]).arg(&paths[0]).spawn();
-            }
-        }
+        Some(14) if single_dir => open_terminal(&paths[0]),
         Some(15) if paths.len() == 1 && is_pic(&paths[0]) => unsafe {
             let wp = w(&paths[0].to_string_lossy());
             SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, wp.as_ptr() as *mut _, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
@@ -569,11 +618,8 @@ fn icons_marker() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_de
 fn small_marker() -> PathBuf { icons_marker().with_file_name("small-icons") }
 fn desk_icon_tier() -> u8 {
     match fs::read_to_string(small_marker()) {
-        Ok(s) => match s.trim() {
-            "0" | "" | "1" if s.trim() != "1" => 0,
-            "2" => 2,
-            _ => 0,
-        },
+        Ok(s) if s.trim() == "2" => 2,
+        Ok(_) => 0,
         Err(_) => 1,
     }
 }
@@ -593,7 +639,7 @@ unsafe fn apply_icon_size(list: HWND) {
     let il = if tier == 2 {
         use windows::Win32::UI::{Controls::IImageList, Shell::{SHGetImageList, SHIL_EXTRALARGE}};
         SHGetImageList::<IImageList>(SHIL_EXTRALARGE as i32)
-            .map(|l| windows::core::Interface::as_raw(&l) as isize)
+            .map(|l| windows::core::Interface::into_raw(l) as isize)
             .unwrap_or_else(|_| SHGetFileInfoW(w("C:\\").as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_LARGEICON) as isize)
     } else {
         let flag = if tier == 0 { SHGFI_SMALLICON } else { SHGFI_LARGEICON };
@@ -609,6 +655,16 @@ fn set_icons_hidden(hide: bool) {
     if hide { if let Some(d) = m.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&m, "1"); } else { let _ = fs::remove_file(&m); }
     let list = ST.with_borrow(|st| st.list);
     unsafe { ShowWindow(list, if hide { SW_HIDE } else { SW_SHOW }) };
+}
+
+fn toggle_group_by_date() {
+    let k = group_marker();
+    if group_on() {
+        let _ = fs::remove_file(&k);
+    } else {
+        if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); }
+        let _ = fs::write(&k, "1");
+    }
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -666,10 +722,7 @@ unsafe fn bg_menu(h: HWND) {
         0x7003 => { set_desk_icon_tier(0); apply_icon_size(ST.with_borrow(|st| st.list)); let _ = fs::remove_file(desk::pos_file()); }
         0x7004 => { let _ = fs::remove_file(desk::pos_file()); }
         0x7005 => set_icons_hidden(!icons_hidden()),
-        0x7006 => {
-            let k = group_marker();
-            if group_on() { let _ = fs::remove_file(&k); } else { if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&k, "1"); }
-        }
+        0x7006 => toggle_group_by_date(),
         0x7010 if !THUMBS.load(Relaxed) => toggle_view(h),
         0x7011 if THUMBS.load(Relaxed) => toggle_view(h),
         0x7007 => { SORT_COL.store(0, Relaxed); SORT_ASC.store(true, Relaxed); if desk() { let _ = fs::remove_file(desk::pos_file()); } }
@@ -681,16 +734,14 @@ unsafe fn bg_menu(h: HWND) {
         0x700C => created = new_entry(&dir, "New folder", true),
         0x700D => created = new_entry(&dir, "New Text Document.txt", false),
         0x7013 => {
-            if std::process::Command::new("wt.exe").arg("-d").arg(&dir).spawn().is_err() {
-                let _ = std::process::Command::new("cmd.exe").args(["/k", "cd", "/d"]).arg(&dir).spawn();
-            }
+            open_terminal(&dir);
             return;
         }
         0x700E | 0x700F => {
             let page = if act == 0x700E { "ms-settings:display" } else { "ms-settings:personalization" };
             let exe = tool("rust-settings").or_else(|| env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("rust-settings.exe"))).filter(|p| p.is_file()));
             if let Some(p) = exe {
-                let _ = std::process::Command::new(p).arg(page).spawn();
+                spawn_gui(std::process::Command::new(p).arg(page));
             } else {
                 ShellExecuteW(h, ptr::null(), w(page).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL);
             }
@@ -748,8 +799,7 @@ unsafe fn view_menu(h: HWND) {
         Some(1) if !THUMBS.load(Relaxed) => toggle_view(h),
         Some(2) if THUMBS.load(Relaxed) => toggle_view(h),
         Some(3) => {
-            let k = group_marker();
-            if group_on() { let _ = fs::remove_file(&k); } else { if let Some(d) = k.parent() { let _ = fs::create_dir_all(d); } let _ = fs::write(&k, "1"); }
+            toggle_group_by_date();
             reload(h);
         }
         Some(4) => {
@@ -856,10 +906,6 @@ fn icon_of(p: &PathBuf, dir: bool) -> i32 {
     fi.iIcon
 }
 
-fn tab_text(tab: HWND, _i: usize, _text: &str, _insert: bool) {
-    if !tab.is_null() { unsafe { InvalidateRect(tab, ptr::null(), 0) }; }
-}
-
 fn shown_name(name: &str, desktop: bool) -> String {
     if name == THIS_PC_KEY { return "This PC".to_string(); }
     if name == RECYCLE_BIN_KEY { return "Recycle Bin".to_string(); }
@@ -897,10 +943,11 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
             for i in 0..26u32 {
                 if mask & (1 << i) == 0 { continue; }
                 let root = format!("{}:\\", (b'A' + i as u8) as char);
-                let ty = GetDriveTypeW(w(&root).as_ptr());
+                let wr = w(&root);
+                let ty = GetDriveTypeW(wr.as_ptr());
                 if !matches!(ty, 2 | 3 | 4 | 5 | 6) { continue; }
                 let (mut free, mut total) = (0u64, 0u64);
-                let _ = GetDiskFreeSpaceExW(w(&root).as_ptr(), &mut free, &mut total, ptr::null_mut());
+                let _ = GetDiskFreeSpaceExW(wr.as_ptr(), &mut free, &mut total, ptr::null_mut());
                 drives.push(Row { name: root, dir: true, size: total, time: 0, icon: -1, thumb: -2, hdr: false });
             }
         }
@@ -1034,18 +1081,21 @@ fn load(h: HWND, dir: PathBuf) {
         }
     }
     if !desk() { unsafe { SetWindowTextW(h, w(&dir.to_string_lossy()).as_ptr()) }; }
-    let (list, tab, edit, active, n) = ST.with_borrow_mut(|st| {
+    let (list, tab, edit, n) = ST.with_borrow_mut(|st| {
         if let Some(t) = st.tabs.get_mut(st.active) { *t = dir.clone(); }
         st.dir = dir.clone(); st.rows = rows;
         if !NAV.load(Relaxed) { st.hist.visit(dir.clone()); }
-        (st.list, st.tab, st.edit, st.active, st.rows.len())
+        (st.list, st.tab, st.edit, st.rows.len())
     });
     unsafe { SetWindowTextW(edit, w(&dir.to_string_lossy()).as_ptr()) };
     shellwin::navigated(&dir);
     ui::set_search(None);
-    tab_text(tab, active, &label(&dir), false);
+    if !tab.is_null() { unsafe { InvalidateRect(tab, ptr::null(), 0) }; }
     ui::nav_dirty();
     reset_thumbs();
+    if !desk() {
+        unsafe { ui::end_rename(false) };
+    }
     if !same_dir {
         put(list, LVM_DELETEALLITEMS, 0, 0);
     }
@@ -1118,9 +1168,15 @@ fn search(h: HWND, q: &str) {
 }
 
 fn flip_layout(q: &str) -> String {
-    let en: Vec<char> = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~".chars().collect();
-    let ru: Vec<char> = "йцукенгшщзхъфывапролджэячсмитьбюёЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ".chars().collect();
-    q.chars().map(|c| en.iter().position(|&x| x == c).map(|i| ru[i]).or_else(|| ru.iter().position(|&x| x == c).map(|i| en[i])).unwrap_or(c)).collect()
+    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~";
+    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюёЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ";
+    q.chars()
+        .map(|c| {
+            EN.chars().position(|x| x == c).and_then(|i| RU.chars().nth(i))
+                .or_else(|| RU.chars().position(|x| x == c).and_then(|i| EN.chars().nth(i)))
+                .unwrap_or(c)
+        })
+        .collect()
 }
 
 fn local_search(dir: &Path, q: &str) -> (Vec<Row>, bool, bool) {
@@ -1231,7 +1287,7 @@ fn col(list: HWND, i: i32, text: &str, width: i32, right: bool) {
 
 fn tab_new() {
     let tab = ST.with_borrow_mut(|st| { st.tabs.push(st.dir.clone()); st.active = st.tabs.len() - 1; st.tab });
-    tab_text(tab, 0, "", true);
+    if !tab.is_null() { unsafe { InvalidateRect(tab, ptr::null(), 0) }; }
 }
 
 fn tab_select(h: HWND, i: usize) {
@@ -1256,7 +1312,7 @@ fn tab_close_at(h: HWND, i: usize) {
     });
     match was_active {
         Some(true) => { let a = ST.with_borrow(|st| st.active); tab_select(h, a); }
-        Some(false) => tab_text(tab, 0, "", false),
+        Some(false) => if !tab.is_null() { unsafe { InvalidateRect(tab, ptr::null(), 0) }; },
         None => {}
     }
 }
@@ -1431,9 +1487,13 @@ mod sh {
         let (tx, rx) = std::sync::mpsc::channel::<(u32, usize, PathBuf)>();
         std::thread::spawn(move || unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let mut wbuf = Vec::with_capacity(260);
             for (era, row, path) in rx {
                 if era != super::GEN.load(std::sync::atomic::Ordering::Relaxed) { continue; }
-                let Ok(f) = SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(wide(&path).as_ptr()), None) else { continue };
+                wbuf.clear();
+                wbuf.extend(path.as_os_str().encode_wide());
+                wbuf.push(0);
+                let Ok(f) = SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(wbuf.as_ptr()), None) else { continue };
                 let Ok(bmp) = f.GetImage(SIZE { cx: super::THUMB, cy: super::THUMB }, SIIGBF_BIGGERSIZEOK) else { continue };
                 let padded = pad(bmp.0);
                 windows_sys::Win32::Graphics::Gdi::DeleteObject(bmp.0 as _);
@@ -1507,6 +1567,10 @@ mod sh {
     pub fn clip_clear() {
         unsafe { let _ = OleSetClipboard(None); }
         CUT_STATE.with_borrow_mut(|c| c.1.clear());
+    }
+
+    pub fn has_cut() -> bool {
+        CUT_STATE.with_borrow(|c| !c.1.is_empty())
     }
 
     pub fn is_cut(p: &std::path::Path) -> bool {
@@ -1650,8 +1714,11 @@ mod sh {
         let n = unsafe { GetMenuItemCount(Some(menu)) };
         let mut out = Vec::new();
         let mut pending_sep = false;
+        let mut buf = [0u16; 256];
         for pos in 0..n {
-            let mut buf = [0u16; 256];
+            if top_level && out.len() >= 8 {
+                break;
+            }
             let mut mii: MENUITEMINFOW = unsafe { std::mem::zeroed() };
             mii.cbSize = size_of::<MENUITEMINFOW>() as u32;
             mii.fMask = MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_STRING | MIIM_SUBMENU;
@@ -1670,6 +1737,12 @@ mod sh {
                 continue;
             }
             if !mii.hSubMenu.0.is_null() {
+                if top_level {
+                    let ll = label.to_ascii_lowercase();
+                    if ll.contains("send to") || ll.contains("отправить") || ll.contains("give access") || ll.contains("include in library") || ll.contains("restore previous") {
+                        continue;
+                    }
+                }
                 let wp = WPARAM(mii.hSubMenu.0 as usize);
                 let lp = LPARAM(pos as isize);
                 if let Some(c3) = cm3 {
@@ -1680,12 +1753,6 @@ mod sh {
                 let sub = unsafe { read_hmenu(cm, cm2, cm3, mii.hSubMenu, false) };
                 if sub.is_empty() {
                     continue;
-                }
-                if top_level {
-                    let ll = label.to_ascii_lowercase();
-                    if ll.contains("send to") || ll.contains("отправить") {
-                        continue;
-                    }
                 }
                 let mut item = crate::ui::MenuItem::new(0, label, "\u{E712}").sub(sub);
                 if pending_sep {
@@ -1728,7 +1795,7 @@ mod sh {
         unsafe {
             let cm: IContextMenu = ui(h, paths).ok()?;
             let hmenu = CreatePopupMenu().ok()?;
-            if cm.QueryContextMenu(hmenu, 0, 1, 0x6FFF, CMF_NORMAL | CMF_EXPLORE).is_err() {
+            if cm.QueryContextMenu(hmenu, 0, 1, 0x6FFF, CMF_NORMAL).is_err() {
                 let _ = DestroyMenu(hmenu);
                 return None;
             }
@@ -1808,15 +1875,106 @@ mod sh {
             cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok().unwrap();
             hide_system_zip(&cm, menu);
             walk(menu, 0, &mut out);
+            let _ = DestroyMenu(menu);
         }
         out
     }
 
+    #[implement(windows::Win32::System::Ole::IDropSource)]
+    struct DropSrc { desk_move: bool }
+
+    impl windows::Win32::System::Ole::IDropSource_Impl for DropSrc_Impl {
+        fn QueryContinueDrag(&self, escape_pressed: BOOL, key_state: MODIFIERKEYS_FLAGS) -> windows::core::HRESULT {
+            if escape_pressed.as_bool() {
+                return windows::core::HRESULT(0x0004_0101);
+            }
+            if key_state.0 & 1 == 0 {
+                return windows::core::HRESULT(0x0004_0100);
+            }
+            windows::core::HRESULT(0)
+        }
+        fn GiveFeedback(&self, _effect: DROPEFFECT) -> windows::core::HRESULT {
+            if self.desk_move {
+                unsafe {
+                    let cur = windows_sys::Win32::UI::WindowsAndMessaging::LoadCursorW(std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::IDC_ARROW);
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(cur);
+                }
+                windows::core::HRESULT(0)
+            } else {
+                windows::core::HRESULT(0x0004_0102)
+            }
+        }
+    }
+
+    fn drag_bitmap(path: &std::path::Path) -> Option<(isize, i32)> {
+        use windows_sys::Win32::Graphics::Gdi::{CreateCompatibleBitmap, CreateCompatibleDC, DC_BRUSH, DeleteDC, DeleteObject, FillRect, GetDC, ReleaseDC, SelectObject, SetDCBrushColor};
+        use windows_sys::Win32::UI::Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHGetFileInfoW};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DestroyIcon, DrawIconEx};
+        let sz = crate::ui::sc(48);
+        let wp = crate::w(&path.to_string_lossy());
+        unsafe {
+            let mut fi: SHFILEINFOW = std::mem::zeroed();
+            let mut hicon = std::ptr::null_mut();
+            if SHGetFileInfoW(wp.as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_LARGEICON) != 0 {
+                if let Ok(il) = SHGetImageList::<windows::Win32::UI::Controls::IImageList>(windows::Win32::UI::Shell::SHIL_EXTRALARGE as i32) {
+                    if let Ok(ic) = il.GetIcon(fi.iIcon, 1) {
+                        hicon = ic.0;
+                    }
+                }
+            }
+            if hicon.is_null() {
+                let mut fi2: SHFILEINFOW = std::mem::zeroed();
+                if SHGetFileInfoW(wp.as_ptr(), 0, &mut fi2, size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON) != 0 {
+                    hicon = fi2.hIcon;
+                }
+            }
+            if hicon.is_null() {
+                return None;
+            }
+            let sdc = GetDC(std::ptr::null_mut());
+            let mdc = CreateCompatibleDC(sdc);
+            let bmp = CreateCompatibleBitmap(sdc, sz, sz);
+            ReleaseDC(std::ptr::null_mut(), sdc);
+            if mdc.is_null() || bmp.is_null() {
+                if !mdc.is_null() { DeleteDC(mdc); }
+                if !bmp.is_null() { DeleteObject(bmp); }
+                DestroyIcon(hicon);
+                return None;
+            }
+            let old = SelectObject(mdc, bmp);
+            let r = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: sz, bottom: sz };
+            SetDCBrushColor(mdc, 0x00FF_00FF);
+            FillRect(mdc, &r, windows_sys::Win32::Graphics::Gdi::GetStockObject(DC_BRUSH as i32) as _);
+            DrawIconEx(mdc, 0, 0, hicon, sz, sz, 0, std::ptr::null_mut(), DI_NORMAL);
+            SelectObject(mdc, old);
+            DeleteDC(mdc);
+            DestroyIcon(hicon);
+            Some((bmp as isize, sz))
+        }
+    }
+
     pub fn drag(h: *mut c_void, paths: &[PathBuf]) -> Result<()> {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
+        use windows::Win32::System::Ole::IDropSource;
+        use windows::Win32::UI::Shell::{CLSID_DragDropHelper, IDragSourceHelper, SHDRAGIMAGE};
         unsafe {
             let hwnd = HWND(h);
             let data: IDataObject = ui(hwnd, paths)?;
-            SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)?;
+            if let (Some(first), Ok(helper)) = (paths.first(), CoCreateInstance::<_, IDragSourceHelper>(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER)) {
+                if let Some((bmp, sz)) = drag_bitmap(first) {
+                    let shdi = SHDRAGIMAGE {
+                        sizeDragImage: SIZE { cx: sz, cy: sz },
+                        ptOffset: POINT { x: sz / 2, y: sz / 2 },
+                        hbmpDragImage: HBITMAP(bmp as *mut _),
+                        crColorKey: COLORREF(0x00FF_00FF),
+                    };
+                    if helper.InitializeFromBitmap(&shdi, &data).is_err() {
+                        let _ = DeleteObject(HGDIOBJ(bmp as *mut _));
+                    }
+                }
+            }
+            let src: IDropSource = DropSrc { desk_move: super::desk() }.into();
+            SHDoDragDrop(Some(hwnd), &data, Some(&src), DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)?;
             Ok(())
         }
     }
@@ -1826,9 +1984,12 @@ mod sh {
             let fmt = FORMATETC { cfFormat: CF_HDROP.0, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0 as u32, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
             let mut med = o.GetData(&fmt)?;
             let hd = HDROP(med.u.hGlobal.0);
-            let mut out = vec![];
-            for i in 0..DragQueryFileW(hd, u32::MAX, None) {
-                let mut buf = vec![0u16; DragQueryFileW(hd, i, None) as usize + 1];
+            let count = DragQueryFileW(hd, u32::MAX, None);
+            let mut out = Vec::with_capacity(count as usize);
+            let mut buf = Vec::with_capacity(260);
+            for i in 0..count {
+                let len = DragQueryFileW(hd, i, None) as usize + 1;
+                buf.resize(len, 0);
                 let n = DragQueryFileW(hd, i, Some(&mut buf)) as usize;
                 out.push(PathBuf::from(String::from_utf16_lossy(&buf[..n])));
             }
@@ -1838,28 +1999,63 @@ mod sh {
     }
 
     #[implement(IDropTarget)]
-    struct DropT { main: isize }
+    struct DropT {
+        main: isize,
+        hwnd: HWND,
+        helper: Option<windows::Win32::UI::Shell::IDropTargetHelper>,
+    }
 
     fn effect(k: MODIFIERKEYS_FLAGS) -> DROPEFFECT { if k.0 & 8 != 0 { DROPEFFECT_COPY } else { DROPEFFECT_MOVE } }
 
     impl IDropTarget_Impl for DropT_Impl {
-        fn DragEnter(&self, _o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = if super::in_zip() { DROPEFFECT_NONE } else { effect(k) } }; Ok(()) }
-        fn DragOver(&self, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = if super::in_zip() { DROPEFFECT_NONE } else { effect(k) } }; Ok(()) }
-        fn DragLeave(&self) -> Result<()> { Ok(()) }
+        fn DragEnter(&self, o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            let eff = if super::in_zip() { DROPEFFECT_NONE } else { effect(k) };
+            unsafe { *e = eff };
+            if let (Some(hp), Some(d)) = (&self.helper, o.as_ref()) {
+                let p = POINT { x: pt.x, y: pt.y };
+                unsafe { let _ = hp.DragEnter(self.hwnd, d, &p, eff); }
+            }
+            Ok(())
+        }
+        fn DragOver(&self, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            let eff = if super::in_zip() { DROPEFFECT_NONE } else { effect(k) };
+            unsafe { *e = eff };
+            if let Some(hp) = &self.helper {
+                let p = POINT { x: pt.x, y: pt.y };
+                unsafe { let _ = hp.DragOver(&p, eff); }
+            }
+            Ok(())
+        }
+        fn DragLeave(&self) -> Result<()> {
+            if let Some(hp) = &self.helper {
+                unsafe { let _ = hp.DragLeave(); }
+            }
+            Ok(())
+        }
         fn Drop(&self, o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
-            if super::desk::dragging() {
+            let skip = if super::desk::dragging() {
                 super::desk::dropped_here((pt.x, pt.y));
+                true
+            } else {
+                super::in_zip()
+            };
+            if skip {
                 unsafe { *e = DROPEFFECT_NONE };
+                if let Some(hp) = &self.helper {
+                    unsafe { let _ = hp.DragLeave(); }
+                }
                 return Ok(());
             }
-            if super::in_zip() {
-                unsafe { *e = DROPEFFECT_NONE };
-                return Ok(());
-            }
-            let paths = hdrop_paths(o.ok()?)?;
+            let d = o.ok()?;
+            let paths = hdrop_paths(d)?;
             let to = super::cur_dir();
             let copy = k.0 & 8 != 0 || paths.first().and_then(|p| p.components().next()) != to.components().next();
-            unsafe { *e = if copy { DROPEFFECT_COPY } else { DROPEFFECT_MOVE } };
+            let eff = if copy { DROPEFFECT_COPY } else { DROPEFFECT_MOVE };
+            unsafe { *e = eff };
+            if let Some(hp) = &self.helper {
+                let p = POINT { x: pt.x, y: pt.y };
+                unsafe { let _ = hp.Drop(d, &p, eff); }
+            }
             let _ = fileop(self.main as *mut c_void, if copy { Op::Copy } else { Op::Move }, &paths, &to);
             unsafe { let _ = PostMessageW(Some(HWND(self.main as *mut c_void)), WM_APP, WPARAM(0), LPARAM(0)); }
             Ok(())
@@ -1867,8 +2063,11 @@ mod sh {
     }
 
     pub fn register_drop(list: *mut c_void, main: isize) -> Result<()> {
-        let t: IDropTarget = DropT { main }.into();
-        unsafe { RegisterDragDrop(HWND(list), &t) }
+        use windows::Win32::UI::Shell::{CLSID_DragDropHelper, IDropTargetHelper};
+        let hwnd = HWND(list);
+        let helper = unsafe { CoCreateInstance::<_, IDropTargetHelper>(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).ok() };
+        let t: IDropTarget = DropT { main, hwnd, helper }.into();
+        unsafe { RegisterDragDrop(hwnd, &t) }
     }
 }
 
@@ -1963,8 +2162,6 @@ mod desk {
         }).map(|(x, y, n): (i32, i32, String)| (n, (x, y))).collect()
     }
 
-    fn names() -> Vec<String> { ST.with_borrow(|st| st.rows.iter().map(|r| r.name.clone()).collect()) }
-
     fn pos(list: HWND, i: usize) -> (i32, i32) {
         let mut p = POINT { x: 0, y: 0 };
         put(list, LVM_GETITEMPOSITION, i, &mut p as *mut _ as isize);
@@ -1977,7 +2174,14 @@ mod desk {
     }
 
     pub fn save(list: HWND) {
-        let lines: String = names().iter().enumerate().map(|(i, n)| { let (x, y) = pos(list, i); format!("{x}\t{y}\t{n}\n") }).collect();
+        use std::fmt::Write as _;
+        let mut lines = String::new();
+        ST.with_borrow(|st| {
+            for (i, r) in st.rows.iter().enumerate() {
+                let (x, y) = pos(list, i);
+                let _ = writeln!(lines, "{x}\t{y}\t{}", r.name);
+            }
+        });
         let f = pos_file();
         let _ = fs::create_dir_all(f.parent().unwrap_or(&f));
         let _ = fs::write(f, lines);
@@ -2020,15 +2224,17 @@ mod desk {
             it.iImage = -1;
             put(list, LVM_INSERTITEMW, 0, &it as *const _ as isize);
         }
-        let (g, old, names) = (Grid::of(list), saved(), names());
+        let (g, old) = (Grid::of(list), saved());
         let mut taken = HashSet::new();
         let mut later = vec![];
-        for (i, name) in names.iter().enumerate() {
-            match old.get(name).and_then(|&p| g.cell(p)).filter(|c| !taken.contains(c)) {
-                Some(c) => { taken.insert(c); set_pos(list, i, g.at(c)); }
-                None => later.push(i),
+        ST.with_borrow(|st| {
+            for (i, r) in st.rows.iter().enumerate() {
+                match old.get(&r.name).and_then(|&p| g.cell(p)).filter(|c| !taken.contains(c)) {
+                    Some(c) => { taken.insert(c); set_pos(list, i, g.at(c)); }
+                    None => later.push(i),
+                }
             }
-        }
+        });
         for i in later {
             let c = g.free(&taken, None);
             taken.insert(c);
@@ -2175,13 +2381,6 @@ unsafe fn delete_word(h: HWND) {
     }
 }
 
-unsafe extern "system" fn label_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe {
-        if m == WM_CHAR && wp == 0x7F { delete_word(h); return 0; }
-        CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(LABEL_OLD.load(std::sync::atomic::Ordering::Relaxed)), h, m, wp, lp)
-    }
-}
-
 unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if matches!(wp, 13 | 27) && matches!(m, WM_KEYDOWN | WM_CHAR) {
@@ -2194,6 +2393,8 @@ unsafe extern "system" fn edit_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
 }
 
 const WM_SHUTDOWN_DLG: u32 = WM_APP + 20;
+const WM_RESIDENT: u32 = WM_APP + 21;
+const WM_DPICHANGED: u32 = 0x02E0;
 static SHUTDOWN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 const SHUTDOWN_OPTS: [(&str, &str); 5] = [
@@ -2205,12 +2406,10 @@ const SHUTDOWN_OPTS: [(&str, &str); 5] = [
 ];
 
 fn run_power_action(idx: usize) {
-    use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    const NO_WIN: u32 = 0x0800_0000;
     match idx {
-        0 => { let _ = std::process::Command::new("shutdown").args(["/s", "/t", "0"]).creation_flags(NO_WIN).spawn(); }
-        1 => { let _ = std::process::Command::new("shutdown").args(["/r", "/t", "0"]).creation_flags(NO_WIN).spawn(); }
+        0 => spawn_gui(std::process::Command::new("shutdown").args(["/s", "/t", "0"])),
+        1 => spawn_gui(std::process::Command::new("shutdown").args(["/r", "/t", "0"])),
         2 => unsafe {
             let lib = LoadLibraryW(w("powrprof.dll").as_ptr());
             if !lib.is_null() {
@@ -2242,66 +2441,186 @@ fn run_power_action(idx: usize) {
     }
 }
 
+static SHUTDOWN_FONTS: std::sync::Mutex<[isize; 3]> = std::sync::Mutex::new([0; 3]);
+static SHUTDOWN_REG: std::sync::Once = std::sync::Once::new();
+thread_local! {
+    static SHUTDOWN_STATE: std::cell::Cell<(usize, i8)> = const { std::cell::Cell::new((0, -1)) };
+}
+
+fn shutdown_rects(cw_full: i32) -> ([RECT; 5], RECT, RECT, RECT) {
+    let pad = ui::sc(22);
+    let cw = (cw_full - pad * 2).max(ui::sc(180));
+    let mut rows = [RECT { left: 0, top: 0, right: 0, bottom: 0 }; 5];
+    let mut y = ui::sc(84);
+    let rh = ui::sc(32);
+    for r in &mut rows {
+        *r = ui::rc(pad, y, pad + cw, y + rh);
+        y += rh + ui::sc(4);
+    }
+    let desc = ui::rc(pad, y + ui::sc(6), pad + cw, y + ui::sc(42));
+    let bw = ui::sc(92);
+    let bh = ui::sc(30);
+    let by = y + ui::sc(50);
+    let ok = ui::rc(pad + cw - bw * 2 - ui::sc(10), by, pad + cw - bw - ui::sc(10), by + bh);
+    let cancel = ui::rc(pad + cw - bw, by, pad + cw, by + bh);
+    (rows, desc, ok, cancel)
+}
+
+fn shutdown_hit(cw_full: i32, x: i32, y: i32) -> i8 {
+    let hit = |r: RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+    let (rows, _, ok, cancel) = shutdown_rects(cw_full);
+    for (i, r) in rows.iter().enumerate() {
+        if hit(*r) { return i as i8; }
+    }
+    if hit(ok) { return 10; }
+    if hit(cancel) { return 11; }
+    -1
+}
+
 unsafe extern "system" fn shutdown_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    use windows_sys::Win32::Graphics::Gdi::{SetBkMode, SetTextColor, TRANSPARENT};
-    const CBS_DROPDOWNLIST: u32 = 0x0003;
-    const CB_ADDSTRING: u32 = 0x0143;
-    const CB_GETCURSEL: u32 = 0x0147;
-    const CB_SETCURSEL: u32 = 0x014E;
-    const CBN_SELCHANGE: u16 = 1;
+    use windows_sys::Win32::Graphics::Gdi::{BeginPaint, DT_CENTER, DT_LEFT, DT_WORDBREAK, DeleteObject, EndPaint, HGDIOBJ, PAINTSTRUCT, SelectObject, SetBkMode, TRANSPARENT};
     unsafe {
         match m {
             WM_CREATE => {
                 ui::dark_title(h);
-                let inst = GetModuleHandleW(ptr::null());
-                let pad = ui::sc(22);
-                let cw = ui::sc(420) - pad * 2;
-                let title = CreateWindowExW(0, w("STATIC").as_ptr(), w("Windows 11").as_ptr(), WS_CHILD | WS_VISIBLE, pad, ui::sc(16), cw, ui::sc(30), h, 100 as _, inst, ptr::null());
-                put(title, WM_SETFONT, ui::font(22, 600, ui::ui_face()) as usize, 1);
-                let ask = CreateWindowExW(0, w("STATIC").as_ptr(), w("What do you want the computer to do?").as_ptr(), WS_CHILD | WS_VISIBLE, pad, ui::sc(54), cw, ui::sc(20), h, 103 as _, inst, ptr::null());
-                put(ask, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
-                let cb = CreateWindowExW(0, w("COMBOBOX").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, pad, ui::sc(80), cw, ui::sc(200), h, 101 as _, inst, ptr::null());
-                put(cb, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
-                for (name, _) in SHUTDOWN_OPTS {
-                    put(cb, CB_ADDSTRING, 0, w(name).as_ptr() as isize);
-                }
-                put(cb, CB_SETCURSEL, 0, 0);
-                let desc = CreateWindowExW(0, w("STATIC").as_ptr(), w(SHUTDOWN_OPTS[0].1).as_ptr(), WS_CHILD | WS_VISIBLE, pad, ui::sc(114), cw, ui::sc(34), h, 102 as _, inst, ptr::null());
-                put(desc, WM_SETFONT, ui::font(12, 400, ui::ui_face()) as usize, 1);
-                let bw = ui::sc(88);
-                let bh = ui::sc(28);
-                let by = ui::sc(162);
-                let ok = CreateWindowExW(0, w("BUTTON").as_ptr(), w("OK").as_ptr(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32, pad + cw - bw * 2 - ui::sc(10), by, bw, bh, h, 1 as _, inst, ptr::null());
-                let cancel = CreateWindowExW(0, w("BUTTON").as_ptr(), w("Cancel").as_ptr(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, pad + cw - bw, by, bw, bh, h, 2 as _, inst, ptr::null());
-                put(ok, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
-                put(cancel, WM_SETFONT, ui::font(13, 400, ui::ui_face()) as usize, 1);
-                SetFocus(cb);
+                let _ = windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(h, 33, &2u32 as *const u32 as _, 4);
+                *SHUTDOWN_FONTS.lock().unwrap() = [
+                    ui::font(20, 600, ui::ui_face()),
+                    ui::font(13, 400, ui::ui_face()),
+                    ui::font(12, 400, ui::ui_face()),
+                ];
+                SHUTDOWN_STATE.set((0, -1));
+                SetFocus(h);
                 0
             }
-            WM_CTLCOLORSTATIC => {
-                SetTextColor(wp as _, ui::pal().text);
-                SetBkMode(wp as _, TRANSPARENT as i32);
-                GetStockObject(5) as isize
-            }
-            WM_COMMAND => {
-                let id = (wp & 0xFFFF) as u16;
-                let code = ((wp >> 16) & 0xFFFF) as u16;
-                if id == 101 && code == CBN_SELCHANGE {
-                    let idx = SendDlgItemMessageW(h, 101, CB_GETCURSEL, 0, 0) as usize;
-                    if let Some((_, desc)) = SHUTDOWN_OPTS.get(idx) {
-                        SetDlgItemTextW(h, 102, w(desc).as_ptr());
-                    }
-                } else if id == 1 {
-                    let idx = SendDlgItemMessageW(h, 101, CB_GETCURSEL, 0, 0) as usize;
-                    DestroyWindow(h);
-                    run_power_action(idx);
-                } else if id == 2 {
-                    DestroyWindow(h);
+            WM_GETDLGCODE => 0x0087,
+            WM_ACTIVATE => {
+                if (wp & 0xFFFF) != 0 {
+                    SetFocus(h);
                 }
+                0
+            }
+            WM_PAINT => {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let dc = BeginPaint(h, &mut ps);
+                let mut cr: RECT = std::mem::zeroed();
+                GetClientRect(h, &mut cr);
+                let pal = ui::pal();
+                ui::fill(dc, cr, pal.bg, 0);
+                let [f20, f13, f12] = *SHUTDOWN_FONTS.lock().unwrap();
+                SetBkMode(dc, TRANSPARENT as i32);
+                let of = SelectObject(dc, f20 as HGDIOBJ);
+                let pad = ui::sc(22);
+                let cw = (cr.right - pad * 2).max(ui::sc(180));
+                ui::text(dc, "Windows 11", ui::rc(pad, ui::sc(18), pad + cw, ui::sc(46)), pal.text, DT_LEFT);
+                SelectObject(dc, f13 as HGDIOBJ);
+                ui::text(dc, "What do you want the computer to do?", ui::rc(pad, ui::sc(52), pad + cw, ui::sc(74)), pal.dim, DT_LEFT);
+                let (sel, hov) = SHUTDOWN_STATE.get();
+                let (rows, desc, ok, cancel) = shutdown_rects(cr.right);
+                for (i, &r) in rows.iter().enumerate() {
+                    let is_sel = i == sel;
+                    let is_hot = hov == i as i8;
+                    if is_sel || is_hot {
+                        let c = if is_sel {
+                            ui::mix(pal.bg, pal.accent, if is_hot { 0.28 } else { 0.20 })
+                        } else {
+                            ui::mix(pal.bg, pal.text, 0.08)
+                        };
+                        ui::fill(dc, r, c, ui::sc(8));
+                    }
+                    if is_sel {
+                        ui::fill(dc, ui::rc(r.left, r.top + ui::sc(7), r.left + ui::sc(3), r.bottom - ui::sc(7)), pal.accent, ui::sc(3));
+                    }
+                    ui::text(dc, SHUTDOWN_OPTS[i].0, ui::rc(r.left + ui::sc(12), r.top, r.right - ui::sc(10), r.bottom), pal.text, DT_LEFT);
+                }
+                SelectObject(dc, f12 as HGDIOBJ);
+                ui::text(dc, SHUTDOWN_OPTS[sel].1, desc, pal.dim, DT_LEFT | DT_WORDBREAK);
+                SelectObject(dc, f13 as HGDIOBJ);
+                let ok_bg = if hov == 10 { ui::mix(pal.accent, 0x00FF_FFFF, 0.14) } else { pal.accent };
+                ui::fill(dc, ok, ok_bg, ui::sc(6));
+                ui::text(dc, "OK", ok, winrust_common::style::on_accent(), DT_CENTER);
+                let c_bg = ui::mix(pal.bg, pal.text, if hov == 11 { 0.14 } else { 0.08 });
+                ui::fill(dc, cancel, c_bg, ui::sc(6));
+                ui::text(dc, "Cancel", cancel, pal.text, DT_CENTER);
+                SelectObject(dc, of);
+                EndPaint(h, &ps);
+                0
+            }
+            WM_MOUSEMOVE => {
+                let (x, y) = ((lp & 0xFFFF) as i16 as i32, (lp >> 16) as i16 as i32);
+                let mut cr: RECT = std::mem::zeroed();
+                GetClientRect(h, &mut cr);
+                let (sel, hov) = SHUTDOWN_STATE.get();
+                let nh = shutdown_hit(cr.right, x, y);
+                if nh != hov {
+                    SHUTDOWN_STATE.set((sel, nh));
+                    InvalidateRect(h, ptr::null(), 0);
+                }
+                0
+            }
+            WM_LBUTTONDOWN => {
+                let (x, y) = ((lp & 0xFFFF) as i16 as i32, (lp >> 16) as i16 as i32);
+                let mut cr: RECT = std::mem::zeroed();
+                GetClientRect(h, &mut cr);
+                let (sel, hov) = SHUTDOWN_STATE.get();
+                match shutdown_hit(cr.right, x, y) {
+                    i @ 0..=4 => {
+                        SHUTDOWN_STATE.set((i as usize, hov));
+                        InvalidateRect(h, ptr::null(), 0);
+                    }
+                    10 => {
+                        DestroyWindow(h);
+                        run_power_action(sel);
+                    }
+                    11 => { DestroyWindow(h); }
+                    _ => {}
+                }
+                0
+            }
+            WM_KEYDOWN => {
+                let (sel, hov) = SHUTDOWN_STATE.get();
+                match wp as u16 {
+                    0x26 | 0x25 => {
+                        let ns = if sel == 0 { SHUTDOWN_OPTS.len() - 1 } else { sel - 1 };
+                        SHUTDOWN_STATE.set((ns, hov));
+                        InvalidateRect(h, ptr::null(), 0);
+                    }
+                    0x28 | 0x27 | 0x09 => {
+                        SHUTDOWN_STATE.set(((sel + 1) % SHUTDOWN_OPTS.len(), hov));
+                        InvalidateRect(h, ptr::null(), 0);
+                    }
+                    0x0D | 0x20 => {
+                        DestroyWindow(h);
+                        run_power_action(sel);
+                    }
+                    0x1B => { DestroyWindow(h); }
+                    _ => {}
+                }
+                0
+            }
+            WM_DPICHANGED => {
+                ui::set_scale_dpi((wp & 0xFFFF) as u32);
+                for f in std::mem::take(&mut *SHUTDOWN_FONTS.lock().unwrap()) {
+                    if f != 0 { DeleteObject(f as HGDIOBJ); }
+                }
+                *SHUTDOWN_FONTS.lock().unwrap() = [
+                    ui::font(20, 600, ui::ui_face()),
+                    ui::font(13, 400, ui::ui_face()),
+                    ui::font(12, 400, ui::ui_face()),
+                ];
+                let r = &*(lp as *const RECT);
+                SetWindowPos(h, ptr::null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                InvalidateRect(h, ptr::null(), 0);
                 0
             }
             WM_CLOSE => { DestroyWindow(h); 0 }
-            WM_DESTROY => { SHUTDOWN_HWND.store(0, Relaxed); 0 }
+            WM_DESTROY => {
+                for f in std::mem::take(&mut *SHUTDOWN_FONTS.lock().unwrap()) {
+                    if f != 0 { DeleteObject(f as HGDIOBJ); }
+                }
+                SHUTDOWN_HWND.store(0, Relaxed);
+                0
+            }
             _ => DefWindowProcW(h, m, wp, lp),
         }
     }
@@ -2316,17 +2635,32 @@ fn show_shutdown_dialog(_h: HWND) {
     unsafe {
         let inst = GetModuleHandleW(ptr::null());
         let cls = w("RxShutdownDlg");
-        let bg = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(ui::pal().bg);
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(shutdown_proc), hInstance: inst, lpszClassName: cls.as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), hbrBackground: bg, ..std::mem::zeroed() });
+        SHUTDOWN_REG.call_once(|| {
+            let bg = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(ui::pal().bg);
+            RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(shutdown_proc), hInstance: inst, lpszClassName: cls.as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), hbrBackground: bg, ..std::mem::zeroed() });
+        });
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-        let mut r = RECT { left: 0, top: 0, right: ui::sc(420), bottom: ui::sc(206) };
+        let wa = winrust_common::ui::work_area();
+        let mut r = RECT { left: 0, top: 0, right: ui::sc(420).min(wa.right - wa.left - ui::sc(16)), bottom: ui::sc(362).min(wa.bottom - wa.top - ui::sc(16)) };
         AdjustWindowRectEx(&mut r, style, 0, WS_EX_TOPMOST | WS_EX_DLGMODALFRAME);
         let (ww, wh) = (r.right - r.left, r.bottom - r.top);
-        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-        let dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, cls.as_ptr(), w("Shut Down Windows").as_ptr(), style | WS_VISIBLE, (sw - ww) / 2, (sh - wh) / 2, ww, wh, 0 as _, 0 as _, inst, ptr::null());
+        let x = wa.left + ((wa.right - wa.left - ww) / 2).max(0);
+        let y = wa.top + ((wa.bottom - wa.top - wh) / 2).max(0);
+        let dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, cls.as_ptr(), w("Shut Down Windows").as_ptr(), style | WS_VISIBLE, x, y, ww, wh, 0 as _, 0 as _, inst, ptr::null());
         if !dlg.is_null() {
+            use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
             SHUTDOWN_HWND.store(dlg as isize, Relaxed);
+            let fg = GetForegroundWindow();
+            let f_tid = if fg.is_null() { 0 } else { GetWindowThreadProcessId(fg, ptr::null_mut()) };
+            let m_tid = GetCurrentThreadId();
+            if f_tid != 0 && f_tid != m_tid {
+                AttachThreadInput(m_tid, f_tid, 1);
+            }
             SetForegroundWindow(dlg);
+            SetFocus(dlg);
+            if f_tid != 0 && f_tid != m_tid {
+                AttachThreadInput(m_tid, f_tid, 0);
+            }
         }
     }
 }
@@ -2356,7 +2690,8 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     SetWindowPos(h, 0 as _, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
                 }
                 let view = if desk() { LVS_ICON } else { LVS_REPORT };
-                let list = CreateWindowExW(0, w("SysListView32").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | view | if desk() { 0 } else { LVS_OWNERDATA } | LVS_EDITLABELS | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
+                let clip = if desk() { 0 } else { WS_CLIPCHILDREN };
+                let list = CreateWindowExW(0, w("SysListView32").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | clip | view | if desk() { 0 } else { LVS_OWNERDATA } | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
                 put(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize);
                 let mut fi: SHFILEINFOW = std::mem::zeroed();
                 let il = SHGetFileInfoW(w("C:\\").as_ptr(), 0, &mut fi, size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
@@ -2397,15 +2732,20 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     select_row(&name);
                     PENDING_PICK.set(Some(name));
                 }
-    if desk() {
-                    use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos};
-                    let mut dirs: Vec<PathBuf> = [&FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents, &FOLDERID_Pictures, &FOLDERID_Music, &FOLDERID_Videos].iter().filter_map(|id| sh::known_dir(id)).collect();
-                    dirs.extend(ui::pins());
-                    shellwin::register_resident(&dirs);
+                if desk() {
+                    PostMessageW(h, WM_RESIDENT, 0, 0);
                 } else {
                     shellwin::navigated(&cur_dir());
                     shellwin::register(h as isize);
                 }
+                0
+            }
+            WM_DPICHANGED if !desk() => { ui::on_dpi_changed(h, wp, lp); 0 }
+            WM_RESIDENT if desk() => {
+                use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos};
+                let mut dirs: Vec<PathBuf> = [&FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents, &FOLDERID_Pictures, &FOLDERID_Music, &FOLDERID_Videos].iter().filter_map(|id| sh::known_dir(id)).collect();
+                dirs.extend(ui::pins());
+                shellwin::register_resident(&dirs);
                 0
             }
             WM_SETTINGCHANGE | WM_DISPLAYCHANGE if desk() => {
@@ -2483,14 +2823,11 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     17 => sort_menu(h),
                     18 => more_menu(h),
                     10..=14 => {
-                        let (list, dir, paths) = selected();
+                        let (_list, dir, paths) = selected();
                         match wp {
                             10 | 11 if !paths.is_empty() => match real_paths(&paths) { Ok(p) => { if sh::clip_set(h, &p, wp == 10 && !in_zip()).is_ok() { sync_cut_visuals(); } } Err(e) => warn(h, &e) },
                             12 => paste(h, &dir),
-                            13 if !in_zip() => {
-                                let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
-                                if i >= 0 { SetFocus(list); put(list, LVM_EDITLABELW, i as usize, 0); }
-                            }
+                            13 if !in_zip() => begin_rename(h),
                             14 if !paths.is_empty() && !in_zip() => {
                                 let perm = GetKeyState(0x10 ) < 0;
                                 confirm_delete(h, &dir, &paths, perm);
@@ -2528,7 +2865,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 let nm = &*(lp as *const NMHDR);
                 let list = ST.with_borrow(|st| st.list);
                 match nm.code {
-                    NM_CUSTOMDRAW if nm.hwndFrom == list && !desk() => return ui::list_draw(lp),
+                    NM_CUSTOMDRAW if nm.hwndFrom == list => return if desk() { ui::desk_draw(lp) } else { ui::list_draw(lp) },
                     LVN_ITEMCHANGED | LVN_ODSTATECHANGED => ui::status_dirty(h),
                     LVN_ODFINDITEMW if nm.hwndFrom == list => {
                         let f = &*(lp as *const NMLVFINDITEMW);
@@ -2538,8 +2875,14 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         let q = String::from_utf16_lossy(std::slice::from_raw_parts(f.lvfi.psz, n)).to_lowercase();
                         return ST.with_borrow(|st| {
                             let len = st.rows.len();
-                            let start = usize::try_from(f.iStart).unwrap_or(0);
-                            (0..len).map(|k| (start + k) % len).find(|&i| !st.rows[i].hdr && st.rows[i].name.to_lowercase().starts_with(&q)).map_or(-1, |i| i as isize)
+                            if len == 0 { return -1; }
+                            let start = usize::try_from(f.iStart).unwrap_or(0) % len;
+                            (0..len).map(|k| (start + k) % len).find(|&i| {
+                                !st.rows[i].hdr && {
+                                    let mut rc = st.rows[i].name.chars().flat_map(char::to_lowercase);
+                                    q.chars().all(|qc| rc.next() == Some(qc))
+                                }
+                            }).map_or(-1, |i| i as isize)
                         });
                     }
                     LVN_GETDISPINFOW => {
@@ -2551,9 +2894,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             let Some(r) = rows.get_mut(i) else { return };
                             if it.mask & LVIF_TEXT != 0 && it.cchTextMax > 0 {
                                 let s = if r.hdr { if it.iSubItem == 0 { r.name[1..].to_string() } else { String::new() } } else { match it.iSubItem { 0 => shown_name(&r.name, desk()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) } };
-                                let u: Vec<u16> = s.encode_utf16().take(it.cchTextMax as usize - 1).collect();
-                                ptr::copy_nonoverlapping(u.as_ptr(), it.pszText, u.len());
-                                *it.pszText.add(u.len()) = 0;
+                                let max_c = it.cchTextMax as usize - 1;
+                                let mut n = 0usize;
+                                for u in s.encode_utf16().take(max_c) {
+                                    *it.pszText.add(n) = u;
+                                    n += 1;
+                                }
+                                *it.pszText.add(n) = 0;
                             }
                             if r.hdr { if it.mask & LVIF_IMAGE != 0 { it.iImage = I_IMAGENONE; } return; }
                             if it.mask & LVIF_IMAGE != 0 && *thumbs {
@@ -2573,7 +2920,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).filter(|r| !r.hdr).map(|r| (r.name.clone(), st.dir.join(&r.name), r.dir)));
                         if let Some((name, p, is_dir)) = hit {
                             if name == THIS_PC_KEY {
-                                if let Ok(me) = env::current_exe() { let _ = std::process::Command::new(me).spawn(); }
+                                if let Ok(me) = env::current_exe() { spawn_gui(&mut std::process::Command::new(me)); }
                             } else if name == RECYCLE_BIN_KEY {
                                 ShellExecuteW(h, w("explore").as_ptr(), w("shell:RecycleBinFolder").as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL);
                             } else {
@@ -2619,16 +2966,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
                         let shift = GetKeyState(0x10 ) < 0;
                         if desk() && matches!(vk, 0x08 | 0x46 | 0x4D | 0x54 | 0x57 | 0x09 | 0x4C | 0x72 | 0x73 | 0x52) { return 0; }
-                        let (list, dir, paths) = selected();
+                        let (_list, dir, paths) = selected();
                         match vk {
                             0x08 => if let Some(p) = dir.parent() { load(h, p.to_path_buf()) },
                             0x1B if jobs::busy() => { jobs::cancel(); return 0; }
                             0x2E if !paths.is_empty() && !in_zip() => confirm_delete(h, &dir, &paths, shift),
                             0x20 if !desk() => if let Some(p) = paths.first().filter(|p| p.is_file()) { activate(h, p.clone(), false); },
-                            0x71 if !in_zip() => {
-                                let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
-                                if i >= 0 { put(list, LVM_EDITLABELW, i as usize, 0); }
-                            }
+                            0x71 if !in_zip() => { begin_rename(h); return 0; }
                             0x46 if ctrl => { search_focus(); return 0; }
                             0x72 => { search_focus(); return 0; }
                             0x52 if ctrl => {}
@@ -2679,40 +3023,6 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             _ => return 0,
                         }
                         reload(h);
-                    }
-                    LVN_BEGINLABELEDITW => {
-                        let hdr = ST.with_borrow(|st| usize::try_from((*(lp as *const NMLVDISPINFOW)).item.iItem).ok().and_then(|i| st.rows.get(i)).is_some_and(|r| r.hdr));
-                        if hdr { return 1; }
-                        let e = SendMessageW(ST.with_borrow(|st| st.list), LVM_GETEDITCONTROL, 0, 0) as HWND;
-                        if e != 0 as HWND { LABEL_OLD.store(SetWindowLongPtrW(e, GWLP_WNDPROC, label_proc as *const () as isize), std::sync::atomic::Ordering::Relaxed); }
-                    }
-                    LVN_ENDLABELEDITW => {
-                        let it = &(*(lp as *const NMLVDISPINFOW)).item;
-                        if !it.pszText.is_null() {
-                            let new = wstr(it.pszText);
-                            if !new.is_empty() && !new.contains(['\\', '/', ':']) {
-                                ST.with_borrow(|st| if let Some(r) = usize::try_from(it.iItem).ok().and_then(|i| st.rows.get(i)) {
-                                    let old_p = st.dir.join(&r.name);
-                                    let target_name = if desk() {
-                                        let low = r.name.to_lowercase();
-                                        if (low.ends_with(".lnk") || low.ends_with(".url")) && !new.to_lowercase().ends_with(&low[low.len() - 4..]) {
-                                            format!("{new}{}", &r.name[r.name.len() - 4..])
-                                        } else {
-                                            new
-                                        }
-                                    } else {
-                                        new
-                                    };
-                                    if let Some(parent) = old_p.parent() {
-                                        let new_p = parent.join(target_name);
-                                        if fs::rename(&old_p, &new_p).is_ok() {
-                                            UNDO.with_borrow_mut(|u| u.push(UndoOp::Rename { from: old_p, to: new_p }));
-                                        }
-                                    }
-                                });
-                                PostMessageW(h, WM_APP, 0, 0);
-                            }
-                        }
                     }
                     _ => {}
                 }
@@ -2824,7 +3134,6 @@ fn main() {
         ui::init_scale();
         winrust_common::ui::ensure_fluent_icons();
         ui::gdiplus_start();
-        ui::dark_mode();
         InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES });
         let inst = GetModuleHandleW(ptr::null());
         let cls = w("RustExplorer");

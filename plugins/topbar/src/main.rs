@@ -26,6 +26,16 @@ mod lang;
 mod settings;
 mod thumbs;
 use {tray::*, status::*, run::*, shot::*, lang::*, settings::*};
+
+pub(crate) unsafe fn own_foreground() -> bool {
+    let fg = GetForegroundWindow();
+    if fg.is_null() {
+        return false;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(fg, &mut pid);
+    pid == std::process::id()
+}
 use windows::{
     Win32::{
         Media::Audio::{Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender},
@@ -182,9 +192,15 @@ fn bump(path: &str) {
 }
 fn bump_name(name: &str) {
     let name = name.to_lowercase();
-    uses(&name);
     let mut g = USAGE.lock().unwrap();
-    let m = g.as_mut().unwrap();
+    let m = g.get_or_insert_with(|| {
+        std::fs::read_to_string(appdata_file("topbar-usage.txt"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.rsplit_once('\t'))
+            .filter_map(|(k, n)| Some((k.to_string(), n.parse().ok()?)))
+            .collect()
+    });
     *m.entry(name).or_insert(0) += 1;
     let _ = std::fs::write(appdata_file("topbar-usage.txt"), m.iter().map(|(k, n)| format!("{k}\t{n}\n")).collect::<String>());
 }
@@ -275,7 +291,7 @@ unsafe fn paint_trayfly(hwnd: HWND, wdc: HDC, w: i32, h: i32) {
     let sop = i18n::style::start_opacity();
     let ulw = sop < 100;
     let bg_a = if ulw { ((255 * sop as u32) / 100).max(1) as u8 } else { 255 };
-    let (dc, _, _) = TF_BUF.with_borrow_mut(|b| b.begin(wdc, w, h, bg_a));
+    let (dc, _, _) = TF_BUF.with_borrow_mut(|b| b.begin(wdc, w, h));
     let rad = rr(16);
     fill_argb(dc, r, pal().bg, bg_a, rad);
     let (cols, _, _) = fly_size();
@@ -307,22 +323,34 @@ unsafe fn paint_trayfly(hwnd: HWND, wdc: HDC, w: i32, h: i32) {
     LayeredBuf::present(hwnd, w, h, dc);
 }
 
+unsafe fn trayfly_pos(fw: i32, fh: i32) -> (i32, i32) {
+    let scr = GetSystemMetrics(SM_CXSCREEN);
+    let (bx, bw) = bar_x_w();
+    let cx = bx + layout(if vert() { axis_len() } else { bw }).apps.0 + sc(12);
+    if vert() {
+        (side_x(fw), (cx - fh / 2).clamp(sc(12), GetSystemMetrics(SM_CYSCREEN) - fh - sc(12)))
+    } else {
+        ((cx - fw / 2).clamp(sc(12), scr - fw - sc(12)), pop_y(fh))
+    }
+}
+
+unsafe fn hide_trayfly(w: HWND) {
+    hide_tip(BAR.load(Relaxed) as HWND);
+    ShowWindow(w, SW_HIDE);
+    let bar = BAR.load(Relaxed) as HWND;
+    if !bar.is_null() {
+        InvalidateRect(bar, null(), 0);
+    }
+}
+
 pub(crate) unsafe fn sync_trayfly() {
     let w = TRAYFLY.get();
     if !w.is_null() && IsWindowVisible(w) != 0 {
         if over_idx().is_empty() {
-            hide_tip(BAR.load(Relaxed) as HWND);
-            ShowWindow(w, SW_HIDE);
+            hide_trayfly(w);
         } else {
             let (_, fw, fh) = fly_size();
-            let scr = GetSystemMetrics(SM_CXSCREEN);
-            let (bx, bw) = bar_x_w();
-            let cx = bx + layout(if vert() { axis_len() } else { bw }).apps.0 + sc(12);
-            let (x, y) = if vert() {
-                (side_x(fw), (cx - fh / 2).clamp(sc(12), GetSystemMetrics(SM_CYSCREEN) - fh - sc(12)))
-            } else {
-                ((cx - fw / 2).clamp(sc(12), scr - fw - sc(12)), pop_y(fh))
-            };
+            let (x, y) = trayfly_pos(fw, fh);
             SetWindowPos(w, HWND_TOPMOST, x, y, fw, fh, SWP_NOACTIVATE);
             let sdc = GetDC(null_mut());
             paint_trayfly(w, sdc, fw, fh);
@@ -338,23 +366,18 @@ pub(crate) unsafe fn sync_trayfly() {
 unsafe fn fly_toggle() {
     let w = TRAYFLY.get();
     if IsWindowVisible(w) != 0 {
-        hide_tip(BAR.load(Relaxed) as HWND);
-        ShowWindow(w, SW_HIDE);
-        InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0);
+        hide_trayfly(w);
         return;
     }
     let (_, fw, fh) = fly_size();
     FHOT.set(-1);
-    let scr = GetSystemMetrics(SM_CXSCREEN);
-    let (bx, bw) = bar_x_w();
-    let cx = bx + layout(if vert() { axis_len() } else { bw }).apps.0 + sc(12);
-    let (x, y) = if vert() { (side_x(fw), (cx - fh / 2).clamp(sc(12), GetSystemMetrics(SM_CYSCREEN) - fh - sc(12))) } else { ((cx - fw / 2).clamp(sc(12), scr - fw - sc(12)), pop_y(fh)) };
+    let (x, y) = trayfly_pos(fw, fh);
     SetWindowPos(w, HWND_TOPMOST, x, y, fw, fh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     let sdc = GetDC(null_mut());
     paint_trayfly(w, sdc, fw, fh);
     ReleaseDC(null_mut(), sdc);
     InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0);
-    SetForegroundWindow(w);
+    force_fg(w);
 }
 
 unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -422,43 +445,39 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         TRAY_KEEP.set(true);
                         SetTimer(hwnd, 2, 120, None);
                     }
+                    REVEAL_UNTIL.set(now_ms() + 600);
                     tray_click(t, msg == WM_LBUTTONDOWN);
                     if msg == WM_LBUTTONDOWN {
                         TRAY_KEEP.set(false);
-                        ShowWindow(hwnd, SW_HIDE);
-                        InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0);
+                        hide_trayfly(hwnd);
                     }
                 }
             }
             0
         }
         WM_ACTIVATE if wp & 0xffff == 0 => {
-            hide_tip(BAR.load(Relaxed) as HWND);
             if !TRAY_KEEP.get() {
-                ShowWindow(hwnd, SW_HIDE);
-                InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0);
+                hide_trayfly(hwnd);
+            } else {
+                hide_tip(BAR.load(Relaxed) as HWND);
             }
             0
         }
         WM_TIMER if wp == 2 => {
-            let ldown = GetAsyncKeyState(VK_LBUTTON as i32) < 0;
             let esc = GetAsyncKeyState(VK_ESCAPE as i32) < 0;
-            if esc {
-                TRAY_KEEP.set(false);
-                KillTimer(hwnd, 2);
-                ShowWindow(hwnd, SW_HIDE);
-                InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0);
-            } else if ldown {
+            let outside = if GetAsyncKeyState(VK_LBUTTON as i32) < 0 {
                 let mut pt: POINT = zeroed();
                 let mut r: RECT = zeroed();
                 GetCursorPos(&mut pt);
                 GetWindowRect(hwnd, &mut r);
-                if pt.x < r.left || pt.x >= r.right || pt.y < r.top || pt.y >= r.bottom {
-                    TRAY_KEEP.set(false);
-                    KillTimer(hwnd, 2);
-                    ShowWindow(hwnd, SW_HIDE);
-                    InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0);
-                }
+                pt.x < r.left || pt.x >= r.right || pt.y < r.top || pt.y >= r.bottom
+            } else {
+                false
+            };
+            if esc || outside {
+                TRAY_KEEP.set(false);
+                KillTimer(hwnd, 2);
+                hide_trayfly(hwnd);
             }
             0
         }
@@ -494,7 +513,7 @@ unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         thread_local! {
             static TIP_BUF: RefCell<LayeredBuf> = const { RefCell::new(LayeredBuf::new()) };
         }
-        let (dc, _, _) = TIP_BUF.with_borrow_mut(|b| b.begin(wdc, r.right, r.bottom, 255));
+        let (dc, _, _) = TIP_BUF.with_borrow_mut(|b| b.begin(wdc, r.right, r.bottom));
         let rad = rr(8);
         fill(dc, r, pal().bg, rad);
         stroke_round(dc, r, pal().line, 255, rad, 1.0);
@@ -722,7 +741,7 @@ unsafe fn set_state(hwnd: HWND, state: usize) {
 }
 
 unsafe fn hide_taskbar() {
-    set_state(tray()[0], ABS_AUTOHIDE as usize);
+    set_state(find_other("Shell_TrayWnd"), ABS_AUTOHIDE as usize);
     for t in foreign_taskbar_windows() {
         ShowWindow(t, SW_HIDE);
     }
@@ -744,7 +763,7 @@ unsafe fn remember_taskbar_state() -> usize {
     if let Some(s) = saved_taskbar_state() {
         return s;
     }
-    let tb = tray()[0];
+    let tb = find_other("Shell_TrayWnd");
     if tb.is_null() {
         return ABS_ALWAYSONTOP as usize;
     }
@@ -757,7 +776,7 @@ unsafe fn remember_taskbar_state() -> usize {
 }
 
 unsafe fn show_taskbar(state: usize) {
-    set_state(tray()[0], state);
+    set_state(find_other("Shell_TrayWnd"), state);
     for t in foreign_taskbar_windows() {
         ShowWindow(t, SW_SHOWNA);
     }
@@ -901,20 +920,33 @@ unsafe fn resolve_cmd(s: &str) -> String {
 }
 
 fn expand_env(s: &str) -> String {
-    let parts: Vec<&str> = s.split('%').collect();
-    let mut out = String::new();
-    for (i, p) in parts.iter().enumerate() {
-        match std::env::var(p) {
-            Ok(v) if i % 2 == 1 && i + 1 < parts.len() => out.push_str(&v),
-            _ if i % 2 == 1 && i + 1 < parts.len() => out.push_str(&format!("%{p}%")),
-            _ if i % 2 == 1 => out.push_str(&format!("%{p}")),
-            _ => out.push_str(p),
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(a) = rest.find('%') {
+        out.push_str(&rest[..a]);
+        let after = &rest[a + 1..];
+        if let Some(b) = after.find('%') {
+            let var = &after[..b];
+            match std::env::var(var) {
+                Ok(v) => out.push_str(&v),
+                Err(_) => {
+                    out.push('%');
+                    out.push_str(var);
+                    out.push('%');
+                }
+            }
+            rest = &after[b + 1..];
+        } else {
+            out.push('%');
+            rest = after;
+            break;
         }
     }
+    out.push_str(rest);
     out
 }
 
-unsafe fn lnk_target(lnk: &[u16]) -> String {
+pub(crate) unsafe fn lnk_target(lnk: &[u16]) -> String {
     (|| -> Option<String> {
         let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
         sl.cast::<IPersistFile>().ok()?.Load(PCWSTR(lnk.as_ptr()), STGM(0)).ok()?;
@@ -1022,42 +1054,50 @@ pub(crate) unsafe fn aumid_icon(aumid: &str, px: i32) -> HICON {
     item_icon(&id, px)
 }
 
-unsafe fn win_icon_with_aumid(w: HWND, aumid: &str) -> HICON {
+unsafe fn cache_icon(key: String, make: impl FnOnce() -> HICON) -> HICON {
+    if let Some(ic) = EXE_ICONS.with_borrow(|m| m.get(&key).copied()) {
+        return ic;
+    }
+    let ic = make();
+    if !ic.is_null() {
+        EXE_ICONS.with_borrow_mut(|m| { m.insert(key, ic); });
+    }
+    ic
+}
+
+unsafe fn win_icon_with_aumid(w: HWND, aumid: &str) -> (HICON, bool) {
     let exe = exe_of(w);
     if exe.ends_with("applicationframehost.exe") {
         let ic = store_icon(w);
         if !ic.is_null() {
-            return ic;
+            return (ic, false);
         }
     }
     let own = window_own_icon(w);
     if !own.is_null() {
-        return own;
+        return (own, false);
     }
     if !aumid.is_empty() {
-        let key = format!("aumid:{aumid}");
-        let ic = EXE_ICONS.with_borrow_mut(|m| *m.entry(key).or_insert_with(|| aumid_icon(aumid, icon_px())));
+        let ic = cache_icon(format!("aumid:{aumid}"), || aumid_icon(aumid, icon_px()));
         if !ic.is_null() {
-            return ic;
+            return (ic, false);
         }
     }
     if !exe.is_empty() && !is_host(&exe) {
-        let ic = EXE_ICONS.with_borrow_mut(|m| {
-            *m.entry(exe.clone()).or_insert_with(|| {
-                let s = item_icon(&exe, icon_px());
-                if !s.is_null() {
-                    return s;
-                }
-                let mut big: HICON = null_mut();
-                ExtractIconExW(wide(&exe).as_ptr(), 0, &mut big, null_mut(), 1);
-                big
-            })
+        let ic = cache_icon(exe.clone(), || {
+            let s = item_icon(&exe, icon_px());
+            if !s.is_null() {
+                return s;
+            }
+            let mut big: HICON = null_mut();
+            ExtractIconExW(wide(&exe).as_ptr(), 0, &mut big, null_mut(), 1);
+            big
         });
         if !ic.is_null() {
-            return ic;
+            return (ic, false);
         }
     }
-    LoadIconW(null_mut(), IDI_APPLICATION)
+    (LoadIconW(null_mut(), IDI_APPLICATION), true)
 }
 
 fn is_host(exe: &str) -> bool {
@@ -1085,15 +1125,19 @@ unsafe fn store_icon(frame: HWND) -> HICON {
         return null_mut();
     }
     let id = format!(r"shell:AppsFolder\{}", wstr_of(&buf));
-    EXE_ICONS.with_borrow_mut(|m| *m.entry(id.clone()).or_insert_with(|| item_icon(&id, icon_px())))
+    cache_icon(id.clone(), || item_icon(&id, icon_px()))
 }
 
 fn msix_family(target: &str) -> Option<(String, String)> {
     let l = target.to_lowercase();
     let (_, tail) = l.split_once(r"\windowsapps\")?;
     let (folder, rest) = tail.split_once('\\')?;
-    let parts: Vec<&str> = folder.split('_').collect();
-    (parts.len() == 5).then(|| (format!("{}_{}", parts[0], parts[4]), rest.to_string()))
+    let mut it = folder.split('_');
+    let (p0, _, _, _, p4) = (it.next()?, it.next()?, it.next()?, it.next()?, it.next()?);
+    if it.next().is_some() {
+        return None;
+    }
+    Some((format!("{p0}_{p4}"), rest.to_string()))
 }
 
 unsafe fn fix_msix_pin(lnk: &[u16], target: &str) -> Option<String> {
@@ -1292,7 +1336,11 @@ fn refresh_buttons() {
     let mut keys: Vec<String> = vec![String::new(); btns.len()];
     ORDER.with_borrow_mut(|o| {
         o.retain(|w| loose.contains(w));
-        o.extend(loose.iter().filter(|w| !o.contains(w)).copied().collect::<Vec<_>>());
+        for &w in &loose {
+            if !o.contains(&w) {
+                o.push(w);
+            }
+        }
         for &w in o.iter() {
             let exe = unsafe { exe_of(w) };
             let (aumid, icon) = unsafe { win_meta(w) };
@@ -1311,26 +1359,32 @@ fn refresh_buttons() {
 }
 
 thread_local! {
-    static META: RefCell<HashMap<usize, (u32, u64, String, HICON)>> = RefCell::new(HashMap::new());
+    static META: RefCell<HashMap<usize, (u32, u64, String, HICON, bool)>> = RefCell::new(HashMap::new());
 }
-const META_TTL: u64 = 4000;
+const META_RETRY_MS: u64 = 500;
 
 unsafe fn win_meta(w: HWND) -> (String, HICON) {
     let mut pid = 0u32;
     GetWindowThreadProcessId(w, &mut pid);
     let now = now_ms();
-    if let Some(v) = META.with_borrow(|m| m.get(&(w as usize)).filter(|e| e.0 == pid && now.saturating_sub(e.1) < META_TTL).map(|e| (e.2.clone(), e.3))) {
-        return v;
+    if let Some((aumid, ic, fallback, t)) = META.with_borrow(|m| m.get(&(w as usize)).filter(|e| e.0 == pid).map(|e| (e.2.clone(), e.3, e.4, e.1))) {
+        if !fallback || now.saturating_sub(t) < META_RETRY_MS {
+            return (aumid, ic);
+        }
+        let (new_ic, new_fb) = win_icon_with_aumid(w, &aumid);
+        let (keep_ic, keep_fb) = if !new_fb && !new_ic.is_null() { (new_ic, false) } else { (ic, fallback) };
+        META.with_borrow_mut(|m| { m.insert(w as usize, (pid, now, aumid.clone(), keep_ic, keep_fb)); });
+        return (aumid, keep_ic);
     }
     let aumid = win_aumid(w);
-    let v = (aumid.clone(), win_icon_with_aumid(w, &aumid));
+    let (ic, fb) = win_icon_with_aumid(w, &aumid);
     META.with_borrow_mut(|m| {
-        if m.len() > 512 {
-            m.clear();
+        if m.len() > 256 {
+            m.retain(|&hw, _| IsWindow(hw as HWND) != 0);
         }
-        m.insert(w as usize, (pid, now, v.0.clone(), v.1));
+        m.insert(w as usize, (pid, now, aumid.clone(), ic, fb));
     });
-    v
+    (aumid, ic)
 }
 
 unsafe fn hide_stub(w: HWND) {
@@ -1381,7 +1435,7 @@ fn refresh_status() {
             place(BAR.load(Relaxed) as HWND);
             announce();
         }
-        if TAPPS.with_borrow(|t| t.is_empty()) && n % 4 == 2 {
+        if n < 16 && n % 4 == 2 && TAPPS.with_borrow(|t| t.is_empty()) {
             announce();
         }
         if n % 3 == 0 {
@@ -1417,13 +1471,13 @@ fn layout(w: i32) -> Layout {
     let tray_step = sc(if small { 20 } else { 24 });
     let apps_r = sys.0 - sc(4);
     let apps = (apps_r - tray_step * tray_count() as i32, apps_r);
-    let margin = (w - apps.0) + sc(8);
-    let n = BTNS.with_borrow(|b| b.len()) as i32;
-    let bw = (((w - 2 * margin + gap) / n.max(1)) - gap).clamp(sc(16), sc(40 + [-10, 0, 8][i18n::style::bar_size() as usize % 3]));
-    let fixed = (PINS.with_borrow(|p| p.len()) as i32 + 1).min(n);
-    let right_limit = w - margin - (n * (bw + gap) - gap);
-    let centered = (w - (fixed * (bw + gap) - gap)) / 2;
     let left_pad = if vert() { sc(GEAR_X.0 + GEAR_X.1 + 6) } else { sc(8) };
+    let avail = (apps.0 - sc(8) - left_pad).max(sc(16));
+    let n = BTNS.with_borrow(|b| b.len()) as i32;
+    let bw = (((avail + gap) / n.max(1)) - gap).clamp(sc(16), sc(40 + [-10, 0, 8][i18n::style::bar_size() as usize % 3]));
+    let total_w = n * (bw + gap) - gap;
+    let right_limit = (apps.0 - sc(8) - total_w).max(left_pad);
+    let centered = (w - total_w) / 2;
     let x0 = if i18n::style::align_left() { left_pad } else { centered }.min(right_limit).max(left_pad);
     Layout { x0, bw, gap, apps, sys, clock }
 }
@@ -1483,10 +1537,6 @@ unsafe fn now_ms() -> u64 {
     GetTickCount64()
 }
 
-unsafe fn hv(_key: i32, on: bool) -> f32 {
-    if on { 1.0 } else { 0.0 }
-}
-
 unsafe fn glow(dc: HDC, on: bool, r: RECT, to: u32, rad: i32) {
     if on {
         fill(dc, r, to, rad);
@@ -1511,14 +1561,27 @@ unsafe fn bar_step(hwnd: HWND) {
     }
 }
 
+unsafe fn trayfly_open() -> bool {
+    let w = TRAYFLY.get();
+    !w.is_null() && IsWindowVisible(w) != 0
+}
+
 unsafe fn fullscreen_now(bar: HWND) -> bool {
+    if fly::any_open() || trayfly_open() || now_ms() < REVEAL_UNTIL.get() {
+        return false;
+    }
     let fg = GetForegroundWindow();
     if fg.is_null() || fg == bar || IsWindowVisible(fg) == 0 || IsIconic(fg) != 0 {
         return false;
     }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(fg, &mut pid);
+    if pid == std::process::id() {
+        return false;
+    }
     let mut cls = [0u16; 64];
     let n = GetClassNameW(fg, cls.as_mut_ptr(), 64).max(0) as usize;
-    if ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "RustExplorer"].iter().any(|s| eq_ascii(&cls[..n], s)) {
+    if ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "RustExplorer", "#32768"].iter().any(|s| eq_ascii(&cls[..n], s)) {
         return false;
     }
     let mut r: RECT = zeroed();
@@ -1543,6 +1606,9 @@ unsafe fn desktop_now() -> bool {
 }
 
 unsafe fn fs_update(hwnd: HWND) {
+    if UI_GUARD.get() {
+        return;
+    }
     let fs = fullscreen_now(hwnd);
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
@@ -1552,7 +1618,7 @@ unsafe fn fs_update(hwnd: HWND) {
     let over = if vert() {
         if i18n::style::side() == i18n::style::Side::Left { pt.x <= 0 || (pt.x < bar_h() && BAR_P.get() > 0.0) } else { pt.x >= sw - 1 || (pt.x >= sw - bar_h() && BAR_P.get() > 0.0) }
     } else if at_top() { pt.y <= 0 || (pt.y < bar_h() && BAR_P.get() > 0.0) } else { pt.y >= sh - 1 || (pt.y >= sh - bar_h() - dock_gap() && BAR_P.get() > 0.0) };
-    if fs || !(i18n::style::autohide() || desktop_now() || dock_covered()) || fly::any_open() || over {
+    if fs || !(i18n::style::autohide() || desktop_now() || dock_covered()) || fly::any_open() || trayfly_open() || over {
         DESK_T.set(now);
     }
     let desk = !fs && now.saturating_sub(DESK_T.get()) >= 2000;
@@ -1561,7 +1627,7 @@ unsafe fn fs_update(hwnd: HWND) {
     }
     if FULLSCREEN.swap(fs, Relaxed) != fs {
         if fs {
-            fly::close_now();
+            fly::close();
             hide_tip(hwnd);
             thumbs::hide_preview();
         }
@@ -1579,6 +1645,8 @@ unsafe fn fs_update(hwnd: HWND) {
 
 thread_local! {
     static FS_POLL: Cell<bool> = const { Cell::new(true) };
+    static UI_GUARD: Cell<bool> = const { Cell::new(false) };
+    static REVEAL_UNTIL: Cell<u64> = const { Cell::new(0) };
 }
 
 unsafe fn dock_covered() -> bool {
@@ -1782,11 +1850,6 @@ pub(crate) unsafe fn stroke_round(dc: HDC, r: RECT, c: u32, a: u8, rad: i32, wid
     if owned {
         GdipDeleteGraphics(g);
     }
-}
-
-pub(crate) unsafe fn sel_font(dc: HDC, fonts: &[HFONT; 4], idx: usize) {
-    CUR_FONT.set(idx);
-    SelectObject(dc, fonts[idx]);
 }
 
 pub(crate) unsafe fn draw_icon(dc: HDC, x: i32, y: i32, sz: i32, ic: HICON) {
@@ -2027,18 +2090,20 @@ unsafe fn icon_of(h: HWND) -> HICON {
     }
     let aumid = win_aumid(h);
     if !aumid.is_empty() {
-        let key = format!("aumid:{aumid}");
-        let ic = EXE_ICONS.with_borrow_mut(|m| *m.entry(key).or_insert_with(|| aumid_icon(&aumid, icon_px())));
+        let ic = cache_icon(format!("aumid:{aumid}"), || aumid_icon(&aumid, icon_px()));
         if !ic.is_null() {
             return ic;
         }
     }
     let exe = exe_of(h);
-    if !exe.is_empty() {
-        let mut big: HICON = null_mut();
-        ExtractIconExW(wide(&exe).as_ptr(), 0, &mut big, null_mut(), 1);
-        if !big.is_null() {
-            return big;
+    if !exe.is_empty() && !is_host(&exe) {
+        let ic = cache_icon(exe.clone(), || {
+            let mut big: HICON = null_mut();
+            ExtractIconExW(wide(&exe).as_ptr(), 0, &mut big, null_mut(), 1);
+            big
+        });
+        if !ic.is_null() {
+            return ic;
         }
     }
     null_mut()
@@ -2165,7 +2230,7 @@ unsafe fn draw_battery(dc: HDC, x: i32, by: i32, bw: i32, bh: i32, pct: i32, ac:
 }
 
 unsafe fn paint_vert(dc: HDC, cr: RECT, fonts: [HFONT; 4]) {
-    let [_f_txt, _f_small, f_glyph, _f_bold] = fonts;
+    let [_f_txt, _f_small, _f_glyph, _f_bold] = fonts;
     let l = layout(cr.bottom);
     let fg = GetForegroundWindow();
     let (lft, rgt) = (sc(6), cr.right - sc(6));
@@ -2178,7 +2243,7 @@ unsafe fn paint_vert(dc: HDC, cr: RECT, fonts: [HFONT; 4]) {
 
     let gr = cell(sc(GEAR_X.0), sc(GEAR_X.1));
     glow(dc, hot == GEAR, gr, pal().hover, sc(8));
-    sel_font(dc, &fonts, 2);
+    SelectObject(dc, fonts[2]);
     text(dc, "\u{E713}", gr, if hot == GEAR { pal().text } else { dim }, DT_CENTER);
 
     BTNS.with_borrow(|btns| {
@@ -2224,7 +2289,7 @@ unsafe fn paint_vert(dc: HDC, cr: RECT, fonts: [HFONT; 4]) {
     let open_tf = IsWindowVisible(TRAYFLY.get()) != 0;
     let turn = if open_tf { 1.0 } else { 0.0 };
     chevron(dc, cx, l.apps.0 + sc(12), sc(5), if left { 90.0 } else { 270.0 } + 180.0 * turn, if open_tf { pal().accent } else { pal().text });
-    sel_font(dc, &fonts, 0);
+    SelectObject(dc, fonts[0]);
     let bar = bar_idx();
     TAPPS.with_borrow(|t| {
         for (k, &ix) in bar.iter().enumerate() {
@@ -2238,7 +2303,7 @@ unsafe fn paint_vert(dc: HDC, cr: RECT, fonts: [HFONT; 4]) {
     let grp = cell(l.sys.0, l.sys.1 - l.sys.0);
     let sys_hot = matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick);
     glow(dc, sys_hot, grp, pal().hover, sc(8));
-    net_icon(dc, cx, l.sys.0 + sc(16), sc(17), f_glyph);
+    net_icon(dc, cx, l.sys.0 + sc(16), sc(17));
     let (vol, muted) = VOL.get();
     volume_glyph(dc, cx, l.sys.0 + sc(48), sc(16), vol, muted, if muted { BAD } else { pal().text });
     let (pct, ac) = BAT.get();
@@ -2246,7 +2311,7 @@ unsafe fn paint_vert(dc: HDC, cr: RECT, fonts: [HFONT; 4]) {
         let (bw, bh) = (sc(22), sc(11));
         let (bx, by) = (cx - bw / 2 - sc(1), l.sys.0 + sc(69));
         draw_battery(dc, bx, by, bw, bh, pct, ac, if sys_hot { pal().hover } else { pal().bg }, 2);
-        sel_font(dc, &fonts, 1);
+        SelectObject(dc, fonts[1]);
         text(dc, &format!("{pct}%"), cell(l.sys.0 + sc(84), sc(18)), pal().text, DT_CENTER);
     }
 
@@ -2254,9 +2319,9 @@ unsafe fn paint_vert(dc: HDC, cr: RECT, fonts: [HFONT; 4]) {
     glow(dc, hot == CLOCK || fly::is_open(fly::Kind::Cal), cb, pal().hover, sc(8));
     let (tm, dt) = clock_texts();
     let mid = (cb.top + cb.bottom) / 2;
-    sel_font(dc, &fonts, 3);
+    SelectObject(dc, fonts[3]);
     text(dc, &tm, RECT { left: 0, top: cb.top, right: cr.right, bottom: mid + sc(1) }, pal().text, DT_CENTER);
-    sel_font(dc, &fonts, 1);
+    SelectObject(dc, fonts[1]);
     text(dc, &dt, RECT { left: 0, top: mid - sc(1), right: cr.right, bottom: cb.bottom }, mix(pal().dim, pal().text, 0.35), DT_CENTER);
 }
 
@@ -2267,8 +2332,6 @@ thread_local! {
     static FONTS: Cell<([HFONT; 4], u64)> = const { Cell::new(([null_mut(); 4], 0)) };
     pub(crate) static FRAME_G: Cell<*mut GpGraphics> = const { Cell::new(null_mut()) };
     pub(crate) static FRAME_BITS: Cell<(*mut u32, i32, i32)> = const { Cell::new((null_mut(), 0, 0)) };
-    pub(crate) static FRAME_MIN_A: Cell<u8> = const { Cell::new(255) };
-    pub(crate) static CUR_FONT: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(crate) struct LayeredBuf {
@@ -2286,7 +2349,7 @@ impl LayeredBuf {
         Self { dc: null_mut(), bmp: null_mut(), bits: null_mut(), gp_bmp: null_mut(), gp_g: null_mut(), w: 0, h: 0 }
     }
 
-    pub unsafe fn begin(&mut self, wdc: HDC, w: i32, h: i32, min_a: u8) -> (HDC, *mut u32, *mut GpGraphics) {
+    pub unsafe fn begin(&mut self, wdc: HDC, w: i32, h: i32) -> (HDC, *mut u32, *mut GpGraphics) {
         if self.dc.is_null() {
             self.dc = CreateCompatibleDC(wdc);
         }
@@ -2320,7 +2383,6 @@ impl LayeredBuf {
         } else {
             FRAME_BITS.set((null_mut(), 0, 0));
         }
-        FRAME_MIN_A.set(min_a);
         FRAME_G.set(self.gp_g);
         (self.dc, self.bits as *mut u32, self.gp_g)
     }
@@ -2331,7 +2393,6 @@ impl LayeredBuf {
             GdipResetClip(fg);
         }
         FRAME_BITS.set((null_mut(), 0, 0));
-        FRAME_MIN_A.set(255);
         GdiFlush();
         let mut wr: RECT = zeroed();
         GetWindowRect(hwnd, &mut wr);
@@ -2361,11 +2422,12 @@ unsafe fn bg_layer(wdc: HDC, cr: RECT) -> HDC {
     if dc.is_null() {
         dc = CreateCompatibleDC(wdc);
     }
+    let new_bmp = CreateCompatibleBitmap(wdc, cr.right, h);
+    let prev = SelectObject(dc, new_bmp);
     if !bmp.is_null() {
-        DeleteObject(bmp);
+        DeleteObject(prev);
     }
-    bmp = CreateCompatibleBitmap(wdc, cr.right, h);
-    SelectObject(dc, bmp);
+    bmp = new_bmp;
     BG.set((dc, bmp, key));
     fill(dc, cr, pal().bg, 0);
     winrust_common::style::backdrop(dc, cr, sc(100) as f32 / 100.0);
@@ -2458,7 +2520,6 @@ unsafe fn paint(hwnd: HWND) {
         } else {
             GdipResetClip(fg_g);
         }
-        FRAME_MIN_A.set(bg_a as u8);
         FRAME_G.set(fg_g);
         if is_dock {
             fill_argb(dc, cr, pal().bg, bg_a as u8, h);
@@ -2470,8 +2531,7 @@ unsafe fn paint(hwnd: HWND) {
     }
     SetBkMode(dc, TRANSPARENT as i32);
     let fonts = bar_fonts();
-    let [f_txt, _f_small, f_glyph, _f_bold] = fonts;
-    CUR_FONT.set(0);
+    let [f_txt, _f_small, _f_glyph, _f_bold] = fonts;
     let of = SelectObject(dc, f_txt);
 
     'horiz: {
@@ -2531,9 +2591,9 @@ unsafe fn paint(hwnd: HWND) {
                 let bh_p = sc(13);
                 let br = RECT { left: (r.right - bw_p - sc(1)).max(r.left), top: r.top + sc(1), right: r.right - sc(1), bottom: r.top + sc(1) + bh_p };
                 fill(dc, br, rgb(232, 17, 35), bh_p);
-                sel_font(dc, &fonts, 1);
+                SelectObject(dc, fonts[1]);
                 text(dc, &btxt, br, rgb(255, 255, 255), DT_CENTER);
-                sel_font(dc, &fonts, 0);
+                SelectObject(dc, fonts[0]);
             }
         }
     });
@@ -2541,12 +2601,12 @@ unsafe fn paint(hwnd: HWND) {
     let tw = sc(if small { 20 } else { 24 });
     let t_ico = sc(if small { 14 } else { 16 });
     glow(dc, hot == TAPP, cell(l.apps.0, tw), pal().hover, rr(8));
-    sel_font(dc, &fonts, 2);
+    SelectObject(dc, fonts[2]);
     let open_tf = IsWindowVisible(TRAYFLY.get()) != 0;
     let turn = if open_tf { 1.0 } else { 0.0 };
     let cc = cell(l.apps.0, tw);
     chevron(dc, (cc.left + cc.right) / 2, mid, sc(if small { 5 } else { 6 }), if at_top() { 180.0 } else { 0.0 } + 180.0 * turn, if open_tf { pal().accent } else { pal().text });
-    sel_font(dc, &fonts, 0);
+    SelectObject(dc, fonts[0]);
     let bar = bar_idx();
     TAPPS.with_borrow(|t| {
         for (k, &ix) in bar.iter().enumerate() {
@@ -2561,7 +2621,7 @@ unsafe fn paint(hwnd: HWND) {
     let sys_hot = matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick);
     glow(dc, sys_hot, grp, pal().hover, rr(8));
     let mut x = grp.left + sc(if small { 7 } else { 8 });
-    net_icon(dc, x + sc(if small { 9 } else { 10 }), mid, sc(if small { 16 } else { 18 }), f_glyph);
+    net_icon(dc, x + sc(if small { 9 } else { 10 }), mid, sc(if small { 16 } else { 18 }));
     x += sc(if small { 25 } else { 28 });
     let (vol, muted) = VOL.get();
     let vw = sc(if small { 20 } else { 24 });
@@ -2578,7 +2638,7 @@ unsafe fn paint(hwnd: HWND) {
     glow(dc, hot == CLOCK || fly::is_open(fly::Kind::Cal), cb, pal().hover, rr(8));
     let (tm, dt) = clock_texts();
     let ch = sc(if small { 13 } else { 15 });
-    sel_font(dc, &fonts, 1);
+    SelectObject(dc, fonts[1]);
     text(dc, &tm, RECT { left: cb.left + sc(4), top: mid - ch, right: cb.right - sc(6), bottom: mid }, pal().text, DT_RIGHT);
     text(dc, &dt, RECT { left: cb.left + sc(4), top: mid, right: cb.right - sc(6), bottom: mid + ch }, mix(pal().dim, pal().text, 0.7), DT_RIGHT);
     }
@@ -2943,7 +3003,6 @@ unsafe fn lnk_args(lnk: &[u16]) -> String {
 }
 
 fn proc_args(pid: u32) -> String {
-    use std::os::windows::process::CommandExt;
     if pid == 0 {
         return String::new();
     }
@@ -3101,7 +3160,7 @@ unsafe fn start_menu() {
             "!taskmgr" => open_taskmgr(),
             "!desktop" => winrust_common::desktop::toggle(),
             "!taskview" => if EXPLORER_UP.load(Relaxed) { keys(&[VK_LWIN, VK_TAB]); } else { fly::toggle(fly::Kind::Desktops); },
-            "!lock" => quiet(Command::new("rundll32.exe").args(["user32.dll,LockWorkStation"])),
+            "!lock" => lock_workstation(),
             "!sleep" => fly::sleep_now(),
             "!restart" => quiet(Command::new("shutdown").args(["/r", "/t", "0"])),
             "!shutdown" => quiet(Command::new("shutdown").args(["/s", "/t", "0"])),
@@ -3188,6 +3247,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                 }
             } else {
                 let ti = bar_idx().get(slot - 1).and_then(|&i| TAPPS.with_borrow(|t| t.get(i).map(|x| (x.hwnd, x.uid, x.cb, x.ver))));
+                REVEAL_UNTIL.set(now_ms() + 600);
                 ti.into_iter().for_each(|ti| tray_click(ti, left));
             }
         }
@@ -3220,7 +3280,7 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                         if IsIconic(w) != 0 {
                             ShowWindow(w, SW_RESTORE);
                         }
-                        SetForegroundWindow(w);
+                        force_fg(w);
                     }
                 }
                 _ => {}
@@ -3278,7 +3338,7 @@ unsafe fn appbar_new(hwnd: HWND) {
     ab.hWnd = hwnd;
     ab.uCallbackMessage = CALLBACK;
     SHAppBarMessage(ABM_NEW, &mut ab);
-    EXP_TRAY.set(tray()[0]);
+    EXP_TRAY.set(find_other("Shell_TrayWnd"));
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -3290,7 +3350,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return 0;
     }
     if msg != 0 && msg == TB_MSG.get() {
-        let t = tray()[0];
+        let t = find_other("Shell_TrayWnd");
         if !t.is_null() && t != EXP_TRAY.get() {
             appbar_new(hwnd);
             hide_taskbar();
@@ -3339,11 +3399,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             InvalidateRect(hwnd, null(), 0);
         }
-        WIN_START => fly::toggle(fly::Kind::Start),
+        WIN_START => {
+            UI_GUARD.set(true);
+            fly::toggle(fly::Kind::Start);
+            UI_GUARD.set(false);
+            fs_update(hwnd);
+        }
         ALT_TAB => alt_tab(wp == 1),
         WIN_NUM => win_num(wp),
-        WIN_X => start_menu(),
-        WIN_TAB => if wp == 0 { fly::toggle(fly::Kind::Desktops); } else { vdesk_action((wp - 1) as u8); },
+        WIN_X => {
+            UI_GUARD.set(true);
+            start_menu();
+            UI_GUARD.set(false);
+            fs_update(hwnd);
+        }
+        WIN_TAB => {
+            UI_GUARD.set(true);
+            if wp == 0 { fly::toggle(fly::Kind::Desktops); } else { vdesk_action((wp - 1) as u8); }
+            UI_GUARD.set(false);
+            fs_update(hwnd);
+        }
         NEXT_LANG => next_lang(hwnd, wp == 1),
         ALT_UP if wp == 2 => alt_close(),
         ALT_UP => alt_done(wp == 1),
@@ -3367,16 +3442,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER => {
             let was_exp = EXPLORER_UP.load(Relaxed);
-            hide_taskbar_if_shown();
+            let tb = find_other("Shell_TrayWnd");
+            if !tb.is_null() && IsWindowVisible(tb) != 0 {
+                hide_taskbar();
+            }
             refresh_status();
             let now_exp = EXPLORER_UP.load(Relaxed);
-            if TICK.get() == 2 || (was_exp && !now_exp) {
+            if was_exp && !now_exp {
                 let host = HOST.get();
                 if !host.is_null() {
                     SetWindowPos(host, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                }
-                if TICK.get() == 2 && now_exp {
-                    import_from_explorer();
                 }
                 announce();
             }
@@ -3415,6 +3490,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let x = if vert() { (lp >> 16) as i16 as i32 } else { x };
             hide_tip(hwnd);
             thumbs::hide_preview();
+            UI_GUARD.set(true);
             if h == NONE && msg == WM_RBUTTONDOWN {
                 fly::context_menu(x);
             } else if h >= 1 && msg == WM_RBUTTONDOWN {
@@ -3422,12 +3498,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             } else if !(msg == WM_RBUTTONDOWN && (TAPP..=-900).contains(&h)) {
                 click(h, msg == WM_LBUTTONDOWN, msg == WM_MBUTTONDOWN);
             }
+            UI_GUARD.set(false);
+            fs_update(hwnd);
             InvalidateRect(hwnd, null(), 0);
         }
         WM_RBUTTONUP => {
             let h = hit(hwnd, (lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
             if (TAPP..=-900).contains(&h) {
+                UI_GUARD.set(true);
                 click(h, false, false);
+                UI_GUARD.set(false);
+                fs_update(hwnd);
                 InvalidateRect(hwnd, null(), 0);
             }
         }
@@ -3455,6 +3536,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
     0
+}
+
+pub(crate) unsafe fn lock_workstation() {
+    let u32_mod = GetModuleHandleW(wide("user32.dll").as_ptr());
+    if !u32_mod.is_null() {
+        if let Some(p) = GetProcAddress(u32_mod, b"LockWorkStation\0".as_ptr()) {
+            std::mem::transmute::<_, unsafe extern "system" fn() -> i32>(p)();
+        }
+    }
 }
 
 unsafe fn enable_dpi_aware() {
@@ -3550,10 +3640,8 @@ fn main() {
         CreateWindowExW(0, tnc.as_ptr(), null(), WS_CHILD, 0, 0, 0, 0, HOST.get(), null_mut(), hi, null());
         ChangeWindowMessageFilterEx(HOST.get(), WM_COPYDATA, MSGFLT_ALLOW, null_mut());
         ChangeWindowMessageFilterEx(HOST.get(), 0x49 , MSGFLT_ALLOW, null_mut());
-        ChangeWindowMessageFilterEx(hwnd, CALLBACK, MSGFLT_ALLOW, null_mut());
-        ChangeWindowMessageFilterEx(hwnd, TB_MSG.get(), MSGFLT_ALLOW, null_mut());
         DragAcceptFiles(hwnd, 1);
-        for m in [WM_DROPFILES, 0x49 , WM_COPYDATA] {
+        for m in [CALLBACK, TB_MSG.get(), WM_DROPFILES, 0x49, WM_COPYDATA] {
             ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, null_mut());
         }
         let fc = wide("topbar_trayfly");

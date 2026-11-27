@@ -1,9 +1,34 @@
-use std::{os::windows::process::CommandExt, path::PathBuf, process::Command, ptr, thread, time::{Duration, Instant}};
-use windows_sys::{core::BOOL, Win32::{Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT}, UI::{Input::KeyboardAndMouse::{MOD_NOREPEAT, MOD_WIN, RegisterHotKey}, WindowsAndMessaging::*}}};
+#![windows_subsystem = "windows"]
+use std::{
+    os::windows::process::CommandExt,
+    path::PathBuf,
+    process::{Child, Command},
+    ptr, thread,
+    time::{Duration, Instant},
+};
+use windows_sys::{
+    Win32::{
+        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT},
+        UI::{
+            Input::KeyboardAndMouse::{MOD_NOREPEAT, MOD_WIN, RegisterHotKey, UnregisterHotKey},
+            WindowsAndMessaging::*,
+        },
+    },
+    core::BOOL,
+};
 
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn SetWinEventHook(event_min: u32, event_max: u32, hmod_win_event_proc: *mut core::ffi::c_void, pfn_win_event_proc: Option<unsafe extern "system" fn(isize, u32, HWND, i32, i32, u32, u32)>, id_process: u32, id_thread: u32, dw_flags: u32) -> isize;
+    fn SetWinEventHook(
+        event_min: u32,
+        event_max: u32,
+        hmod_win_event_proc: *mut core::ffi::c_void,
+        pfn_win_event_proc: Option<unsafe extern "system" fn(isize, u32, HWND, i32, i32, u32, u32)>,
+        id_process: u32,
+        id_thread: u32,
+        dw_flags: u32,
+    ) -> isize;
+    fn UnhookWinEvent(h_win_event_hook: isize) -> BOOL;
 }
 
 #[link(name = "kernel32")]
@@ -20,9 +45,38 @@ const RS_DESKTOP_TITLE: [u16; 11] = [b'r' as u16, b's' as u16, b'-' as u16, b'd'
 const WINLOGON: &str = r"HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon";
 const NO_WINDOW: u32 = 0x0800_0000;
 
+fn find_ic(s: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    s.as_bytes().windows(needle.len()).position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn contains_ic(s: &str, needle: &str) -> bool {
+    find_ic(s, needle).is_some()
+}
+
+fn with_wide<T>(s: &str, f: impl FnOnce(*const u16) -> T) -> T {
+    let mut stack = [0u16; 256];
+    let mut len = 0usize;
+    for u in s.encode_utf16() {
+        if len + 1 >= stack.len() {
+            let v: Vec<u16> = s.encode_utf16().chain([0]).collect();
+            return f(v.as_ptr());
+        }
+        stack[len] = u;
+        len += 1;
+    }
+    stack[len] = 0;
+    f(stack.as_ptr())
+}
+
 fn quiet(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut c = Command::new(program);
-    c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    c.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(NO_WINDOW);
     c
 }
 
@@ -36,18 +90,22 @@ fn parse_run(out: &str) -> Vec<String> {
 }
 
 fn parse_run_named(out: &str) -> Vec<(String, String)> {
-    out.lines().filter_map(|l| {
-        let (n, v) = l.split_once("    REG_EXPAND_SZ").or_else(|| l.split_once("    REG_SZ"))?;
-        Some((n.trim().to_string(), v.trim().to_string())).filter(|(_, v)| !v.is_empty())
-    }).collect()
+    out.lines()
+        .filter_map(|l| {
+            let (n, v) = l.split_once("    REG_EXPAND_SZ").or_else(|| l.split_once("    REG_SZ"))?;
+            Some((n.trim().to_string(), v.trim().to_string())).filter(|(_, v)| !v.is_empty())
+        })
+        .collect()
 }
 
 fn parse_disabled(out: &str) -> std::collections::HashSet<String> {
-    out.lines().filter_map(|l| {
-        let (n, v) = l.split_once("    REG_BINARY")?;
-        let first = u8::from_str_radix(v.trim().get(..2)?, 16).ok()?;
-        (first & 1 == 1).then(|| n.trim().to_lowercase())
-    }).collect()
+    out.lines()
+        .filter_map(|l| {
+            let (n, v) = l.split_once("    REG_BINARY")?;
+            let first = u8::from_str_radix(v.trim().get(..2)?, 16).ok()?;
+            (first & 1 == 1).then(|| n.trim().to_lowercase())
+        })
+        .collect()
 }
 
 const APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved";
@@ -61,9 +119,9 @@ fn exe_path(cmd: &str) -> Option<String> {
     }
     let path = match c.strip_prefix('"') {
         Some(rest) => rest.split('"').next()?.to_string(),
-        None => c[..c.to_lowercase().find(".exe")? + 4].to_string(),
+        None => c[..find_ic(&c, ".exe")? + 4].to_string(),
     };
-    path.to_lowercase().ends_with(".exe").then_some(path)
+    path.get(path.len().saturating_sub(4)..).is_some_and(|e| e.eq_ignore_ascii_case(".exe")).then_some(path)
 }
 
 fn autostart() -> Vec<String> {
@@ -76,7 +134,14 @@ fn autostart() -> Vec<String> {
     ];
     for (key, approved) in runs {
         let disabled = off(approved);
-        v.extend(reg(&["query", key]).map(|o| parse_run_named(&o)).unwrap_or_default().into_iter().filter(|(n, _)| !disabled.contains(&n.to_lowercase())).map(|(_, c)| c));
+        v.extend(
+            reg(&["query", key])
+                .map(|o| parse_run_named(&o))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(n, _)| !disabled.contains(&n.to_lowercase()))
+                .map(|(_, c)| c),
+        );
     }
     let dirs = [
         (std::env::var("APPDATA").map(|a| PathBuf::from(a).join(r"Microsoft\Windows\Start Menu\Programs\Startup")), format!(r"HKCU\{APPROVED}\StartupFolder")),
@@ -87,36 +152,46 @@ fn autostart() -> Vec<String> {
         let disabled = off(approved);
         for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().to_lowercase();
-            if name == "desktop.ini" || disabled.contains(&name) { continue; }
+            if name == "desktop.ini" || disabled.contains(&name) {
+                continue;
+            }
             v.push(format!("\"{}\"", e.path().display()));
         }
     }
     let mut seen = std::collections::HashSet::new();
-    v.retain(|c| seen.insert(c.to_lowercase()));
-    v.retain(|c| !c.to_lowercase().contains("rs-shell"));
-    v.retain(|c| !c.to_lowercase().contains(r"\topbar\"));
+    v.retain(|c| !contains_ic(c, "rs-shell") && !contains_ic(c, r"\topbar\") && seen.insert(c.to_lowercase()));
     v.retain(|c| exe_path(c).is_none_or(|p| std::path::Path::new(&p).exists()));
     v
 }
 
-fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain([0]).collect() }
-
-fn dir() -> PathBuf { std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())).unwrap_or_default() }
+fn dir() -> PathBuf {
+    std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())).unwrap_or_default()
+}
 
 fn find_exe(name: &str) -> PathBuf {
     let own = dir().join(name);
-    if own.exists() { return own; }
+    if own.exists() {
+        return own;
+    }
     PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into())).join("topbar").join(name)
 }
 
-fn bar_hwnd() -> HWND { unsafe { FindWindowW(TOPBAR_CLS.as_ptr(), std::ptr::null()) } }
-fn bar_up() -> bool { !bar_hwnd().is_null() }
+fn bar_hwnd() -> HWND {
+    unsafe { FindWindowW(TOPBAR_CLS.as_ptr(), std::ptr::null()) }
+}
+fn bar_up() -> bool {
+    !bar_hwnd().is_null()
+}
 
 fn hwnd_proc(h: HWND) -> HANDLE {
-    if h.is_null() { return ptr::null_mut(); }
+    if h.is_null() {
+        return ptr::null_mut();
+    }
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(h, &mut pid) };
-    if pid == 0 { return ptr::null_mut(); }
+    if pid == 0 {
+        return ptr::null_mut();
+    }
     unsafe { OpenProcess(0x0010_0000, 0, pid) }
 }
 
@@ -131,15 +206,16 @@ unsafe extern "system" fn park(h: HWND, _: LPARAM) -> BOOL {
         if IsWindowVisible(h) != 0 && IsIconic(h) != 0 {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(h, &mut r);
-            if r.left > -30000 { SetWindowPos(h, ptr::null_mut(), -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE); }
+            if r.left > -30000 {
+                SetWindowPos(h, ptr::null_mut(), -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
         1
     }
 }
 
 fn to_bmp(src: &str, dst: &std::path::Path) {
-    use windows_sys::{core::GUID, Win32::Graphics::GdiPlus::*};
-    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    use windows_sys::{Win32::Graphics::GdiPlus::*, core::GUID};
     const BMP: GUID = GUID { data1: 0x557C_F400, data2: 0x1A04, data3: 0x11D3, data4: [0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E] };
     unsafe {
         let (mut token, mut input): (usize, GdiplusStartupInput) = (0, std::mem::zeroed());
@@ -148,8 +224,11 @@ fn to_bmp(src: &str, dst: &std::path::Path) {
             return;
         }
         let mut img = ptr::null_mut();
-        if GdipLoadImageFromFile(wide(src).as_ptr(), &mut img) == 0 {
-            GdipSaveImageToFile(img, wide(&dst.to_string_lossy()).as_ptr(), &BMP, ptr::null());
+        let loaded = with_wide(src, |w| GdipLoadImageFromFile(w, &mut img));
+        if loaded == 0 {
+            with_wide(&dst.to_string_lossy(), |w| {
+                GdipSaveImageToFile(img, w, &BMP, ptr::null());
+            });
             GdipDisposeImage(img);
         }
         GdiplusShutdown(token);
@@ -158,12 +237,18 @@ fn to_bmp(src: &str, dst: &std::path::Path) {
 
 fn wallpaper_value() -> Option<String> {
     use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW};
-    let mut buf = vec![0u16; 1024];
+    let mut buf = [0u16; 1024];
     let mut len = (buf.len() * 2) as u32;
-    let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, wide(r"Control Panel\Desktop").as_ptr(), wide("WallPaper").as_ptr(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, ptr::null_mut(), buf.as_mut_ptr().cast(), &mut len) };
-    if r != 0 { return None; }
-    buf.truncate((len as usize / 2).saturating_sub(1));
-    Some(String::from_utf16_lossy(&buf)).filter(|s| !s.trim().is_empty())
+    let r = with_wide(r"Control Panel\Desktop", |sub| {
+        with_wide("WallPaper", |val| unsafe {
+            RegGetValueW(HKEY_CURRENT_USER, sub, val, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, ptr::null_mut(), buf.as_mut_ptr().cast(), &mut len)
+        })
+    });
+    if r != 0 {
+        return None;
+    }
+    let n = (len as usize / 2).saturating_sub(1);
+    Some(String::from_utf16_lossy(&buf[..n])).filter(|s| !s.trim().is_empty())
 }
 
 fn wallpaper_source() -> Option<PathBuf> {
@@ -173,12 +258,10 @@ fn wallpaper_source() -> Option<PathBuf> {
 
 fn wallpaper_bmp() -> Option<PathBuf> {
     let src = wallpaper_source()?;
-    let bmp = bmp_copy()?;
     if src.extension().is_some_and(|e| e.eq_ignore_ascii_case("bmp")) {
-        let _ = std::fs::remove_file(&bmp);
-        let _ = std::fs::copy(&src, &bmp);
         return Some(src);
     }
+    let bmp = bmp_copy()?;
     let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     if !bmp.is_file() || modified(&bmp) < modified(&src) {
         let _ = std::fs::create_dir_all(bmp.parent()?);
@@ -194,7 +277,9 @@ fn bmp_copy() -> Option<PathBuf> {
 
 fn set_wallpaper() {
     let Some(path) = wallpaper_bmp() else { return };
-    unsafe { SystemParametersInfoW(0x14, 0, wide(&path.to_string_lossy()).as_ptr() as _, 0) };
+    with_wide(&path.to_string_lossy(), |w| unsafe {
+        SystemParametersInfoW(0x14, 0, w as _, 0);
+    });
 }
 
 fn log(msg: &str) {
@@ -202,77 +287,106 @@ fn log(msg: &str) {
 }
 
 fn run_shell() {
-    unsafe { windows_sys::Win32::System::Console::FreeConsole() };
     winrust_common::signal_shell_ready();
     log("start");
     let mut mm = MINIMIZEDMETRICS { cbSize: size_of::<MINIMIZEDMETRICS>() as u32, iWidth: 0, iHorzGap: 0, iVertGap: 0, iArrange: ARW_HIDE as i32 };
     unsafe { SystemParametersInfoW(SPI_SETMINIMIZEDMETRICS, mm.cbSize, &mut mm as *mut _ as _, 0) };
-    thread::spawn(set_wallpaper);
-    let list = autostart();
-    log(&format!("autostart: {} entries", list.len()));
-    for c in list {
-        let r = quiet("cmd").raw_arg(format!("/c start \"\" {c}")).creation_flags(NO_WINDOW).spawn();
-        log(&format!("start {c} -> {:?}", r.map(|_| ())));
-    }
-    thread::sleep(Duration::from_secs(4));
-    set_wallpaper();
-    if !bar_up() { log(&format!("topbar spawn -> {:?}", quiet(find_exe("topbar.exe")).spawn().map(|_| ()))); }
+    let wp = thread::spawn(set_wallpaper);
+    let bar_child = if !bar_up() {
+        let r = quiet(find_exe("topbar.exe")).spawn();
+        log(&format!("topbar spawn -> {:?}", r.as_ref().map(|_| ())));
+        r.ok()
+    } else {
+        None
+    };
     let hotkeys = find_exe("reshell.exe");
-    if hotkeys.exists() { log(&format!("reshell spawn -> {:?}", quiet(&hotkeys).spawn().map(|_| ()))); }
+    if hotkeys.exists() {
+        log(&format!("reshell spawn -> {:?}", quiet(&hotkeys).spawn().map(|_| ())));
+    }
     let desktop = dir().join("rust-explorer.exe");
-    let desktop_up = || unsafe { !FindWindowW(wide("Progman").as_ptr(), wide("rs-desktop").as_ptr()).is_null() };
+    let desktop_up = || unsafe { !FindWindowW(PROGMAN_CLS.as_ptr(), RS_DESKTOP_TITLE.as_ptr()).is_null() };
     log(&format!("desktop exe {} exists={} up={}", desktop.display(), desktop.exists(), desktop_up()));
-    if desktop.exists() && !desktop_up() { log(&format!("desktop spawn -> {:?}", quiet(&desktop).arg("--desktop").spawn().map(|_| ()))); }
+    if desktop.exists() && !desktop_up() {
+        log(&format!("desktop spawn -> {:?}", quiet(&desktop).arg("--desktop").spawn().map(|_| ())));
+    }
+    thread::spawn(move || {
+        let list = autostart();
+        log(&format!("autostart: {} entries", list.len()));
+        for c in list {
+            let r = quiet("cmd").raw_arg(format!("/c start \"\" {c}")).spawn();
+            log(&format!("start {c} -> {:?}", r.map(|_| ())));
+        }
+        let _ = wp.join();
+        thread::sleep(Duration::from_secs(4));
+        set_wallpaper();
+    });
     unsafe { EnumWindows(Some(park), 0) };
-    thread::spawn(supervise);
+    thread::spawn(move || supervise(bar_child));
     hotkey_loop();
 }
 
 fn hotkey_loop() {
     unsafe {
-        SetWinEventHook(0x0016, 0x0016, ptr::null_mut(), Some(on_minimize), 0, 0, 0);
+        let hook = SetWinEventHook(0x0016, 0x0016, ptr::null_mut(), Some(on_minimize), 0, 0, 0);
         RegisterHotKey(ptr::null_mut(), 1, MOD_WIN | MOD_NOREPEAT, 'D' as u32);
         RegisterHotKey(ptr::null_mut(), 2, MOD_WIN | MOD_NOREPEAT, 'E' as u32);
         let mut m: MSG = std::mem::zeroed();
         while GetMessageW(&mut m, ptr::null_mut(), 0, 0) > 0 {
             match (m.message == WM_HOTKEY).then_some(m.wParam) {
                 Some(1) => winrust_common::desktop::toggle(),
-                Some(2) => { let fm = dir().join("rust-explorer.exe"); let _ = quiet(if fm.exists() { fm } else { "explorer.exe".into() }).spawn(); }
+                Some(2) => {
+                    let fm = dir().join("rust-explorer.exe");
+                    let _ = quiet(if fm.exists() { fm } else { "explorer.exe".into() }).spawn();
+                }
                 _ => {}
             }
+        }
+        UnregisterHotKey(ptr::null_mut(), 1);
+        UnregisterHotKey(ptr::null_mut(), 2);
+        if hook != 0 {
+            UnhookWinEvent(hook);
         }
     }
 }
 
-fn supervise() {
-    let (mut starts, mut since, mut misses) = (0, Instant::now(), 0);
+fn supervise(mut bar_child: Option<Child>) {
+    let bar_exe = find_exe("topbar.exe");
+    let (mut starts, mut since) = (0, Instant::now());
     loop {
-        let bar = bar_hwnd();
-        if !bar.is_null() {
-            misses = 0;
-            let h = hwnd_proc(bar);
-            if !h.is_null() {
-                unsafe {
-                    WaitForSingleObject(h, 0xFFFF_FFFF);
-                    CloseHandle(h);
+        if let Some(mut c) = bar_child.take() {
+            let _ = c.wait();
+        } else {
+            let bar = bar_hwnd();
+            if !bar.is_null() {
+                let h = hwnd_proc(bar);
+                if !h.is_null() {
+                    unsafe {
+                        WaitForSingleObject(h, 0xFFFF_FFFF);
+                        CloseHandle(h);
+                    }
+                    continue;
                 }
+                thread::sleep(Duration::from_secs(2));
                 continue;
             }
-            thread::sleep(Duration::from_secs(5));
-            continue;
         }
-        misses += 1;
-        if misses >= 6 {
-            if since.elapsed() > Duration::from_secs(120) { (starts, since) = (0, Instant::now()); }
-            starts += 1;
-            if starts > 3 || quiet(find_exe("topbar.exe")).spawn().is_err() {
-                let _ = quiet(find_exe("topbar.exe")).arg("--restore").creation_flags(NO_WINDOW).status();
+        if since.elapsed() > Duration::from_secs(120) {
+            (starts, since) = (0, Instant::now());
+        }
+        starts += 1;
+        if starts > 3 {
+            let _ = quiet(&bar_exe).arg("--restore").status();
+            let _ = quiet("explorer.exe").spawn();
+            std::process::exit(0);
+        }
+        match quiet(&bar_exe).spawn() {
+            Ok(c) => bar_child = Some(c),
+            Err(_) => {
+                let _ = quiet(&bar_exe).arg("--restore").status();
                 let _ = quiet("explorer.exe").spawn();
                 std::process::exit(0);
             }
-            misses = 0;
         }
-        thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -298,10 +412,9 @@ fn expected_autostart(list: &[String]) -> (Vec<String>, usize) {
     let exes: Vec<String> = list
         .iter()
         .filter_map(|c| {
-            let lc = c.to_lowercase();
-            if let Some(i) = lc.find("--processstart") {
+            if let Some(i) = find_ic(c, "--processstart") {
                 let app = c[i + "--processstart".len()..].trim_start().trim_start_matches('"');
-                return app.split(['"', ' ']).next().filter(|a| a.to_lowercase().ends_with(".exe")).map(str::to_lowercase);
+                return app.split(['"', ' ']).next().filter(|a| a.get(a.len().saturating_sub(4)..).is_some_and(|e| e.eq_ignore_ascii_case(".exe"))).map(str::to_lowercase);
             }
             exe_path(c).and_then(|p| std::path::Path::new(&p).file_name().map(|n| n.to_string_lossy().to_lowercase()))
         })
@@ -325,20 +438,25 @@ fn start_shell_explorer() {
 }
 
 fn overlay() {
-    unsafe { windows_sys::Win32::System::Console::FreeConsole() };
     let replace = replace_on();
     log(&format!("overlay start (replace explorer: {replace})"));
     let wp = thread::spawn(wallpaper_bmp);
     winrust_common::wait_shell_ready();
     let bar_exe = find_exe("topbar.exe");
     let has_bar = bar_exe.exists();
-    if has_bar && !bar_up() { log(&format!("topbar spawn -> {:?}", quiet(&bar_exe).spawn().map(|_| ()))); }
+    if has_bar && !bar_up() {
+        log(&format!("topbar spawn -> {:?}", quiet(&bar_exe).spawn().map(|_| ())));
+    }
     let hk = find_exe("reshell.exe");
-    if hk.exists() { log(&format!("reshell spawn -> {:?}", quiet(&hk).spawn().map(|_| ()))); }
+    if hk.exists() {
+        log(&format!("reshell spawn -> {:?}", quiet(&hk).spawn().map(|_| ())));
+    }
     let _ = wp.join();
     let desktop = dir().join("rust-explorer.exe");
     let up = || unsafe { !FindWindowW(PROGMAN_CLS.as_ptr(), RS_DESKTOP_TITLE.as_ptr()).is_null() };
-    if desktop.exists() && !up() { log(&format!("desktop spawn -> {:?}", quiet(&desktop).arg("--desktop").spawn().map(|_| ()))); }
+    if desktop.exists() && !up() {
+        log(&format!("desktop spawn -> {:?}", quiet(&desktop).arg("--desktop").spawn().map(|_| ())));
+    }
     if replace {
         thread::spawn(move || overlay_watch(replace, has_bar, desktop, up));
         hotkey_loop();
@@ -348,49 +466,77 @@ fn overlay() {
 }
 
 fn overlay_watch(replace: bool, has_bar: bool, desktop: PathBuf, up: impl Fn() -> bool) {
+    let has_desk = desktop.exists();
+    let bar_exe = find_exe("topbar.exe");
     let (mut starts, mut misses, mut dmiss, mut stable, mut killed) = (0, 0, 0, 0, false);
     let began = Instant::now();
     let (expected, untracked) = if replace { expected_autostart(&autostart()) } else { (vec![], 0) };
-    if replace { log(&format!("autostart to wait for: {} exe(s) {:?}, {} other entr(ies)", expected.len(), expected, untracked)); }
+    if replace {
+        log(&format!("autostart to wait for: {} exe(s) {:?}, {} other entr(ies)", expected.len(), expected, untracked));
+    }
     loop {
         if !replace || killed {
             let bar = if has_bar { bar_hwnd() } else { ptr::null_mut() };
-            let desk = if desktop.exists() { unsafe { FindWindowW(PROGMAN_CLS.as_ptr(), RS_DESKTOP_TITLE.as_ptr()) } } else { ptr::null_mut() };
+            let desk = if has_desk { unsafe { FindWindowW(PROGMAN_CLS.as_ptr(), RS_DESKTOP_TITLE.as_ptr()) } } else { ptr::null_mut() };
             let mut handles: [HANDLE; 2] = [ptr::null_mut(); 2];
             let mut count = 0u32;
             let hb = hwnd_proc(bar);
-            if !hb.is_null() { handles[count as usize] = hb; count += 1; }
+            if !hb.is_null() {
+                handles[count as usize] = hb;
+                count += 1;
+            }
             let hd = hwnd_proc(desk);
-            if !hd.is_null() { handles[count as usize] = hd; count += 1; }
-            if (!has_bar || !bar.is_null()) && (!desktop.exists() || !desk.is_null()) && count > 0 {
+            if !hd.is_null() {
+                handles[count as usize] = hd;
+                count += 1;
+            }
+            if (!has_bar || !bar.is_null()) && (!has_desk || !desk.is_null()) && count > 0 {
                 unsafe {
                     WaitForMultipleObjects(count, handles.as_ptr(), 0, 0xFFFF_FFFF);
-                    for h in &handles[..count as usize] { CloseHandle(*h); }
+                    for h in &handles[..count as usize] {
+                        CloseHandle(*h);
+                    }
                 }
                 continue;
             }
-            for h in &handles[..count as usize] { unsafe { CloseHandle(*h) }; }
+            for h in &handles[..count as usize] {
+                unsafe { CloseHandle(*h) };
+            }
         }
         thread::sleep(Duration::from_secs(if !replace || killed { 5 } else { 3 }));
         if replace && !killed {
-            stable = if (!has_bar || bar_up()) && (!desktop.exists() || up()) { stable + 1 } else { 0 };
-            let missing = missing_autostart(&expected, &winrust_common::proc::list());
-            if stable >= 3 && may_end_explorer(startup_run(), began.elapsed(), missing.is_empty(), untracked) {
-                log(&format!("autostart done (markers: {}, after {} s, not running: {:?})", startup_run(), began.elapsed().as_secs(), missing));
-                kill_shell_explorer();
-                killed = true;
+            stable = if (!has_bar || bar_up()) && (!has_desk || up()) { stable + 1 } else { 0 };
+            if stable >= 3 {
+                let procs = winrust_common::proc::list();
+                let missing = missing_autostart(&expected, &procs);
+                let markers = startup_run();
+                if may_end_explorer(markers, began.elapsed(), missing.is_empty(), untracked) {
+                    log(&format!("autostart done (markers: {markers}, after {} s, not running: {missing:?})", began.elapsed().as_secs()));
+                    kill_shell_explorer();
+                    killed = true;
+                }
             }
         }
         let lent = || winrust_common::settings::explorer_lent() || (replace && killed && !winrust_common::proc::shell_explorers().is_empty());
-        dmiss = if desktop.exists() && !up() && !lent() { dmiss + 1 } else { 0 };
-        if dmiss >= 2 { log(&format!("desktop respawn -> {:?}", quiet(&desktop).arg("--desktop").spawn().map(|_| ()))); dmiss = 0; }
-        if !has_bar || bar_up() { misses = 0; continue; }
+        dmiss = if has_desk && !up() && !lent() { dmiss + 1 } else { 0 };
+        if dmiss >= 2 {
+            log(&format!("desktop respawn -> {:?}", quiet(&desktop).arg("--desktop").spawn().map(|_| ())));
+            dmiss = 0;
+        }
+        if !has_bar || bar_up() {
+            misses = 0;
+            continue;
+        }
         misses += 1;
-        if misses < 2 { continue; }
+        if misses < 2 {
+            continue;
+        }
         starts += 1;
-        if starts > 3 || quiet(find_exe("topbar.exe")).spawn().is_err() {
-            let _ = quiet(find_exe("topbar.exe")).arg("--restore").creation_flags(NO_WINDOW).status();
-            if replace { start_shell_explorer(); }
+        if starts > 3 || quiet(&bar_exe).spawn().is_err() {
+            let _ = quiet(&bar_exe).arg("--restore").status();
+            if replace {
+                start_shell_explorer();
+            }
             log("overlay: topbar keeps dying, system shell restored");
             return;
         }
@@ -422,13 +568,27 @@ fn bootstrap() -> bool {
 fn main() {
     winrust_common::install_panic_hook("rs-shell");
     let a: Vec<String> = std::env::args().skip(1).collect();
+    if !a.is_empty() && a.first().map(String::as_str) != Some("--overlay") {
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
+        }
+    }
     let code = match a.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        [] => { if !bootstrap() { run_shell(); } 0 }
-        ["--overlay"] => { overlay(); 0 }
+        [] => {
+            if !bootstrap() {
+                run_shell();
+            }
+            0
+        }
+        ["--overlay"] => {
+            overlay();
+            0
+        }
         ["--dry-run"] => {
             println!("wallpaper: {:?}", reg(&["query", r"HKCU\Control Panel\Desktop", "/v", "WallPaper"]).map(|o| parse_run(&o)));
             autostart().iter().for_each(|c| println!("autostart: {c}"));
-            println!("topbar: {} ({})", find_exe("topbar.exe").display(), if find_exe("topbar.exe").exists() { "found" } else { "MISSING" });
+            let bar = find_exe("topbar.exe");
+            println!("topbar: {} ({})", bar.display(), if bar.exists() { "found" } else { "MISSING" });
             println!("explorer ran this session's autostart: {}", startup_run());
             0
         }
@@ -440,14 +600,20 @@ fn main() {
             } else if reg(&["add", WINLOGON, "/v", "Shell", "/t", "REG_SZ", "/d", &exe.to_string_lossy(), "/f"]).is_some() {
                 println!("done: you get rs-shell instead of explorer at the next sign-in.\nundo: rs-shell --disable   (or: reg delete \"{WINLOGON}\" /v Shell /f)");
                 0
-            } else { eprintln!("reg add failed"); 1 }
+            } else {
+                eprintln!("reg add failed");
+                1
+            }
         }
         ["--disable"] => {
             let _ = reg(&["delete", WINLOGON, "/v", "Shell", "/f"]);
             println!("done: normal shell at the next sign-in");
             0
         }
-        _ => { eprintln!("usage: rs-shell [--enable | --disable | --dry-run]"); 2 }
+        _ => {
+            eprintln!("usage: rs-shell [--enable | --disable | --dry-run]");
+            2
+        }
     };
     std::process::exit(code);
 }

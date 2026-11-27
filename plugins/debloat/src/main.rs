@@ -1,69 +1,64 @@
 use std::{
     env,
+    fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
 
-fn services() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("DiagTrack", "Connected User Experiences and Telemetry"),
-        ("dmwappushservice", "WAP push message routing (telemetry helper)"),
-        ("MapsBroker", "downloaded maps"),
-        ("RetailDemo", "retail demo mode"),
-        ("WerSvc", "Windows Error Reporting"),
-        ("Fax", "Fax"),
-        ("DPS", "Diagnostic Policy Service (troubleshooters)"),
-        ("WdiServiceHost", "diagnostic service host (needs DPS)"),
-        ("WdiSystemHost", "diagnostic system host (needs DPS)"),
-        ("whesvc", "Windows Health and Optimized Experiences"),
-        ("TrkWks", "distributed link tracking"),
-        ("WSAIFabricSvc", "Windows AI Fabric (Copilot+/Recall features)"),
-    ]
-}
+const SERVICES: &[(&str, &str)] = &[
+    ("DiagTrack", "Connected User Experiences and Telemetry"),
+    ("dmwappushservice", "WAP push message routing (telemetry helper)"),
+    ("MapsBroker", "downloaded maps"),
+    ("RetailDemo", "retail demo mode"),
+    ("WerSvc", "Windows Error Reporting"),
+    ("Fax", "Fax"),
+    ("DPS", "Diagnostic Policy Service (troubleshooters)"),
+    ("WdiServiceHost", "diagnostic service host (needs DPS)"),
+    ("WdiSystemHost", "diagnostic system host (needs DPS)"),
+    ("whesvc", "Windows Health and Optimized Experiences"),
+    ("TrkWks", "distributed link tracking"),
+    ("WSAIFabricSvc", "Windows AI Fabric (Copilot+/Recall features)"),
+];
 
-fn regs() -> Vec<(&'static str, &'static str, u32, &'static str)> {
-    vec![
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry", 0, "telemetry to the minimum"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection", "DoNotShowFeedbackNotifications", 1, "no feedback pop-ups"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot", "TurnOffWindowsCopilot", 1, "Copilot off"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI", "DisableAIDataAnalysis", 1, "Recall: no snapshots of your screen"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent", "DisableWindowsConsumerFeatures", 1, "no suggested/promoted apps"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent", "DisableCloudOptimizedContent", 1, "no cloud-driven content"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent", "DisableSoftLanding", 1, "no Windows tips and tricks"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo", "DisabledByGroupPolicy", 1, "no advertising ID"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\System", "EnableActivityFeed", 0, "no activity history (Timeline)"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\System", "PublishUserActivities", 0, "activity history stays local"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR", "AllowGameDVR", 0, "Game Bar background capture off"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Edge", "StartupBoostEnabled", 0, "Edge does not preload at sign-in"),
-        (r"HKLM\SOFTWARE\Policies\Microsoft\Edge", "BackgroundModeEnabled", 0, "Edge does not run after it is closed"),
-        (r"HKCU\Software\Policies\Microsoft\Windows\Explorer", "DisableSearchBoxSuggestions", 1, "no web results in search"),
-        (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SilentInstalledAppsEnabled", 0, "no apps installed behind your back"),
-        (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "PreInstalledAppsEnabled", 0, "no pre-installed promoted apps"),
-        (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "OemPreInstalledAppsEnabled", 0, "no OEM promoted apps"),
-        (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SystemPaneSuggestionsEnabled", 0, "no ads in Start"),
-        (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SubscribedContent-338388Value", 0, "no suggestions in Start"),
-        (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SubscribedContent-338389Value", 0, "no tips and suggestions"),
-        (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SubscribedContent-353694Value", 0, "no suggestions in Settings"),
-        (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SubscribedContent-353696Value", 0, "no suggestions in Settings"),
-        (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "RotatingLockScreenOverlayEnabled", 0, "no ads on the lock screen"),
-    ]
-}
+const REGS: &[(&str, &str, u32, &str)] = &[
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry", 0, "telemetry to the minimum"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection", "DoNotShowFeedbackNotifications", 1, "no feedback pop-ups"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot", "TurnOffWindowsCopilot", 1, "Copilot off"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI", "DisableAIDataAnalysis", 1, "Recall: no snapshots of your screen"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent", "DisableWindowsConsumerFeatures", 1, "no suggested/promoted apps"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent", "DisableCloudOptimizedContent", 1, "no cloud-driven content"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent", "DisableSoftLanding", 1, "no Windows tips and tricks"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo", "DisabledByGroupPolicy", 1, "no advertising ID"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\System", "EnableActivityFeed", 0, "no activity history (Timeline)"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\System", "PublishUserActivities", 0, "activity history stays local"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR", "AllowGameDVR", 0, "Game Bar background capture off"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Edge", "StartupBoostEnabled", 0, "Edge does not preload at sign-in"),
+    (r"HKLM\SOFTWARE\Policies\Microsoft\Edge", "BackgroundModeEnabled", 0, "Edge does not run after it is closed"),
+    (r"HKCU\Software\Policies\Microsoft\Windows\Explorer", "DisableSearchBoxSuggestions", 1, "no web results in search"),
+    (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SilentInstalledAppsEnabled", 0, "no apps installed behind your back"),
+    (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "PreInstalledAppsEnabled", 0, "no pre-installed promoted apps"),
+    (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "OemPreInstalledAppsEnabled", 0, "no OEM promoted apps"),
+    (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SystemPaneSuggestionsEnabled", 0, "no ads in Start"),
+    (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SubscribedContent-338388Value", 0, "no suggestions in Start"),
+    (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SubscribedContent-338389Value", 0, "no tips and suggestions"),
+    (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SubscribedContent-353694Value", 0, "no suggestions in Settings"),
+    (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "SubscribedContent-353696Value", 0, "no suggestions in Settings"),
+    (r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager", "RotatingLockScreenOverlayEnabled", 0, "no ads on the lock screen"),
+];
 
-fn upd_services() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("AdobeARMservice", "Adobe Acrobat updater"),
-        ("AdobeUpdateService", "Adobe updater"),
-        ("AGSService", "Adobe Genuine Software check"),
-        ("AGMService", "Adobe Genuine Monitor"),
-        ("MozillaMaintenance", "Mozilla maintenance (Firefox still updates itself while it runs)"),
-        ("dbupdate", "Dropbox updater"),
-        ("dbupdatem", "Dropbox updater"),
-        ("ccleaner", "CCleaner updater"),
-        ("ccleanerm", "CCleaner updater"),
-    ]
-}
+const UPD_SERVICES: &[(&str, &str)] = &[
+    ("AdobeARMservice", "Adobe Acrobat updater"),
+    ("AdobeUpdateService", "Adobe updater"),
+    ("AGSService", "Adobe Genuine Software check"),
+    ("AGMService", "Adobe Genuine Monitor"),
+    ("MozillaMaintenance", "Mozilla maintenance (Firefox still updates itself while it runs)"),
+    ("dbupdate", "Dropbox updater"),
+    ("dbupdatem", "Dropbox updater"),
+    ("ccleaner", "CCleaner updater"),
+    ("ccleanerm", "CCleaner updater"),
+];
 
 const UPD_TASKS: &[&str] = &[
     r"\Adobe Acrobat Update Task",
@@ -84,12 +79,10 @@ const UPD_TASKS: &[&str] = &[
 
 const WINGET_TASK: &str = r"\WinRust\Update apps";
 
-fn ntfs_regs() -> Vec<(&'static str, &'static str, u32, &'static str)> {
-    vec![
-        (r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem", "NtfsDisableLastAccessUpdate", 0x8000_0001, "no last-access time written on every read"),
-        (r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem", "NtfsDisable8dot3NameCreation", 1, "no 8.3 short name created with every new file"),
-    ]
-}
+const NTFS_REGS: &[(&str, &str, u32, &str)] = &[
+    (r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem", "NtfsDisableLastAccessUpdate", 0x8000_0001, "no last-access time written on every read"),
+    (r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem", "NtfsDisable8dot3NameCreation", 1, "no 8.3 short name created with every new file"),
+];
 
 const DEF_PROCS: &[&str] = &["cargo.exe", "rustc.exe"];
 
@@ -156,9 +149,17 @@ impl Group {
     }
 }
 
+fn starts_ic(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+}
+
 fn run(prog: &str, args: &[&str]) -> (bool, String) {
-    let args: Vec<String> = if prog == "reg.exe" { winrust_common::reg::user_args(args) } else { args.iter().map(|a| a.to_string()).collect() };
-    match Command::new(prog).args(&args).output() {
+    let out = if prog == "reg.exe" {
+        Command::new(prog).args(winrust_common::reg::user_args(args)).output()
+    } else {
+        Command::new(prog).args(args).output()
+    };
+    match out {
         Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned()),
         Err(e) => (false, e.to_string()),
     }
@@ -174,7 +175,10 @@ fn psq(s: &str) -> String {
 
 fn start_mode(svc: &str) -> Option<&'static str> {
     let (ok, out) = run("sc.exe", &["qc", svc]);
-    let line = out.lines().find(|l| ok && l.contains("START_TYPE"))?;
+    if !ok {
+        return None;
+    }
+    let line = out.lines().find(|l| l.contains("START_TYPE"))?;
     Some(if line.contains("DISABLED") {
         "disabled"
     } else if line.contains("DEMAND_START") {
@@ -224,7 +228,7 @@ fn parse_task_names(csv: &str) -> Vec<String> {
 
 fn updater_tasks() -> Vec<String> {
     let (_, out) = run("schtasks.exe", &["/query", "/fo", "csv", "/nh"]);
-    parse_task_names(&out).into_iter().filter(|n| UPD_TASKS.iter().any(|p| n.to_lowercase().starts_with(&p.to_lowercase()))).collect()
+    parse_task_names(&out).into_iter().filter(|n| UPD_TASKS.iter().any(|p| starts_ic(n, p))).collect()
 }
 
 fn task_enabled(name: &str) -> Option<bool> {
@@ -248,17 +252,16 @@ fn defender_paths() -> Vec<String> {
         }
     }
     if let Some(la) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
-        v.push(la.join("npm-cache"));
-        v.push(la.join(r"pip\cache"));
-        v.push(la.join(r"Yarn\Cache"));
-        v.push(la.join(r"pnpm\store"));
+        for d in ["npm-cache", r"pip\cache", r"Yarn\Cache", r"pnpm\store"] {
+            v.push(la.join(d));
+        }
     }
     if let Some(pf) = env::var_os("ProgramFiles").map(PathBuf::from) {
         v.push(pf.join("Epic Games"));
     }
     v.extend(steam_libraries());
     let mut seen = std::collections::HashSet::new();
-    v.into_iter().filter(|p| p.is_dir()).map(|p| p.display().to_string().replace('/', "\\")).filter(|p| seen.insert(p.to_lowercase())).collect()
+    v.into_iter().filter(|p| p.is_dir()).map(|p| p.to_string_lossy().into_owned()).filter(|p| seen.insert(p.to_lowercase())).collect()
 }
 
 fn steam_libraries() -> Vec<PathBuf> {
@@ -273,8 +276,11 @@ fn steam_libraries() -> Vec<PathBuf> {
 fn parse_vdf_paths(vdf: &str) -> Vec<String> {
     vdf.lines()
         .filter_map(|l| {
-            let f: Vec<&str> = l.split('"').collect();
-            (f.len() >= 4 && f[1] == "path").then(|| f[3].replace(r"\\", r"\"))
+            let mut it = l.split('"');
+            match (it.next(), it.next(), it.next(), it.next()) {
+                (Some(_), Some("path"), Some(_), Some(p)) => Some(p.replace(r"\\", r"\")),
+                _ => None,
+            }
         })
         .collect()
 }
@@ -288,11 +294,13 @@ fn defender_exclusions() -> Result<Vec<String>, String> {
 }
 
 fn hosts_block() -> String {
-    let mut s = format!("{HOSTS_BEGIN}\r\n");
+    let mut s = String::with_capacity(4096);
+    let _ = writeln!(s, "{HOSTS_BEGIN}\r");
     for d in BLOCK {
-        s += &format!("0.0.0.0 {d}\r\n");
+        let _ = writeln!(s, "0.0.0.0 {d}\r");
     }
-    s + HOSTS_END + "\r\n"
+    let _ = writeln!(s, "{HOSTS_END}\r");
+    s
 }
 
 fn strip_block(text: &str) -> String {
@@ -309,50 +317,50 @@ fn strip_block(text: &str) -> String {
 }
 
 fn plan(g: Group) {
-    println!("{}", "Dry run: nothing is changed. Add --apply (admin) to do it, --undo to revert.\n");
-    let (svcs, regs): (Vec<(&str, &str)>, Vec<(&str, &str, u32, &str)>) = match g {
-        Group::Base => (services(), regs()),
-        Group::Updaters => (upd_services(), vec![]),
-        Group::Ntfs => (vec![], ntfs_regs()),
-        _ => (vec![], vec![]),
+    println!("Dry run: nothing is changed. Add --apply (admin) to do it, --undo to revert.\n");
+    let (svcs, regs) = match g {
+        Group::Base => (SERVICES, REGS),
+        Group::Updaters => (UPD_SERVICES, &[][..]),
+        Group::Ntfs => (&[][..], NTFS_REGS),
+        _ => (&[][..], &[][..]),
     };
-    for (svc, why) in svcs {
+    for &(svc, why) in svcs {
         match start_mode(svc) {
-            None => println!("{}", format!("  service {0:<18} not present", svc)),
-            Some("disabled") => println!("{}", format!("  service {0:<18} already disabled", svc)),
-            Some(m) => println!("{}", format!("  service {0:<18} {1} -> disabled   ({2})", svc, m, why)),
+            None => println!("  service {svc:<18} not present"),
+            Some("disabled") => println!("  service {svc:<18} already disabled"),
+            Some(m) => println!("  service {svc:<18} {m} -> disabled   ({why})"),
         }
     }
-    for (key, value, data, why) in regs {
+    for &(key, value, data, why) in regs {
         let state = match reg_val(key, value) {
             Val::Dword(d) if d == data => "already set".to_string(),
             Val::Dword(d) => format!("{d} -> {data}"),
             Val::Missing => format!("(none) -> {data}"),
             Val::Other => "not a DWORD, left alone".into(),
         };
-        println!("{}", format!("  policy  {0:<34} {1}   ({2})", value, state, why));
+        println!("  policy  {value:<34} {state}   ({why})");
     }
     match g {
         Group::Updaters => {
             for t in updater_tasks() {
-                println!("{}", format!("  task    {0}   -> disabled", t));
+                println!("  task    {t}   -> disabled");
             }
             let winget = if has_winget() {
                 "weekly winget upgrade --all"
             } else {
                 "skipped: winget is not installed"
             };
-            println!("{}", format!("  task    {0}   {1}", WINGET_TASK, winget));
+            println!("  task    {WINGET_TASK}   {winget}");
         }
         Group::Defender => {
             for p in defender_paths() {
-                println!("{}", format!("  exclude {0}", p));
+                println!("  exclude {p}");
             }
             for p in DEF_PROCS {
-                println!("{}", format!("  exclude process {0}", p));
+                println!("  exclude process {p}");
             }
         }
-        Group::Dns => println!("{}", format!("  hosts   {0} ad/tracker domains -> 0.0.0.0", BLOCK.len())),
+        Group::Dns => println!("  hosts   {} ad/tracker domains -> 0.0.0.0", BLOCK.len()),
         _ => {}
     }
 }
@@ -365,26 +373,20 @@ impl Log {
     }
 }
 
-fn done(ok: bool) -> &'static str {
-    if ok {
-        "done  "
-    } else {
-        "FAILED"
-    }
-}
-
 fn apply_services(list: &[(&str, &str)], log: &mut Log) -> Result<u32, String> {
     let mut failed = 0;
-    for (svc, _) in list {
+    for &(svc, _) in list {
         match start_mode(svc) {
-            None => println!("{}", format!("skip   {0}: not present", svc)),
-            Some("disabled") => println!("{}", format!("skip   {0}: already disabled", svc)),
+            None => println!("skip   {svc}: not present"),
+            Some("disabled") => println!("skip   {svc}: already disabled"),
             Some(mode) => {
                 log.line(&format!("svc|{svc}|{mode}"))?;
                 let ok = run("sc.exe", &["config", svc, "start=", "disabled"]).0;
-                let _ = run("sc.exe", &["stop", svc]);
+                if ok {
+                    let _ = run("sc.exe", &["stop", svc]);
+                }
                 failed += !ok as u32;
-                println!("{}", format!("{0}  {1}: {2} -> disabled", done(ok), svc, mode));
+                println!("{}  {svc}: {mode} -> disabled", if ok { "done  " } else { "FAILED" });
             }
         }
     }
@@ -393,14 +395,14 @@ fn apply_services(list: &[(&str, &str)], log: &mut Log) -> Result<u32, String> {
 
 fn apply_regs(list: &[(&str, &str, u32, &str)], log: &mut Log) -> Result<u32, String> {
     let mut failed = 0;
-    for (key, value, data, _) in list {
+    for &(key, value, data, _) in list {
         let old = match reg_val(key, value) {
-            Val::Dword(d) if d == *data => {
-                println!("{}", format!("skip   {value}: already {data}"));
+            Val::Dword(d) if d == data => {
+                println!("skip   {value}: already {data}");
                 continue;
             }
             Val::Other => {
-                println!("{}", format!("skip   {value}: not a DWORD, left alone"));
+                println!("skip   {value}: not a DWORD, left alone");
                 continue;
             }
             Val::Dword(d) => d.to_string(),
@@ -409,27 +411,27 @@ fn apply_regs(list: &[(&str, &str, u32, &str)], log: &mut Log) -> Result<u32, St
         log.line(&format!("reg|{key}|{value}|{old}"))?;
         let ok = run("reg.exe", &["add", key, "/v", value, "/t", "REG_DWORD", "/d", &data.to_string(), "/f"]).0;
         failed += !ok as u32;
-        println!("{}", format!("{0}  {value} = {data}", done(ok)));
+        println!("{}  {value} = {data}", if ok { "done  " } else { "FAILED" });
     }
     Ok(failed)
 }
 
 fn apply_updaters(log: &mut Log) -> Result<u32, String> {
-    let mut failed = apply_services(&upd_services(), log)?;
+    let mut failed = apply_services(UPD_SERVICES, log)?;
     for t in updater_tasks() {
         if task_enabled(&t) != Some(true) {
-            println!("{}", format!("skip   {t}: already disabled"));
+            println!("skip   {t}: already disabled");
             continue;
         }
         log.line(&format!("task|{t}"))?;
         let ok = run("schtasks.exe", &["/change", "/tn", &t, "/disable"]).0;
         failed += !ok as u32;
-        println!("{}", format!("{0}  {t}: disabled", done(ok)));
+        println!("{}  {t}: disabled", if ok { "done  " } else { "FAILED" });
     }
     if !has_winget() {
-        println!("{}", format!("skip   {WINGET_TASK}: winget is not installed (App Installer from the Store)"));
+        println!("skip   {WINGET_TASK}: winget is not installed (App Installer from the Store)");
     } else if task_enabled(WINGET_TASK).is_some() {
-        println!("{}", format!("skip   {WINGET_TASK}: already there"));
+        println!("skip   {WINGET_TASK}: already there");
     } else {
         log.line(&format!("newtask|{WINGET_TASK}"))?;
         let user = env::var(winrust_common::reg::SID_ENV).ok().filter(|s| winrust_common::reg::valid_sid(s)).map_or("([Security.Principal.WindowsIdentity]::GetCurrent().Name)".to_string(), |s| psq(&s));
@@ -442,17 +444,38 @@ fn apply_updaters(log: &mut Log) -> Result<u32, String> {
         );
         let ok = ps(&script).0;
         failed += !ok as u32;
-        println!("{}", format!("{0}  {WINGET_TASK}: weekly winget upgrade --all (Sunday 12:00, or at the next start)", done(ok)));
+        println!("{}  {WINGET_TASK}: weekly winget upgrade --all (Sunday 12:00, or at the next start)", if ok { "done  " } else { "FAILED" });
     }
     Ok(failed)
 }
 
+fn push_ps_list<'a>(cmd: &mut String, flag: &str, items: impl Iterator<Item = &'a str>) {
+    let mut first = true;
+    for s in items {
+        if first {
+            cmd.push_str(flag);
+            first = false;
+        } else {
+            cmd.push(',');
+        }
+        cmd.push('\'');
+        for ch in s.chars() {
+            if ch == '\'' {
+                cmd.push_str("''");
+            } else {
+                cmd.push(ch);
+            }
+        }
+        cmd.push('\'');
+    }
+}
+
 fn apply_defender(log: &mut Log) -> Result<u32, String> {
     let have = defender_exclusions()?;
-    let paths: Vec<String> = defender_paths().into_iter().filter(|p| !have.contains(&p.to_lowercase())).collect();
-    let procs: Vec<&str> = DEF_PROCS.iter().copied().filter(|p| !have.contains(&p.to_lowercase())).collect();
+    let paths: Vec<String> = defender_paths().into_iter().filter(|p| !have.iter().any(|h| h.eq_ignore_ascii_case(p))).collect();
+    let procs: Vec<&str> = DEF_PROCS.iter().copied().filter(|p| !have.iter().any(|h| h.eq_ignore_ascii_case(p))).collect();
     if paths.is_empty() && procs.is_empty() {
-        println!("{}", "skip   nothing new to exclude");
+        println!("skip   nothing new to exclude");
         return Ok(0);
     }
     for p in &paths {
@@ -461,17 +484,17 @@ fn apply_defender(log: &mut Log) -> Result<u32, String> {
     for p in &procs {
         log.line(&format!("mpx|proc|{p}"))?;
     }
-    let list = |v: &[&str]| v.iter().map(|s| psq(s)).collect::<Vec<_>>().join(",");
     let mut cmd = "Add-MpPreference -ErrorAction Stop".to_string();
     if !paths.is_empty() {
-        cmd += &format!(" -ExclusionPath {}", list(&paths.iter().map(String::as_str).collect::<Vec<_>>()));
+        push_ps_list(&mut cmd, " -ExclusionPath ", paths.iter().map(String::as_str));
     }
     if !procs.is_empty() {
-        cmd += &format!(" -ExclusionProcess {}", list(&procs));
+        push_ps_list(&mut cmd, " -ExclusionProcess ", procs.iter().copied());
     }
     let ok = ps(&cmd).0;
+    let status = if ok { "done  " } else { "FAILED" };
     for p in paths.iter().map(String::as_str).chain(procs.iter().copied()) {
-        println!("{}", format!("{0}  exclude {1}", done(ok), p));
+        println!("{status}  exclude {p}");
     }
     Ok(!ok as u32)
 }
@@ -480,14 +503,14 @@ fn apply_dns(log: &mut Log) -> Result<u32, String> {
     let path = hosts_path();
     let text = fs::read_to_string(&path).unwrap_or_default();
     if text.contains(HOSTS_BEGIN) {
-        println!("{}", "skip   hosts: the block is already there");
+        println!("skip   hosts: the block is already there");
         return Ok(0);
     }
     log.line("hosts|block")?;
     let new = format!("{}\r\n\r\n{}", text.trim_end_matches(['\r', '\n']), hosts_block());
     let ok = fs::write(&path, new.trim_start_matches(['\r', '\n'])).is_ok();
     let _ = run("ipconfig.exe", &["/flushdns"]);
-    println!("{}", format!("{0}  hosts: {1} domains blocked", done(ok), BLOCK.len()));
+    println!("{}  hosts: {} domains blocked", if ok { "done  " } else { "FAILED" }, BLOCK.len());
     Ok(!ok as u32)
 }
 
@@ -498,46 +521,38 @@ fn apply(g: Group) -> Result<(), String> {
     let f = OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut log = Log(f);
     let failed = match g {
-        Group::Base => apply_services(&services(), &mut log)? + apply_regs(&regs(), &mut log)?,
+        Group::Base => apply_services(SERVICES, &mut log)? + apply_regs(REGS, &mut log)?,
         Group::Updaters => apply_updaters(&mut log)?,
         Group::Defender => apply_defender(&mut log)?,
-        Group::Ntfs => apply_regs(&ntfs_regs(), &mut log)?,
+        Group::Ntfs => apply_regs(NTFS_REGS, &mut log)?,
         Group::Dns => apply_dns(&mut log)?,
     };
     drop(log);
     if fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
         let _ = fs::remove_file(&path);
     }
-    println!("{}", format!("\nUndo information saved to {}. Some changes need a reboot or sign-out.", path.display()));
+    println!("\nUndo information saved to {}. Some changes need a reboot or sign-out.", path.display());
     if failed > 0 { Err(format!("{failed} change(s) failed (run as administrator)")) } else { Ok(()) }
-}
-
-fn restored(ok: bool) -> &'static str {
-    if ok {
-        "restored"
-    } else {
-        "FAILED  "
-    }
 }
 
 fn undo(g: Group) -> Result<(), String> {
     let path = undo_path(g);
     let Ok(text) = fs::read_to_string(&path) else {
-        println!("{}", "nothing to undo (no undo file)");
+        println!("nothing to undo (no undo file)");
         return Ok(());
     };
     let mut failed = 0;
     for line in text.lines().rev() {
-        let f: Vec<&str> = line.splitn(4, '|').collect();
-        let ok = match f.as_slice() {
-            ["svc", name, mode] => run("sc.exe", &["config", name, "start=", mode]).0,
-            ["reg", key, value, "-"] => run("reg.exe", &["delete", key, "/v", value, "/f"]).0 || reg_val(key, value) == Val::Missing,
-            ["reg", key, value, old] => run("reg.exe", &["add", key, "/v", value, "/t", "REG_DWORD", "/d", old, "/f"]).0,
-            ["task", name] => run("schtasks.exe", &["/change", "/tn", name, "/enable"]).0 || task_enabled(name).is_none(),
-            ["newtask", name] => run("schtasks.exe", &["/delete", "/tn", name, "/f"]).0 || task_enabled(name).is_none(),
-            ["mpx", "path", p] => ps(&format!("Remove-MpPreference -ErrorAction Stop -ExclusionPath {}", psq(p))).0,
-            ["mpx", "proc", p] => ps(&format!("Remove-MpPreference -ErrorAction Stop -ExclusionProcess {}", psq(p))).0,
-            ["hosts", "block"] => {
+        let mut it = line.splitn(4, '|');
+        let ok = match (it.next(), it.next(), it.next(), it.next()) {
+            (Some("svc"), Some(name), Some(mode), None) => run("sc.exe", &["config", name, "start=", mode]).0,
+            (Some("reg"), Some(key), Some(value), Some("-")) => run("reg.exe", &["delete", key, "/v", value, "/f"]).0 || reg_val(key, value) == Val::Missing,
+            (Some("reg"), Some(key), Some(value), Some(old)) => run("reg.exe", &["add", key, "/v", value, "/t", "REG_DWORD", "/d", old, "/f"]).0,
+            (Some("task"), Some(name), None, None) => run("schtasks.exe", &["/change", "/tn", name, "/enable"]).0 || task_enabled(name).is_none(),
+            (Some("newtask"), Some(name), None, None) => run("schtasks.exe", &["/delete", "/tn", name, "/f"]).0 || task_enabled(name).is_none(),
+            (Some("mpx"), Some("path"), Some(p), None) => ps(&format!("Remove-MpPreference -ErrorAction Stop -ExclusionPath {}", psq(p))).0,
+            (Some("mpx"), Some("proc"), Some(p), None) => ps(&format!("Remove-MpPreference -ErrorAction Stop -ExclusionProcess {}", psq(p))).0,
+            (Some("hosts"), Some("block"), None, None) => {
                 let p = hosts_path();
                 let ok = fs::read_to_string(&p).is_ok_and(|t| fs::write(&p, strip_block(&t)).is_ok());
                 let _ = run("ipconfig.exe", &["/flushdns"]);
@@ -546,13 +561,13 @@ fn undo(g: Group) -> Result<(), String> {
             _ => continue,
         };
         failed += !ok as u32;
-        println!("{}", format!("{0}  {1}", restored(ok), line));
+        println!("{}  {line}", if ok { "restored" } else { "FAILED  " });
     }
     if failed > 0 {
         return Err(format!("{failed} item(s) not restored; the undo file is kept at {}", path.display()));
     }
     fs::remove_file(&path).map_err(|e| e.to_string())?;
-    println!("{}", "\nRestored (services start again after a reboot or by hand).");
+    println!("\nRestored (services start again after a reboot or by hand).");
     Ok(())
 }
 
@@ -564,7 +579,7 @@ fn main() {
         Some(g) => match Group::parse(g) {
             Some(g) => g,
             None => {
-                eprintln!("{}", format!("unknown group '{g}' (updaters, defender, ntfs, dns)"));
+                eprintln!("unknown group '{g}' (updaters, defender, ntfs, dns)");
                 std::process::exit(2);
             }
         },
@@ -604,7 +619,7 @@ mod tests {
     #[test]
     fn every_registry_item_is_hkcu_or_hklm_and_unique() {
         let mut seen = std::collections::HashSet::new();
-        for (k, v, _, _) in regs().into_iter().chain(ntfs_regs()) {
+        for &(k, v, _, _) in REGS.iter().chain(NTFS_REGS) {
             assert!(k.starts_with("HKLM\\") || k.starts_with("HKCU\\"), "{k}");
             assert!(seen.insert((k, v)), "duplicate {k} {v}");
         }

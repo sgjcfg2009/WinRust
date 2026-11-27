@@ -1,9 +1,19 @@
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryW};
+use winapi::um::libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryW};
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
+fn utf16_from_le(bytes: &[u8]) -> String {
+    let mut w = [0u16; 256];
+    let mut n = 0;
+    for c in bytes.as_chunks::<2>().0 {
+        let u = u16::from_le_bytes([c[0], c[1]]);
+        if u == 0 || n == w.len() {
+            break;
+        }
+        w[n] = u;
+        n += 1;
+    }
+    String::from_utf16_lossy(&w[..n])
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -65,23 +75,26 @@ unsafe fn release(obj: *mut c_void) {
 }
 
 fn directx_level(adapter: *mut c_void) -> String {
+    const D3D12: [u16; 10] = [b'd' as u16, b'3' as u16, b'd' as u16, b'1' as u16, b'2' as u16, b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16, 0];
     unsafe {
-        let lib = LoadLibraryW(wide("d3d12.dll").as_ptr());
+        let lib = LoadLibraryW(D3D12.as_ptr());
         if lib.is_null() {
             return "DirectX 11".into();
         }
+        let mut out = "DirectX 11".to_string();
         let f = GetProcAddress(lib, c"D3D12CreateDevice".as_ptr());
-        if f.is_null() {
-            return "DirectX 11".into();
-        }
-        let create: unsafe extern "system" fn(*mut c_void, i32, *const Guid, *mut *mut c_void) -> i32 = std::mem::transmute(f);
-        for (fl, name) in [(0xC200, "12_2"), (0xC100, "12_1"), (0xC000, "12_0"), (0xB100, "11_1"), (0xB000, "11_0")] {
-            let hr = create(adapter, fl, &IID_ID3D12DEVICE, null_mut());
-            if hr == 0 || hr == 1 {
-                return format!("DirectX {} (FL {name})", if fl >= 0xC000 { "12" } else { "11" });
+        if !f.is_null() {
+            let create: unsafe extern "system" fn(*mut c_void, i32, *const Guid, *mut *mut c_void) -> i32 = std::mem::transmute(f);
+            for (fl, name) in [(0xC200, "12_2"), (0xC100, "12_1"), (0xC000, "12_0"), (0xB100, "11_1"), (0xB000, "11_0")] {
+                let hr = create(adapter, fl, &IID_ID3D12DEVICE, null_mut());
+                if hr == 0 || hr == 1 {
+                    out = format!("DirectX {} (FL {name})", if fl >= 0xC000 { "12" } else { "11" });
+                    break;
+                }
             }
         }
-        "DirectX 11".into()
+        FreeLibrary(lib);
+        out
     }
 }
 
@@ -129,9 +142,8 @@ fn locations() -> Vec<(String, String)> {
             let mut desc = [0u8; 512];
             let (mut bus, mut addr) = ([0u8; 4], [0u8; 4]);
             if prop(0 , &mut desc) && prop(0x10 , &mut bus) && prop(0x1C , &mut addr) {
-                let w: Vec<u16> = desc.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
                 let (b, a) = (u32::from_le_bytes(bus), u32::from_le_bytes(addr));
-                out.push((String::from_utf16_lossy(&w), format!("PCI bus {b}, device {}, function {}", (a >> 16) & 0xFFFF, a & 0xFFFF)));
+                out.push((utf16_from_le(&desc), format!("PCI bus {b}, device {}, function {}", (a >> 16) & 0xFFFF, a & 0xFFFF)));
             }
         }
         SetupDiDestroyDeviceInfoList(set);
@@ -158,8 +170,7 @@ pub fn adapters() -> Vec<Adapter> {
             let mut d = [0u8; 312];
             let get_desc1: unsafe extern "system" fn(*mut c_void, *mut u8) -> i32 = vtbl(ad, 10);
             if get_desc1(ad, d.as_mut_ptr()) == 0 {
-                let w: Vec<u16> = d[..256].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
-                let name = String::from_utf16_lossy(&w);
+                let name = utf16_from_le(&d[..256]);
                 let u64_at = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
                 let flags = u32::from_le_bytes([d[304], d[305], d[306], d[307]]);
                 let dup = out.iter().any(|a: &Adapter| a.name == name && a.dedicated == u64_at(272) && a.shared == u64_at(288));

@@ -2,7 +2,7 @@ use windows_sys::Win32::{
     Foundation::HWND,
     System::Threading::{AttachThreadInput, GetCurrentThreadId},
     UI::{
-        Input::KeyboardAndMouse::{INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, SendInput, SetFocus, VK_MENU},
+        Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow},
     },
 };
@@ -23,24 +23,6 @@ pub fn force(h: HWND) {
                 AttachThreadInput(me, ft, 0);
             }
         }
-        if GetForegroundWindow() != h {
-            keys(&[(VK_MENU, false), (0xE8, false), (0xE8, true)]);
-            SetForegroundWindow(h);
-            keys(&[(VK_MENU, true)]);
-        }
         SetFocus(h);
-    }
-}
-
-fn keys(k: &[(u16, bool)]) {
-    let mut buf: [INPUT; 4] = unsafe { std::mem::zeroed() };
-    let n = k.len().min(buf.len());
-    for (slot, &(vk, up)) in buf[..n].iter_mut().zip(k) {
-        slot.r#type = INPUT_KEYBOARD;
-        slot.Anonymous.ki.wVk = vk;
-        slot.Anonymous.ki.dwFlags = if up { KEYEVENTF_KEYUP } else { 0 };
-    }
-    if n > 0 {
-        unsafe { SendInput(n as u32, buf.as_ptr(), size_of::<INPUT>() as i32) };
     }
 }

@@ -106,7 +106,7 @@ impl Drop for Handle {
 }
 
 pub fn scan(drive: char) -> Result<HashMap<u32, Rec>, String> {
-    let path: Vec<u16> = format!("\\\\.\\{drive}:").encode_utf16().chain([0]).collect();
+    let path: [u16; 7] = [b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16, drive as u16, b':' as u16, 0];
     let h = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, ptr::null(), OPEN_EXISTING, 0, ptr::null_mut()) };
     if h == INVALID_HANDLE_VALUE { return Err(format!("cannot open volume {drive}: (run as administrator), error {}", unsafe { GetLastError() })); }
     let _guard = Handle(h);
@@ -171,7 +171,7 @@ pub fn human(b: u64) -> String {
 }
 
 pub fn totals(recs: &HashMap<u32, Rec>, logical: bool) -> HashMap<u32, u64> {
-    let mut tot: HashMap<u32, u64> = HashMap::new();
+    let mut tot: HashMap<u32, u64> = HashMap::with_capacity(recs.len() / 4);
     for (&id, r) in recs {
         let s = if logical { r.logical } else { r.alloc };
         if s == 0 || id == ROOT || id == 8 { continue; }

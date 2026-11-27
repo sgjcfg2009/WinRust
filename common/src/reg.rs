@@ -60,6 +60,44 @@ pub fn get_dword(path: &str, name: &str) -> Option<u32> {
     })
 }
 
+pub fn get_str(path: &str, name: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::*;
+    let (root, sub) = split_root(path)?;
+    crate::with_wide(sub, |sub_p| {
+        crate::with_wide(name, |name_p| unsafe {
+            let mut k = std::ptr::null_mut();
+            if RegOpenKeyExW(root, sub_p, 0, KEY_READ, &mut k) != 0 {
+                return None;
+            }
+            let (mut ty, mut len) = (0u32, 0u32);
+            let ok = RegQueryValueExW(k, name_p, std::ptr::null(), &mut ty, std::ptr::null_mut(), &mut len) == 0 && (ty == 1 || ty == 2);
+            if !ok {
+                RegCloseKey(k);
+                return None;
+            }
+            let n = (len as usize + 1) / 2;
+            let mut stack = [0u16; 260];
+            let mut heap = Vec::new();
+            let buf: &mut [u16] = if n <= stack.len() {
+                &mut stack[..n.max(1)]
+            } else {
+                heap.resize(n, 0);
+                &mut heap
+            };
+            let ok = RegQueryValueExW(k, name_p, std::ptr::null(), &mut ty, buf.as_mut_ptr().cast(), &mut len) == 0;
+            RegCloseKey(k);
+            if !ok {
+                return None;
+            }
+            let mut used = (len as usize / 2).min(buf.len());
+            while used > 0 && buf[used - 1] == 0 {
+                used -= 1;
+            }
+            Some(String::from_utf16_lossy(&buf[..used]))
+        })
+    })
+}
+
 pub fn dword(out: &str) -> Option<u32> {
     match value(out)? {
         ("REG_DWORD", d) => u32::from_str_radix(d.trim_start_matches("0x"), 16).ok(),
