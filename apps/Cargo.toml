@@ -1,0 +1,129 @@
+[package]
+name = "winrust-apps"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "debloat"
+path = "debloat.rs"
+
+[[bin]]
+name = "photoview"
+path = "photoview.rs"
+
+[[bin]]
+name = "purge"
+path = "purge.rs"
+
+[[bin]]
+name = "reshell"
+path = "reshell.rs"
+
+[[bin]]
+name = "rs-shell"
+path = "rs_shell.rs"
+
+[[bin]]
+name = "rtaskmgr-win32"
+path = "rtaskmgr.rs"
+
+[[bin]]
+name = "rust-explorer"
+path = "rust_explorer.rs"
+
+[[bin]]
+name = "rust-settings"
+path = "rust_settings.rs"
+
+[[bin]]
+name = "topbar"
+path = "topbar.rs"
+
+[dependencies]
+winrust-common = { path = "../common" }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_GdiPlus",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_Rras",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinInet",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_ExtensibleAuthenticationProtocol",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Accessibility",
+    "Win32_UI_ColorSystem",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows = { version = "0.62.2", features = [
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Networking_NetworkListManager",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_System_UpdateAgent",
+    "Win32_System_Variant",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+native-windows-gui = { version = "1.0.13", default-features = false, features = ["timer", "clipboard", "cursor", "tray-notification", "high-dpi", "embed-resource"] }
+sysinfo = { version = "0.40.3", default-features = false, features = ["system", "network", "disk"] }
+winapi = { version = "0.3", features = ["debugapi", "winsvc", "processthreadsapi", "winbase", "winnt", "handleapi", "shellapi", "errhandlingapi", "minwindef", "winuser", "wingdi", "winreg", "winerror", "sysinfoapi", "minwinbase", "windef", "commctrl", "winver", "psapi", "libloaderapi", "fileapi", "ioapiset", "ntdef", "setupapi", "guiddef", "securitybaseapi", "synchapi"] }
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["util", "ppmd", "bzip2", "deflate"] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[dev-dependencies]
+zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["util", "compress"] }

@@ -76,14 +76,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "debloat"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "winrust-common",
-]
-
-[[package]]
 name = "embed-resource"
 version = "3.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -290,16 +282,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "photoview"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "windows",
- "windows-sys",
- "winrust-common",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -330,14 +312,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "purge"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "winrust-common",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,60 +325,6 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
-
-[[package]]
-name = "reshell"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "windows-sys",
- "winrust-common",
-]
-
-[[package]]
-name = "rs-shell"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "windows-sys",
- "winrust-common",
-]
-
-[[package]]
-name = "rtaskmgr-win32"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "native-windows-gui",
- "sysinfo",
- "winapi",
- "windows-sys",
- "winrust-common",
-]
-
-[[package]]
-name = "rust-explorer"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "sevenz-rust2",
- "windows",
- "windows-core",
- "windows-sys",
- "winrust-common",
- "zip",
-]
-
-[[package]]
-name = "rust-settings"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "windows",
- "windows-core",
- "windows-sys",
- "winrust-common",
-]
 
 [[package]]
 name = "rustc_version"
@@ -563,17 +483,6 @@ name = "toml_writer"
 version = "1.2.0+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
-
-[[package]]
-name = "topbar"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "windows",
- "windows-core",
- "windows-sys",
- "winrust-common",
-]
 
 [[package]]
 name = "typed-path"
@@ -812,6 +721,22 @@ checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
  "windows-sys",
+]
+
+[[package]]
+name = "winrust-apps"
+version = "0.1.0"
+dependencies = [
+ "embed-resource",
+ "native-windows-gui",
+ "sevenz-rust2",
+ "sysinfo",
+ "winapi",
+ "windows",
+ "windows-core",
+ "windows-sys",
+ "winrust-common",
+ "zip",
 ]
 
 [[package]]

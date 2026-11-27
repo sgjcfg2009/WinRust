@@ -2,6 +2,7 @@
 Requires: Pillow, resvg-py
 """
 import io
+import os
 import re
 import struct
 from pathlib import Path
@@ -9,26 +10,24 @@ from PIL import Image
 import resvg_py
 
 ROOT = Path(__file__).resolve().parent.parent
-FLUENT_ASSETS = Path(r"c:\Users\Admin\Videos\Captures\fluentui-system-icons-main\assets")
+FLUENT_ASSETS = Path(os.environ.get("FLUENT_ICONS_DIR") or ROOT.parent / "fluentui-system-icons-main" / "assets")
 M = 1024
 PAD = 64
 SIZES = [16, 24, 32, 48, 64, 128, 256]
 
 # (relative_app_dir, asset_subpath, optional (top_hex, bottom_hex) gradient for monochrome _filled.svg)
 APPS = [
-    (".", r"Apps\SVG\ic_fluent_apps_48_color.svg", None),
-    ("plugins/rust-settings", r"Settings\SVG\ic_fluent_settings_48_color.svg", None),
-    ("plugins/photoview", r"Image\SVG\ic_fluent_image_48_color.svg", None),
-    ("plugins/rtaskmgr-win32", r"Gauge\SVG\ic_fluent_gauge_32_color.svg", None),
-    ("plugins/rust-search", r"Search Sparkle\SVG\ic_fluent_search_sparkle_48_color.svg", None),
-    ("plugins/wiztree", r"Data Pie\SVG\ic_fluent_data_pie_32_color.svg", None),
-    ("plugins/rust-explorer", r"Folder\SVG\ic_fluent_folder_48_filled.svg", ("#FCE100", "#F59E0B")),
-    ("plugins/topbar", r"Panel Bottom\SVG\ic_fluent_panel_bottom_20_filled.svg", ("#60CDFF", "#0078D4")),
-    ("plugins/rs-du", r"Hard Drive\SVG\ic_fluent_hard_drive_48_filled.svg", ("#94A3B8", "#475569")),
-    ("plugins/debloat", r"Broom\SVG\ic_fluent_broom_32_filled.svg", ("#34D399", "#059669")),
-    ("plugins/purge", r"Delete\SVG\ic_fluent_delete_48_filled.svg", ("#FB7185", "#E11D48")),
-    ("plugins/rs-shell", r"Window Console\SVG\ic_fluent_window_console_20_filled.svg", ("#38BDF8", "#0284C7")),
-    ("ReShell", r"Desktop\SVG\ic_fluent_desktop_48_filled.svg", ("#818CF8", "#2563EB")),
+    ("launcher/app.ico", r"Apps\SVG\ic_fluent_apps_48_color.svg", None),
+    ("apps/rust-settings.ico", r"Settings\SVG\ic_fluent_settings_48_color.svg", None),
+    ("apps/photoview.ico", r"Image\SVG\ic_fluent_image_48_color.svg", None),
+    ("apps/rtaskmgr-win32.ico", r"Gauge\SVG\ic_fluent_gauge_32_color.svg", None),
+    ("rust-search/app.ico", r"Search Sparkle\SVG\ic_fluent_search_sparkle_48_color.svg", None),
+    ("apps/rust-explorer.ico", r"Folder\SVG\ic_fluent_folder_48_filled.svg", ("#FCE100", "#F59E0B")),
+    ("apps/topbar.ico", r"Panel Bottom\SVG\ic_fluent_panel_bottom_20_filled.svg", ("#60CDFF", "#0078D4")),
+    ("apps/debloat.ico", r"Broom\SVG\ic_fluent_broom_32_filled.svg", ("#34D399", "#059669")),
+    ("apps/purge.ico", r"Delete\SVG\ic_fluent_delete_48_filled.svg", ("#FB7185", "#E11D48")),
+    ("apps/rs-shell.ico", r"Window Console\SVG\ic_fluent_window_console_20_filled.svg", ("#38BDF8", "#0284C7")),
+    ("apps/reshell.ico", r"Desktop\SVG\ic_fluent_desktop_48_filled.svg", ("#818CF8", "#2563EB")),
 ]
 
 
@@ -75,17 +74,18 @@ def write_ico(path: Path, img: Image.Image) -> None:
 
 
 def main() -> None:
-    # Delete all existing app.ico files first
-    for old_ico in ROOT.rglob("app.ico"):
+    missing = [FLUENT_ASSETS / asset_rel for _, asset_rel, _ in APPS if not (FLUENT_ASSETS / asset_rel).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing Fluent SVG: {missing[0]}")
+
+    for old_ico in ROOT.rglob("*.ico"):
         old_ico.unlink()
         print("deleted:", old_ico.relative_to(ROOT))
 
     for rel, asset_rel, grad in APPS:
         svg_path = FLUENT_ASSETS / asset_rel
-        if not svg_path.is_file():
-            raise FileNotFoundError(f"Missing Fluent SVG: {svg_path}")
         img = render_svg(svg_path, grad)
-        out_ico = ROOT / rel / "app.ico"
+        out_ico = ROOT / rel
         write_ico(out_ico, img)
         print("wrote:", out_ico.relative_to(ROOT), "<-", asset_rel)
 

@@ -1,9 +1,10 @@
 # Build outputs
 /target/
-/plugins/*/target/
+/rust-search/target/
 /out/
 /payload/
 /tools/
+/test-apps/
 
 # Binaries & debug artifacts
 *.exe

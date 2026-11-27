@@ -8,7 +8,7 @@ $root = Split-Path $PSScriptRoot
 $bin = "$env:LOCALAPPDATA\plugin-launcher\bin"
 $exe = "$Name.exe"
 if (-not (Test-Path "$bin\rs-shell.exe")) { throw "run scripts\user-mode.ps1 first" }
-Push-Location $root; cargo build --release -p $Name; $rc = $LASTEXITCODE; Pop-Location
+Push-Location $root; cargo build --release -p winrust-apps --bin $Name; $rc = $LASTEXITCODE; Pop-Location
 if ($rc -ne 0) { throw "cargo build failed" }
 $to = "$bin\$exe"
 if (Test-Path $to) { Rename-Item $to ("$exe." + (Get-Date -Format HHmmssfff) + '.old') -Force }

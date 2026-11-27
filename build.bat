@@ -140,7 +140,7 @@ try {
     Pop-Location
 }
 
-Push-Location -LiteralPath (Join-Path $Root 'plugins\rust-search')
+Push-Location -LiteralPath (Join-Path $Root 'rust-search')
 try {
     & $cargoCmd build --release -j "$Jobs"
     if ($LASTEXITCODE -ne 0) { throw "rust-search build failed (exit $LASTEXITCODE)" }
@@ -153,7 +153,7 @@ $testDir = Join-Path $Root 'test-apps'
 $testAdvDir = Join-Path $testDir 'system'
 New-Item -ItemType Directory -Force -Path $payloadDir, $testDir, $testAdvDir | Out-Null
 $systemOnly = @('debloat.exe', 'purge.exe', 'rs-shell.exe', 'reshell.exe')
-foreach ($line in Get-Content (Join-Path $Root 'payload.txt')) {
+foreach ($line in Get-Content (Join-Path $Root 'launcher\payload.txt')) {
     if ($line -match '^\s*(#|$)') { continue }
     $name, $src = $line -split '=', 2
     $exeName = $name.Trim()

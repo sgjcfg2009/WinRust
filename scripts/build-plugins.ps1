@@ -8,9 +8,9 @@ function Build([string]$dir, [string[]]$a) {
     try { cargo build --release @a; if ($LASTEXITCODE) { throw "cargo build failed in $dir" } } finally { Pop-Location }
 }
 Build $root '--workspace', '--exclude', 'plugin-launcher' # the launcher embeds payload\, so it is built after the copy
-Build "$root\plugins\rust-search" @()                     # outside the workspace (needs panic = unwind, see Cargo.toml)
+Build "$root\rust-search" @()                             # outside the workspace (needs panic = unwind, see Cargo.toml)
 New-Item -ItemType Directory -Force "$root\payload" | Out-Null
-foreach ($l in Get-Content "$root\payload.txt") {
+foreach ($l in Get-Content "$root\launcher\payload.txt") {
     if ($l -match '^\s*(#|$)') { continue }
     $name, $src = $l -split '=', 2
     Copy-Item (Join-Path $root $src.Trim()) (Join-Path "$root\payload" $name.Trim()) -Force
