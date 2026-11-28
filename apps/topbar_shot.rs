@@ -44,6 +44,13 @@ pub(crate) unsafe fn screenshot_notice(bar: HWND) {
         None => "Could not take a screenshot",
     };
     KillTimer(bar, 2);
-    show_tip(msg.to_string(), GetSystemMetrics(SM_CXSCREEN) / 2);
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    let cx = if GetMonitorInfoW(MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST), &mut mi) != 0 {
+        (mi.rcMonitor.right - mi.rcMonitor.left) / 2
+    } else {
+        GetSystemMetrics(SM_CXSCREEN) / 2
+    };
+    show_tip(msg.to_string(), cx);
     SetTimer(bar, 6, 2500, None);
 }

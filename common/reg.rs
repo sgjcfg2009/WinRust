@@ -65,35 +65,30 @@ pub fn get_str(path: &str, name: &str) -> Option<String> {
     let (root, sub) = split_root(path)?;
     crate::with_wide(sub, |sub_p| {
         crate::with_wide(name, |name_p| unsafe {
-            let mut k = std::ptr::null_mut();
-            if RegOpenKeyExW(root, sub_p, 0, KEY_READ, &mut k) != 0 {
-                return None;
-            }
-            let (mut ty, mut len) = (0u32, 0u32);
-            let ok = RegQueryValueExW(k, name_p, std::ptr::null(), &mut ty, std::ptr::null_mut(), &mut len) == 0 && (ty == 1 || ty == 2);
-            if !ok {
-                RegCloseKey(k);
-                return None;
-            }
-            let n = (len as usize + 1) / 2;
+            let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
             let mut stack = [0u16; 260];
-            let mut heap = Vec::new();
-            let buf: &mut [u16] = if n <= stack.len() {
-                &mut stack[..n.max(1)]
-            } else {
-                heap.resize(n, 0);
-                &mut heap
-            };
-            let ok = RegQueryValueExW(k, name_p, std::ptr::null(), &mut ty, buf.as_mut_ptr().cast(), &mut len) == 0;
-            RegCloseKey(k);
-            if !ok {
+            let mut len = (stack.len() * 2) as u32;
+            let rc = RegGetValueW(root, sub_p, name_p, flags, std::ptr::null_mut(), stack.as_mut_ptr().cast(), &mut len);
+            if rc == 0 {
+                let mut used = (len as usize / 2).min(stack.len());
+                while used > 0 && stack[used - 1] == 0 {
+                    used -= 1;
+                }
+                return Some(String::from_utf16_lossy(&stack[..used]));
+            }
+            if rc != 234 {
                 return None;
             }
-            let mut used = (len as usize / 2).min(buf.len());
-            while used > 0 && buf[used - 1] == 0 {
+            let mut heap = vec![0u16; (len as usize + 1) / 2 + 16];
+            let mut hlen = (heap.len() * 2) as u32;
+            if RegGetValueW(root, sub_p, name_p, flags, std::ptr::null_mut(), heap.as_mut_ptr().cast(), &mut hlen) != 0 {
+                return None;
+            }
+            let mut used = (hlen as usize / 2).min(heap.len());
+            while used > 0 && heap[used - 1] == 0 {
                 used -= 1;
             }
-            Some(String::from_utf16_lossy(&buf[..used]))
+            Some(String::from_utf16_lossy(&heap[..used]))
         })
     })
 }

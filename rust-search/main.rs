@@ -6,7 +6,7 @@ use std::{
     os::windows::io::FromRawHandle,
     path::PathBuf,
     ptr,
-    sync::{Arc, RwLock},
+    sync::{Arc, Condvar, Mutex, RwLock},
     thread,
     time::{Duration, Instant},
 };
@@ -129,7 +129,7 @@ impl Index {
                     })
                 })
                 .collect();
-            jobs.into_iter().flat_map(|j| j.join().unwrap()).collect()
+            jobs.into_iter().filter_map(|j| j.join().ok()).flatten().collect()
         })
     }
 
@@ -164,15 +164,21 @@ impl Index {
         if b.len() < HEADER || &b[..8] != MAGIC {
             return None;
         }
-        let num = |i: usize| u64::from_le_bytes(b[8 + i * 8..16 + i * 8].try_into().unwrap());
-        let (jid, usn, n_ents, arena_len, live) = (num(0), num(1) as i64, num(2) as usize, num(3) as usize, num(4) as usize);
+        let num = |i: usize| -> Option<u64> {
+            Some(u64::from_le_bytes(b.get(8 + i * 8..16 + i * 8)?.try_into().ok()?))
+        };
+        let (jid, usn, n_ents, arena_len, live) = (num(0)?, num(1)? as i64, num(2)? as usize, num(3)? as usize, num(4)? as usize);
         if n_ents > MAX_REC || b.len() != HEADER + n_ents * 12 + arena_len {
             return None;
         }
         let arena = b[HEADER + n_ents * 12..].to_vec();
         let (mut ents, mut seen, mut used) = (Vec::with_capacity(n_ents), 0usize, 0usize);
         for c in b[HEADER..HEADER + n_ents * 12].chunks_exact(12) {
-            let e = Ent { parent: u32::from_le_bytes(c[0..4].try_into().unwrap()), off: u32::from_le_bytes(c[4..8].try_into().unwrap()), len: u16::from_le_bytes(c[8..10].try_into().unwrap()) };
+            let e = Ent {
+                parent: u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                off: u32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                len: u16::from_le_bytes([c[8], c[9]]),
+            };
             if e.len > 0 {
                 let name = arena.get(e.off as usize..e.off as usize + e.len as usize)?;
                 std::str::from_utf8(name).ok()?;
@@ -210,17 +216,17 @@ fn records(b: &[u8], buf: &mut String, mut f: impl FnMut(u64, u64, u32, &str)) {
     let mut off = 8;
     while off + 60 <= b.len() {
         let r = &b[off..];
-        let len = u32::from_le_bytes(r[0..4].try_into().unwrap()) as usize;
-        if len == 0 || u16::from_le_bytes(r[4..6].try_into().unwrap()) != 2 {
+        let len = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+        if len < 60 || len > r.len() || u16::from_le_bytes([r[4], r[5]]) != 2 {
             break;
         }
-        let frn = u64::from_le_bytes(r[8..16].try_into().unwrap());
-        let parent = u64::from_le_bytes(r[16..24].try_into().unwrap());
-        let reason = u32::from_le_bytes(r[40..44].try_into().unwrap());
-        let nlen = u16::from_le_bytes(r[56..58].try_into().unwrap()) as usize;
-        let noff = u16::from_le_bytes(r[58..60].try_into().unwrap()) as usize;
-        let end = noff.saturating_add(nlen);
-        if len > r.len() || noff < 60 || end > len {
+        let frn = u64::from_le_bytes([r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]]);
+        let parent = u64::from_le_bytes([r[16], r[17], r[18], r[19], r[20], r[21], r[22], r[23]]);
+        let reason = u32::from_le_bytes([r[40], r[41], r[42], r[43]]);
+        let nlen = u16::from_le_bytes([r[56], r[57]]) as usize;
+        let noff = u16::from_le_bytes([r[58], r[59]]) as usize;
+        let Some(end) = noff.checked_add(nlen) else { break };
+        if noff < 60 || end > len {
             break;
         }
         buf.clear();
@@ -259,7 +265,10 @@ fn scan(h: HANDLE) -> Result<Index, String> {
             } else { Err(format!("FSCTL_ENUM_USN_DATA failed (error {e})")) };
         }
         let b = &buf[..n as usize];
-        med.StartFileReferenceNumber = u64::from_le_bytes(b[..8].try_into().unwrap());
+        if b.len() < 8 {
+            return Err("FSCTL_ENUM_USN_DATA returned truncated buffer".into());
+        }
+        med.StartFileReferenceNumber = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
         records(b, &mut name, |frn, parent, _, name| {
             idx.insert(frn, parent, name);
         });
@@ -285,7 +294,7 @@ struct Shared {
     dirty: bool,
 }
 
-fn tail(drive: char, sh: &RwLock<Shared>) {
+fn tail(drive: char, sh: &RwLock<Shared>, sig: &(Mutex<bool>, Condvar)) {
     let h = match open_volume(drive) {
         Ok(h) => h,
         Err(e) => return eprintln!("{e}"),
@@ -293,7 +302,7 @@ fn tail(drive: char, sh: &RwLock<Shared>) {
     let mask = USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_RENAME_NEW_NAME;
     let mut buf = vec![0u8; 1 << 16];
     let (jid, mut usn) = {
-        let g = sh.read().unwrap();
+        let g = sh.read().unwrap_or_else(|e| e.into_inner());
         (g.jid, g.usn)
     };
     let mut name = String::with_capacity(260);
@@ -309,9 +318,12 @@ fn tail(drive: char, sh: &RwLock<Shared>) {
             return;
         }
         let b = &buf[..n as usize];
-        usn = i64::from_le_bytes(b[..8].try_into().unwrap());
-        if b.len() > 8 || usn != sh.read().unwrap().usn {
-            let mut g = sh.write().unwrap();
+        if b.len() < 8 {
+            continue;
+        }
+        usn = i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+        if b.len() > 8 || usn != sh.read().unwrap_or_else(|e| e.into_inner()).usn {
+            let mut g = sh.write().unwrap_or_else(|e| e.into_inner());
             if b.len() > 8 {
                 records(b, &mut name, |frn, parent, reason, name| {
                     if reason & USN_REASON_FILE_DELETE != 0 {
@@ -321,15 +333,17 @@ fn tail(drive: char, sh: &RwLock<Shared>) {
                     }
                 });
                 g.dirty = true;
+                *sig.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                sig.1.notify_one();
             }
             g.usn = usn;
         }
     }
 }
 
-fn maintain(drive: char, sh: Arc<RwLock<Shared>>) {
+fn maintain(drive: char, sh: Arc<RwLock<Shared>>, sig: Arc<(Mutex<bool>, Condvar)>) {
     loop {
-        tail(drive, &sh);
+        tail(drive, &sh, &sig);
         thread::sleep(Duration::from_secs(10));
         loop {
             match open_volume(drive).and_then(|h| {
@@ -338,7 +352,9 @@ fn maintain(drive: char, sh: Arc<RwLock<Shared>>) {
                 r
             }) {
                 Ok((idx, j)) => {
-                    *sh.write().unwrap() = Shared { idx, jid: j.UsnJournalID, usn: j.NextUsn, dirty: true };
+                    *sh.write().unwrap_or_else(|e| e.into_inner()) = Shared { idx, jid: j.UsnJournalID, usn: j.NextUsn, dirty: true };
+                    *sig.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                    sig.1.notify_one();
                     eprintln!("index rebuilt");
                     break;
                 }
@@ -363,7 +379,7 @@ fn load_saved(drive: char, j: &USN_JOURNAL_DATA_V0) -> Option<(Index, i64)> {
 fn save(drive: char, sh: &RwLock<Shared>) {
     let Some(path) = index_path(drive) else { return };
     let (saved_usn, r) = {
-        let g = sh.read().unwrap();
+        let g = sh.read().unwrap_or_else(|e| e.into_inner());
         if !g.dirty {
             return;
         }
@@ -378,7 +394,7 @@ fn save(drive: char, sh: &RwLock<Shared>) {
     };
     match r {
         Ok(()) => {
-            let mut g = sh.write().unwrap();
+            let mut g = sh.write().unwrap_or_else(|e| e.into_inner());
             if g.usn == saved_usn {
                 g.dirty = false;
             }
@@ -432,7 +448,7 @@ fn ends_with_ci_ascii(s: &str, suffix: &str) -> bool {
     s.len() >= suffix.len() && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
-fn query(idx: &Index, drive: char, terms: &[String]) -> (Vec<String>, usize) {
+fn query(idx: &Index, drive: char, terms: &[String], scope: Option<&str>) -> (Vec<String>, usize) {
     let t0 = &terms[0];
     let t0_ascii = t0.is_ascii();
     let mut hits: Vec<(u8, u8, usize, u32)> = idx.par_filter_map(|rec, n| {
@@ -448,6 +464,31 @@ fn query(idx: &Index, drive: char, terms: &[String]) -> (Vec<String>, usize) {
         };
         Some((!(ends_with_ci_ascii(n, ".lnk") || ends_with_ci_ascii(n, ".exe")) as u8, rank, n.len(), rec))
     });
+    if let Some(prefix) = scope {
+        let mut paths: Vec<(u8, u8, u8, usize, String)> = hits
+            .into_iter()
+            .filter_map(|(_, rank, _, f)| {
+                let p = full_path(idx, drive, f);
+                if p.len() < prefix.len() || !p.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
+                    if !p.to_lowercase().starts_with(prefix) {
+                        return None;
+                    }
+                }
+                let tier = if ends_with_ci_ascii(&p, ".lnk") {
+                    if contains_ci(&p, START_MENU) { 0 } else { 1 }
+                } else if ends_with_ci_ascii(&p, ".exe") {
+                    2
+                } else {
+                    3
+                };
+                let junk = JUNK.iter().any(|j| contains_ci(&p, j)) as u8;
+                Some((tier, rank, junk, p.len(), p))
+            })
+            .collect();
+        let total = paths.len();
+        paths.sort_unstable();
+        return (paths.into_iter().take(SHOW).map(|t| t.4).collect(), total);
+    }
     let total = hits.len();
     const CAND: usize = 1000;
     if hits.len() > CAND {
@@ -458,9 +499,14 @@ fn query(idx: &Index, drive: char, terms: &[String]) -> (Vec<String>, usize) {
         .into_iter()
         .map(|(_, rank, _, f)| {
             let p = full_path(idx, drive, f);
-            let l = p.to_lowercase();
-            let tier = if l.ends_with(".lnk") { if l.contains(START_MENU) { 0 } else { 1 } } else if l.ends_with(".exe") { 2 } else { 3 };
-            let junk = JUNK.iter().any(|j| l.contains(j)) as u8;
+            let tier = if ends_with_ci_ascii(&p, ".lnk") {
+                if contains_ci(&p, START_MENU) { 0 } else { 1 }
+            } else if ends_with_ci_ascii(&p, ".exe") {
+                2
+            } else {
+                3
+            };
+            let junk = JUNK.iter().any(|j| contains_ci(&p, j)) as u8;
             (tier, rank, junk, p.len(), p)
         })
         .collect();
@@ -472,8 +518,8 @@ const START_MENU: &str = "\\start menu\\programs\\";
 
 const JUNK: [&str; 2] = ["\\winsxs\\", "\\windowsapps\\"];
 
-fn render(idx: &Index, drive: char, terms: &[String]) -> String {
-    let (paths, total) = query(idx, drive, terms);
+fn render(idx: &Index, drive: char, terms: &[String], scope: Option<&str>) -> String {
+    let (paths, total) = query(idx, drive, terms, scope);
     let mut out = paths.join("\n");
     if !out.is_empty() {
         out.push('\n');
@@ -508,17 +554,27 @@ fn serve(drive: char, allow: Option<String>) -> Result<(), String> {
     eprintln!("{how} {} entries in {:?}, serving {}", idx.len(), t.elapsed(), pipe_name(drive));
     let idx = Arc::new(RwLock::new(Shared { idx, jid: j.UsnJournalID, usn, dirty: how == "scanned" }));
 
+    let dirty_sig = Arc::new((Mutex::new(how == "scanned"), Condvar::new()));
     let sh = idx.clone();
-    thread::spawn(move || maintain(drive, sh));
+    let sig_m = dirty_sig.clone();
+    thread::spawn(move || maintain(drive, sh, sig_m));
     let sh = idx.clone();
+    let sig_s = dirty_sig;
     thread::spawn(move || loop {
+        {
+            let mut g = sig_s.0.lock().unwrap_or_else(|e| e.into_inner());
+            while !*g {
+                g = sig_s.1.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            *g = false;
+        }
         save(drive, &sh);
         thread::sleep(SAVE_EVERY);
     });
 
     let name: Vec<u16> = pipe_name(drive).encode_utf16().chain([0]).collect();
     let pipe = unsafe {
-        CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 1 << 16, 1 << 16, 0, sa.as_ref().map_or(ptr::null(), |s| s as *const _))
+        CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_WAIT, 4, 1 << 16, 1 << 16, 0, sa.as_ref().map_or(ptr::null(), |s| s as *const _))
     };
     if let Some(s) = sa {
         if !s.lpSecurityDescriptor.is_null() {
@@ -534,9 +590,23 @@ fn serve(drive: char, allow: Option<String>) -> Result<(), String> {
             let mut f = ManuallyDrop::new(unsafe { File::from_raw_handle(pipe as _) });
             let mut buf = [0u8; 4096];
             if let Ok(n) = f.read(&mut buf) {
-                let terms = split_terms(&String::from_utf8_lossy(&buf[..n]));
+                let raw = String::from_utf8_lossy(&buf[..n]);
+                let (scope, q_part) = if let Some(rest) = raw.strip_prefix("scope:") {
+                    if let Some((dir, q)) = rest.split_once('\n') {
+                        let mut p = dir.trim().to_lowercase();
+                        if !p.ends_with('\\') {
+                            p.push('\\');
+                        }
+                        (Some(p), q)
+                    } else {
+                        (None, raw.as_ref())
+                    }
+                } else {
+                    (None, raw.as_ref())
+                };
+                let terms = split_terms(q_part);
                 if !terms.is_empty() {
-                    let out = render(&idx.read().unwrap().idx, drive, &terms);
+                    let out = render(&idx.read().unwrap_or_else(|e| e.into_inner()).idx, drive, &terms, scope.as_deref());
                     let _ = f.write_all(out.as_bytes());
                     let _ = f.sync_all();
                 }
@@ -557,7 +627,7 @@ fn bench(drive: char, args: &[String]) -> Result<(), String> {
     let idx = idx?;
     for _ in 0..5 {
         let t = Instant::now();
-        let (_, total) = query(&idx, drive, &terms);
+        let (_, total) = query(&idx, drive, &terms, None);
         println!("query {:?} -> {total} hits in {:?}", terms, t.elapsed());
     }
     Ok(())
@@ -710,7 +780,7 @@ fn main() {
             std::process::exit(1);
         });
         eprintln!("no server running; indexed {} entries on {d}: in {:?}", idx.len(), t.elapsed());
-        print!("{}", render(&idx, d, &terms));
+        print!("{}", render(&idx, d, &terms, None));
     }
 }
 

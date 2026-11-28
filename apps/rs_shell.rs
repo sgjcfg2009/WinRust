@@ -9,34 +9,15 @@ use std::{
 use windows_sys::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT},
+        System::Threading::{OpenProcess, WaitForMultipleObjects, WaitForSingleObject},
         UI::{
+            Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             Input::KeyboardAndMouse::{MOD_NOREPEAT, MOD_WIN, RegisterHotKey, UnregisterHotKey},
             WindowsAndMessaging::*,
         },
     },
     core::BOOL,
 };
-
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn SetWinEventHook(
-        event_min: u32,
-        event_max: u32,
-        hmod_win_event_proc: *mut core::ffi::c_void,
-        pfn_win_event_proc: Option<unsafe extern "system" fn(isize, u32, HWND, i32, i32, u32, u32)>,
-        id_process: u32,
-        id_thread: u32,
-        dw_flags: u32,
-    ) -> isize;
-    fn UnhookWinEvent(h_win_event_hook: isize) -> BOOL;
-}
-
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn OpenProcess(dw_desired_access: u32, b_inherit_handle: BOOL, dw_process_id: u32) -> HANDLE;
-    fn WaitForSingleObject(h_handle: HANDLE, dw_milliseconds: u32) -> u32;
-    fn WaitForMultipleObjects(n_count: u32, lp_handles: *const HANDLE, b_wait_all: BOOL, dw_milliseconds: u32) -> u32;
-}
 
 const TOPBAR_CLS: [u16; 7] = [b't' as u16, b'o' as u16, b'p' as u16, b'b' as u16, b'a' as u16, b'r' as u16, 0];
 const PROGMAN_CLS: [u16; 8] = [b'P' as u16, b'r' as u16, b'o' as u16, b'g' as u16, b'm' as u16, b'a' as u16, b'n' as u16, 0];
@@ -182,7 +163,7 @@ fn hwnd_proc(h: HWND) -> HANDLE {
     unsafe { OpenProcess(0x0010_0000, 0, pid) }
 }
 
-unsafe extern "system" fn on_minimize(_: isize, _: u32, h: HWND, id_obj: i32, id_child: i32, _: u32, _: u32) {
+unsafe extern "system" fn on_minimize(_: HWINEVENTHOOK, _: u32, h: HWND, id_obj: i32, id_child: i32, _: u32, _: u32) {
     if id_obj == 0 && id_child == 0 && !h.is_null() {
         unsafe { park(h, 0) };
     }
@@ -194,7 +175,7 @@ unsafe extern "system" fn park(h: HWND, _: LPARAM) -> BOOL {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(h, &mut r);
             if r.left > -30000 {
-                SetWindowPos(h, ptr::null_mut(), -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                SetWindowPos(h, ptr::null_mut(), -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
             }
         }
         1
@@ -313,10 +294,13 @@ fn run_shell() {
 }
 
 fn hotkey_loop() {
+    let has_reshell = find_exe("reshell.exe").exists();
     unsafe {
         let hook = SetWinEventHook(0x0016, 0x0016, ptr::null_mut(), Some(on_minimize), 0, 0, 0);
-        RegisterHotKey(ptr::null_mut(), 1, MOD_WIN | MOD_NOREPEAT, 'D' as u32);
-        RegisterHotKey(ptr::null_mut(), 2, MOD_WIN | MOD_NOREPEAT, 'E' as u32);
+        if !has_reshell {
+            RegisterHotKey(ptr::null_mut(), 1, MOD_WIN | MOD_NOREPEAT, 'D' as u32);
+            RegisterHotKey(ptr::null_mut(), 2, MOD_WIN | MOD_NOREPEAT, 'E' as u32);
+        }
         let mut m: MSG = std::mem::zeroed();
         while GetMessageW(&mut m, ptr::null_mut(), 0, 0) > 0 {
             match (m.message == WM_HOTKEY).then_some(m.wParam) {
@@ -328,9 +312,11 @@ fn hotkey_loop() {
                 _ => {}
             }
         }
-        UnregisterHotKey(ptr::null_mut(), 1);
-        UnregisterHotKey(ptr::null_mut(), 2);
-        if hook != 0 {
+        if !has_reshell {
+            UnregisterHotKey(ptr::null_mut(), 1);
+            UnregisterHotKey(ptr::null_mut(), 2);
+        }
+        if !hook.is_null() {
             UnhookWinEvent(hook);
         }
     }

@@ -121,8 +121,7 @@ fn code_lengths(freq: &[u32], limit: u32, len: &mut [u8]) {
     }
     let mut next = n;
     while heap.len() > 1 {
-        let std::cmp::Reverse((fa, a)) = heap.pop().unwrap();
-        let std::cmp::Reverse((fb, b)) = heap.pop().unwrap();
+        let (Some(std::cmp::Reverse((fa, a))), Some(std::cmp::Reverse((fb, b)))) = (heap.pop(), heap.pop()) else { break };
         parent[a] = next;
         parent[b] = next;
         heap.push(std::cmp::Reverse((fa + fb, next)));
@@ -141,7 +140,7 @@ fn code_lengths(freq: &[u32], limit: u32, len: &mut [u8]) {
     let full = 1u64 << limit;
     used.sort_by_key(|&i| std::cmp::Reverse(freq[i]));
     while kraft > full {
-        let i = *used.iter().filter(|&&i| (len[i] as u32) < limit).max_by_key(|&&i| (len[i], std::cmp::Reverse(freq[i]))).unwrap();
+        let Some(&i) = used.iter().filter(|&&i| (len[i] as u32) < limit).max_by_key(|&&i| (len[i], std::cmp::Reverse(freq[i]))) else { break };
         kraft -= unit(len[i]) / 2;
         len[i] += 1;
     }
@@ -270,7 +269,11 @@ impl Deflater {
             }
             let mut l = 0;
             while l + 8 <= max {
-                let x = u64::from_le_bytes(d[c + l..c + l + 8].try_into().unwrap()) ^ u64::from_le_bytes(d[i + l..i + l + 8].try_into().unwrap());
+                let (Some(a), Some(b)) = (d.get(c + l..c + l + 8), d.get(i + l..i + l + 8)) else { break };
+                let (mut ba, mut bb) = ([0u8; 8], [0u8; 8]);
+                ba.copy_from_slice(a);
+                bb.copy_from_slice(b);
+                let x = u64::from_le_bytes(ba) ^ u64::from_le_bytes(bb);
                 if x != 0 {
                     l += (x.trailing_zeros() / 8) as usize;
                     break;

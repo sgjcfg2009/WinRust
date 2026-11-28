@@ -238,6 +238,9 @@ impl BackBuf {
 
 thread_local! {
     static ROWHOT: Cell<isize> = const { Cell::new(-1) };
+    static TRACK_LIST: Cell<bool> = const { Cell::new(false) };
+    static TRACK_CHROME: Cell<bool> = const { Cell::new(false) };
+    static TRACK_NAV: Cell<bool> = const { Cell::new(false) };
     static FONTS: Cell<(isize, isize)> = const { Cell::new((0, 0)) };
     static PC_SEL: Cell<isize> = const { Cell::new(-1) };
     static PC_SCROLL: Cell<i32> = const { Cell::new(0) };
@@ -778,6 +781,7 @@ pub unsafe fn fit_columns(list: HWND) {
         ShowScrollBar(list, 0, 0);
     }
     SendMessageW(list, WM_SETREDRAW, 1, 0);
+    InvalidateRect(list, ptr::null(), 0);
     let hdr = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
     if !hdr.is_null() { InvalidateRect(hdr, ptr::null(), 0); }
 }
@@ -972,13 +976,15 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
             WM_MOUSEMOVE => {
                 let hit = pc_hit(h, x, y).map_or(-1, |(i, _)| i as isize);
                 if ROWHOT.replace(hit) != hit {
+                    InvalidateRect(h, ptr::null(), 0);
+                }
+                if !TRACK_LIST.replace(true) {
                     let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
                     TrackMouseEvent(&mut tme);
-                    InvalidateRect(h, ptr::null(), 0);
                 }
                 return 0;
             }
-            WM_MOUSELEAVE => { ROWHOT.set(-1); InvalidateRect(h, ptr::null(), 0); return 0; }
+            WM_MOUSELEAVE => { TRACK_LIST.set(false); ROWHOT.set(-1); InvalidateRect(h, ptr::null(), 0); return 0; }
             WM_LBUTTONDOWN => {
                 SetFocus(h);
                 match pc_hit(h, x, y) {
@@ -1074,14 +1080,17 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
             ht.pt = POINT { x: mx, y: my };
             SendMessageW(h, LVM_HITTEST, 0, &mut ht as *mut _ as isize)
         };
+        if !TRACK_LIST.replace(true) {
+            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
+            TrackMouseEvent(&mut tme);
+        }
         let old = ROWHOT.replace(i);
         if old != i {
             redraw_row(h, old);
             redraw_row(h, i);
-            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
-            TrackMouseEvent(&mut tme);
         }
     } else if m == WM_MOUSELEAVE {
+        TRACK_LIST.set(false);
         redraw_row(h, ROWHOT.replace(-1));
     } else if matches!(m, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP) && !crate::desk() && is_empty_hit(h, mx, my) {
         match m {
@@ -1118,9 +1127,6 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
                     let (dc, r, i) = (nm.hdc, nm.rc, nm.dwItemSpec);
                     SetDCBrushColor(dc, listbg());
                     FillRect(dc, &r, GetStockObject(DC_BRUSH as i32) as HBRUSH);
-                    if i < 3 {
-                        fill(dc, rc(r.right - 1, r.top + sc(10), r.right, r.bottom - sc(10)), mix(listbg(), pal().text, 0.05), 0);
-                    }
                     let mut buf = [0u16; 128];
                     let mut it: HDITEMW = std::mem::zeroed();
                     it.mask = HDI_TEXT;
@@ -1564,11 +1570,14 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_TIMER if wp == 4 => { InvalidateRect(h, ptr::null(), 0); }
         WM_MOUSEMOVE => {
             let k = match hit(&layout_now(), x, y) { NONE => crumb_at(x, y).map_or(NONE, |i| CRUMB + i as i32), k => k };
-            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
-            TrackMouseEvent(&mut tme);
+            if !TRACK_CHROME.replace(true) {
+                let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
+                TrackMouseEvent(&mut tme);
+            }
             if HOT.replace(k) != k { InvalidateRect(h, ptr::null(), 0); }
         }
         WM_MOUSELEAVE => {
+            TRACK_CHROME.set(false);
             HOT.set(NONE);
             InvalidateRect(h, ptr::null(), 0);
         }
@@ -1671,7 +1680,10 @@ struct MenuState<'a> {
     hot: isize,
     picked: Option<usize>,
     done: bool,
-    sub_open: bool,
+    sub_hwnd: HWND,
+    sub_idx: isize,
+    tracking: bool,
+    is_sub: bool,
 }
 
 fn menu_fonts() -> (HFONT, HFONT) {
@@ -1691,10 +1703,14 @@ unsafe extern "system" fn menu_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
     }
     let ptr = GetWindowLongPtrW(h, GWLP_USERDATA) as *mut MenuState<'_>;
     if ptr.is_null() { return DefWindowProcW(h, m, wp, lp); }
-    let st = &mut *ptr;
     match m {
         WM_ERASEBKGND => return 1,
+        0x0021 => {
+            if (*ptr).is_sub { return 3; }
+            DefWindowProcW(h, m, wp, lp)
+        }
         WM_PAINT => {
+            let st = &mut *ptr;
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let wdc = BeginPaint(h, &mut ps);
             let mut cr: RECT = std::mem::zeroed();
@@ -1743,15 +1759,24 @@ unsafe extern "system" fn menu_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_MOUSEMOVE => {
-            let y = ((lp >> 16) & 0xFFFF) as i16 as i32 + st.scroll;
-            let hit = st.ys.iter().position(|&(a, b)| y >= a && y < b).map_or(-1, |i| i as isize);
-            if st.hot != hit {
-                st.hot = hit;
+            let y = ((lp >> 16) & 0xFFFF) as i16 as i32 + (*ptr).scroll;
+            let hit = (*ptr).ys.iter().position(|&(a, b)| y >= a && y < b).map_or(-1, |i| i as isize);
+            if !(*ptr).tracking {
+                (*ptr).tracking = true;
                 let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
                 TrackMouseEvent(&mut tme);
+            }
+            if !(*ptr).sub_hwnd.is_null() && hit != (*ptr).sub_idx {
+                let sub = (*ptr).sub_hwnd;
+                SendMessageW(sub, WM_CLOSE, 0, 0);
+            }
+            if (*ptr).hot != hit {
+                (*ptr).hot = hit;
                 InvalidateRect(h, ptr::null(), 0);
-                if hit >= 0 && !st.items[hit as usize].sub.is_empty() && !st.items[hit as usize].disabled {
-                    SetTimer(h, 9, 220, None);
+                if hit >= 0 && !(*ptr).items[hit as usize].sub.is_empty() && !(*ptr).items[hit as usize].disabled {
+                    if (*ptr).sub_hwnd.is_null() || (*ptr).sub_idx != hit {
+                        SetTimer(h, 9, 220, None);
+                    }
                 } else {
                     KillTimer(h, 9);
                 }
@@ -1759,6 +1784,7 @@ unsafe extern "system" fn menu_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_MOUSEWHEEL => {
+            let st = &mut *ptr;
             let mut cr: RECT = std::mem::zeroed();
             GetClientRect(h, &mut cr);
             let max_s = (st.tot_h - cr.bottom).max(0);
@@ -1775,79 +1801,118 @@ unsafe extern "system" fn menu_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_TIMER if wp == 9 => {
             KillTimer(h, 9);
-            if st.hot >= 0 && !st.sub_open && !st.items[st.hot as usize].sub.is_empty() && !st.items[st.hot as usize].disabled {
-                open_submenu(h, st, st.hot as usize);
+            let hot = (*ptr).hot;
+            if hot >= 0 && (*ptr).sub_hwnd.is_null() && !(*ptr).items[hot as usize].sub.is_empty() && !(*ptr).items[hot as usize].disabled {
+                open_submenu(h, ptr, hot as usize);
             }
             0
         }
         WM_MOUSELEAVE => {
+            (*ptr).tracking = false;
             KillTimer(h, 9);
-            if st.hot != -1 { st.hot = -1; InvalidateRect(h, ptr::null(), 0); }
+            if (*ptr).sub_hwnd.is_null() && (*ptr).hot != -1 {
+                (*ptr).hot = -1;
+                InvalidateRect(h, ptr::null(), 0);
+            }
             0
         }
         WM_LBUTTONUP => {
             KillTimer(h, 9);
-            let y = ((lp >> 16) & 0xFFFF) as i16 as i32 + st.scroll;
-            if let Some(i) = st.ys.iter().position(|&(a, b)| y >= a && y < b) {
-                if !st.items[i].disabled {
-                    if !st.items[i].sub.is_empty() {
-                        open_submenu(h, st, i);
+            let y = ((lp >> 16) & 0xFFFF) as i16 as i32 + (*ptr).scroll;
+            if let Some(i) = (*ptr).ys.iter().position(|&(a, b)| y >= a && y < b) {
+                if !(*ptr).items[i].disabled {
+                    if !(*ptr).items[i].sub.is_empty() {
+                        if (*ptr).sub_hwnd.is_null() {
+                            open_submenu(h, ptr, i);
+                        }
                         return 0;
                     }
-                    st.picked = Some(st.items[i].id);
-                    st.done = true;
+                    if !(*ptr).sub_hwnd.is_null() {
+                        let sub = (*ptr).sub_hwnd;
+                        SendMessageW(sub, WM_CLOSE, 0, 0);
+                    }
+                    (*ptr).picked = Some((*ptr).items[i].id);
+                    (*ptr).done = true;
                 }
             } else {
-                st.done = true;
+                if !(*ptr).sub_hwnd.is_null() {
+                    let sub = (*ptr).sub_hwnd;
+                    SendMessageW(sub, WM_CLOSE, 0, 0);
+                }
+                (*ptr).done = true;
             }
             0
         }
         WM_KEYDOWN => {
             match wp as u16 {
-                0x1B => st.done = true,
-                0x27 if st.hot >= 0 && !st.items[st.hot as usize].sub.is_empty() && !st.items[st.hot as usize].disabled => {
-                    open_submenu(h, st, st.hot as usize);
-                }
-                0x0D if st.hot >= 0 && !st.items[st.hot as usize].disabled => {
-                    if !st.items[st.hot as usize].sub.is_empty() {
-                        open_submenu(h, st, st.hot as usize);
+                0x1B => {
+                    if !(*ptr).sub_hwnd.is_null() {
+                        let sub = (*ptr).sub_hwnd;
+                        SendMessageW(sub, WM_CLOSE, 0, 0);
                     } else {
-                        st.picked = Some(st.items[st.hot as usize].id);
-                        st.done = true;
+                        (*ptr).done = true;
                     }
                 }
-                0x26 if !st.items.is_empty() => {
-                    st.hot = if st.hot <= 0 { st.items.len() as isize - 1 } else { st.hot - 1 };
+                0x27 if (*ptr).hot >= 0 && (*ptr).sub_hwnd.is_null() && !(*ptr).items[(*ptr).hot as usize].sub.is_empty() && !(*ptr).items[(*ptr).hot as usize].disabled => {
+                    open_submenu(h, ptr, (*ptr).hot as usize);
+                }
+                0x0D if (*ptr).hot >= 0 && !(*ptr).items[(*ptr).hot as usize].disabled => {
+                    let hot = (*ptr).hot as usize;
+                    if !(*ptr).items[hot].sub.is_empty() {
+                        if (*ptr).sub_hwnd.is_null() {
+                            open_submenu(h, ptr, hot);
+                        }
+                    } else {
+                        (*ptr).picked = Some((*ptr).items[hot].id);
+                        (*ptr).done = true;
+                    }
+                }
+                0x26 if !(&(*ptr).items).is_empty() => {
+                    (*ptr).hot = if (*ptr).hot <= 0 { (&(*ptr).items).len() as isize - 1 } else { (*ptr).hot - 1 };
                     InvalidateRect(h, ptr::null(), 0);
                 }
-                0x28 if !st.items.is_empty() => {
-                    st.hot = if st.hot < 0 || st.hot + 1 >= st.items.len() as isize { 0 } else { st.hot + 1 };
+                0x28 if !(&(*ptr).items).is_empty() => {
+                    (*ptr).hot = if (*ptr).hot < 0 || (*ptr).hot + 1 >= (&(*ptr).items).len() as isize { 0 } else { (*ptr).hot + 1 };
                     InvalidateRect(h, ptr::null(), 0);
                 }
                 _ => {}
             }
             0
         }
-        WM_KILLFOCUS | WM_ACTIVATE if !st.sub_open && (m == WM_KILLFOCUS || (wp & 0xFFFF) == 0) => {
-            st.done = true;
+        WM_KILLFOCUS | WM_ACTIVATE if !(*ptr).is_sub && (m == WM_KILLFOCUS || (wp & 0xFFFF) == 0) => {
+            if !(*ptr).sub_hwnd.is_null() {
+                let sub = (*ptr).sub_hwnd;
+                SendMessageW(sub, WM_CLOSE, 0, 0);
+            }
+            (*ptr).done = true;
+            ShowWindow(h, SW_HIDE);
+            0
+        }
+        WM_CLOSE => {
+            if !(*ptr).sub_hwnd.is_null() {
+                let sub = (*ptr).sub_hwnd;
+                SendMessageW(sub, WM_CLOSE, 0, 0);
+            }
+            (*ptr).done = true;
+            ShowWindow(h, SW_HIDE);
             0
         }
         _ => DefWindowProcW(h, m, wp, lp),
     }
 }
 
-unsafe fn open_submenu(h: HWND, st: &mut MenuState<'_>, idx: usize) {
+unsafe fn open_submenu(h: HWND, ptr: *mut MenuState<'_>, idx: usize) {
     let mut wr: RECT = std::mem::zeroed();
     GetWindowRect(h, &mut wr);
-    let y0 = st.ys[idx].0 - st.scroll;
-    st.sub_open = true;
-    let res = popup_menu_at(h, &st.items[idx].sub, Some((wr.right - sc(4), wr.top + y0 - sc(4))), Some(wr.left + sc(4)));
-    st.sub_open = false;
+    let y0 = (&(*ptr).ys)[idx].0 - (*ptr).scroll;
+    (*ptr).sub_idx = idx as isize;
+    let sub_items = &(*ptr).items[idx].sub;
+    let res = popup_menu_at(h, sub_items, Some((wr.right - sc(4), wr.top + y0 - sc(4))), Some(wr.left + sc(4)));
+    (*ptr).sub_hwnd = ptr::null_mut();
+    (*ptr).sub_idx = -1;
     if res.is_some() {
-        st.picked = res;
-        st.done = true;
-    } else {
-        SetFocus(h);
+        (*ptr).picked = res;
+        (*ptr).done = true;
     }
 }
 
@@ -1855,8 +1920,23 @@ pub unsafe fn popup_menu(owner: HWND, items: &[MenuItem]) -> Option<usize> {
     popup_menu_at(owner, items, None, None)
 }
 
+thread_local! {
+    static ACTIVE_MENU: Cell<isize> = const { Cell::new(0) };
+    static MENU_OPENING: Cell<bool> = const { Cell::new(false) };
+}
+
 pub unsafe fn popup_menu_at(owner: HWND, items: &[MenuItem], pos: Option<(i32, i32)>, flip_x: Option<i32>) -> Option<usize> {
     if items.is_empty() { return None; }
+    if pos.is_none() {
+        let prev = ACTIVE_MENU.get() as HWND;
+        if !prev.is_null() && IsWindow(prev) != 0 {
+            SendMessageW(prev, WM_CLOSE, 0, 0);
+        }
+        if MENU_OPENING.get() {
+            return None;
+        }
+        MENU_OPENING.set(true);
+    }
     static REG: std::sync::Once = std::sync::Once::new();
     let cls = w("WinRustExplorerMenu");
     REG.call_once(|| {
@@ -1933,9 +2013,11 @@ pub unsafe fn popup_menu_at(owner: HWND, items: &[MenuItem], pos: Option<(i32, i
         (wa.bottom - mh - sc(4)).max(wa.top + sc(4))
     };
 
-    let mut st = MenuState { items, ys, tot_h, scroll: 0, hot: -1, picked: None, done: false, sub_open: false };
+    let is_sub = pos.is_some();
+    let mut st = MenuState { items, ys, tot_h, scroll: 0, hot: -1, picked: None, done: false, sub_hwnd: ptr::null_mut(), sub_idx: -1, tracking: false, is_sub };
+    let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | if is_sub { 0x0800_0000 } else { 0 };
     let hw = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        ex,
         cls.as_ptr(),
         ptr::null(),
         WS_POPUP | WS_CLIPSIBLINGS,
@@ -1945,17 +2027,39 @@ pub unsafe fn popup_menu_at(owner: HWND, items: &[MenuItem], pos: Option<(i32, i
         ptr::null_mut(),
         &mut st as *mut _ as *mut _,
     );
-    if hw.is_null() { return None; }
+    if hw.is_null() {
+        if !is_sub { MENU_OPENING.set(false); }
+        return None;
+    }
+    if is_sub {
+        let op = GetWindowLongPtrW(owner, GWLP_USERDATA) as *mut MenuState<'_>;
+        if !op.is_null() { (*op).sub_hwnd = hw; }
+    } else {
+        ACTIVE_MENU.set(hw as isize);
+    }
     let rad = if winrust_common::style::style().square() { 1 } else { 2 };
     DwmSetWindowAttribute(hw, 33, &rad as *const _ as _, 4);
     let bdr = mix(pal().bg, pal().text, 0.14) as i32;
     DwmSetWindowAttribute(hw, 34, &bdr as *const _ as _, 4);
-    ShowWindow(hw, SW_SHOW);
-    SetFocus(hw);
+    if is_sub {
+        ShowWindow(hw, 8);
+    } else {
+        ShowWindow(hw, SW_SHOW);
+        SetFocus(hw);
+    }
     let mut msg: MSG = std::mem::zeroed();
     while !st.done && GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+    if is_sub {
+        let op = GetWindowLongPtrW(owner, GWLP_USERDATA) as *mut MenuState<'_>;
+        if !op.is_null() && (*op).sub_hwnd == hw { (*op).sub_hwnd = ptr::null_mut(); }
+    } else {
+        if ACTIVE_MENU.get() == hw as isize {
+            ACTIVE_MENU.set(0);
+        }
+        MENU_OPENING.set(false);
     }
     DestroyWindow(hw);
     st.picked
@@ -2179,11 +2283,13 @@ pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == 4 => { InvalidateRect(h, ptr::null(), 0); }
         WM_MOUSEMOVE => {
             let k = nav_hit(y).map_or(-1, |i| i as i32);
-            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
-            TrackMouseEvent(&mut tme);
+            if !TRACK_NAV.replace(true) {
+                let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
+                TrackMouseEvent(&mut tme);
+            }
             if NAVHOT.replace(k) != k { InvalidateRect(h, ptr::null(), 0); }
         }
-        WM_MOUSELEAVE => { NAVHOT.set(-1); InvalidateRect(h, ptr::null(), 0); }
+        WM_MOUSELEAVE => { TRACK_NAV.set(false); NAVHOT.set(-1); InvalidateRect(h, ptr::null(), 0); }
         WM_MOUSEWHEEL => {
             let delta = ((wp >> 16) as u16) as i16 as i32;
             let step = (-delta * sc(48)) / 120;
@@ -2192,7 +2298,8 @@ pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SIZE => {
             let next = NAVSCROLL.get().clamp(0, nav_max_scroll(h));
-            if NAVSCROLL.replace(next) != next { InvalidateRect(h, ptr::null(), 0); }
+            NAVSCROLL.set(next);
+            InvalidateRect(h, ptr::null(), 0);
         }
         WM_LBUTTONDOWN => {
             if let Some(i) = nav_hit(y) {

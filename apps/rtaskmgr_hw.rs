@@ -226,7 +226,8 @@ pub fn disk_info_for(number: u32) -> DiskInfo {
     }
     unsafe {
         let mut total: winapi::shared::ntdef::ULARGE_INTEGER = std::mem::zeroed();
-        if GetDiskFreeSpaceExW(wide(r"C:\").as_ptr(), null_mut(), &mut total, null_mut()) != 0 {
+        let sys_root = format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()));
+        if GetDiskFreeSpaceExW(wide(&sys_root).as_ptr(), null_mut(), &mut total, null_mut()) != 0 {
             d.formatted = *total.QuadPart();
         }
     }
@@ -273,7 +274,9 @@ impl Nvml {
         unsafe {
             let mut lib = LoadLibraryW(wide("nvml.dll").as_ptr());
             if lib.is_null() {
-                lib = LoadLibraryW(wide(r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll").as_ptr());
+                let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+                let p = format!(r"{pf}\NVIDIA Corporation\NVSMI\nvml.dll");
+                lib = LoadLibraryW(wide(&p).as_ptr());
             }
             if lib.is_null() {
                 return None;

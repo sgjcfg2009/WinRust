@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}},
     },
     time::Instant,
 };
@@ -25,7 +25,7 @@ impl Progress {
     }
 
     fn cancelled(&self) -> bool {
-        self.cancel.load(Relaxed)
+        self.cancel.load(Acquire)
     }
 }
 
@@ -58,7 +58,7 @@ pub fn status_text() -> Option<String> {
 }
 
 pub fn busy() -> bool {
-    RUNNING.load(Relaxed)
+    RUNNING.load(Acquire)
 }
 
 pub fn progress_pct() -> Option<u8> {
@@ -75,12 +75,12 @@ pub fn progress_pct() -> Option<u8> {
 
 pub fn cancel() {
     if let Some(p) = JOB.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        p.cancel.store(true, Relaxed);
+        p.cancel.store(true, Release);
     }
 }
 
 fn spawn(h: isize, what: String, f: impl FnOnce(&Progress) -> Result<(), String> + Send + 'static) -> bool {
-    if RUNNING.swap(true, Relaxed) {
+    if RUNNING.swap(true, Acquire) {
         return false;
     }
     let p = Progress::new(what);
@@ -90,14 +90,14 @@ fn spawn(h: isize, what: String, f: impl FnOnce(&Progress) -> Result<(), String>
         let mut g = TICK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         while *g {
             unsafe { super::ui::status_dirty(h as _) };
-            let (ng, _) = TICK_CV.wait_timeout(g, std::time::Duration::from_millis(200)).unwrap();
+            let (ng, _) = TICK_CV.wait_timeout(g, std::time::Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner());
             g = ng;
         }
     });
     std::thread::spawn(move || {
         let r = f(&p);
         *JOB.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        RUNNING.store(false, Relaxed);
+        RUNNING.store(false, Release);
         *TICK_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = false;
         TICK_CV.notify_one();
         let _ = ticker.join();
@@ -187,8 +187,25 @@ fn seek_penalty(p: &Path) -> bool {
 
 const BIG: u64 = 256 << 20;
 
-fn copy_file(src: &Path, dst: &Path, size: u64, p: &Progress, ws: &mut Vec<u16>, wd: &mut Vec<u16>) -> std::io::Result<()> {
+fn fill_wide_path(p: &Path, buf: &mut Vec<u16>) {
     use std::os::windows::ffi::OsStrExt;
+    buf.clear();
+    buf.extend(p.as_os_str().encode_wide());
+    if buf.len() >= 240 && p.is_absolute() && !buf.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
+        let mut prefixed = Vec::with_capacity(buf.len() + 8);
+        if buf.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            prefixed.extend([b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16, b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16]);
+            prefixed.extend_from_slice(&buf[2..]);
+        } else {
+            prefixed.extend([b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+            prefixed.extend_from_slice(buf);
+        }
+        *buf = prefixed;
+    }
+    buf.push(0);
+}
+
+fn copy_file(src: &Path, dst: &Path, size: u64, p: &Progress, ws: &mut Vec<u16>, wd: &mut Vec<u16>) -> std::io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{COPY_FILE_FAIL_IF_EXISTS, COPY_FILE_NO_BUFFERING, CopyFileExW};
     unsafe extern "system" fn cb(_total: i64, done: i64, _st: i64, _sd: i64, _id: u32, _r: u32, _s: *mut core::ffi::c_void, _d: *mut core::ffi::c_void, data: *const core::ffi::c_void) -> u32 {
         let (prog, last) = unsafe { &mut *(data as *mut (&Progress, u64)) };
@@ -196,12 +213,8 @@ fn copy_file(src: &Path, dst: &Path, size: u64, p: &Progress, ws: &mut Vec<u16>,
         *last = done as u64;
         u32::from(prog.cancelled())
     }
-    ws.clear();
-    ws.extend(src.as_os_str().encode_wide());
-    ws.push(0);
-    wd.clear();
-    wd.extend(dst.as_os_str().encode_wide());
-    wd.push(0);
+    fill_wide_path(src, ws);
+    fill_wide_path(dst, wd);
     let mut state: (&Progress, u64) = (p, 0);
     let flags = COPY_FILE_FAIL_IF_EXISTS | if size >= BIG { COPY_FILE_NO_BUFFERING } else { 0 };
     let ok = unsafe { CopyFileExW(ws.as_ptr(), wd.as_ptr(), Some(cb), &mut state as *mut _ as _, std::ptr::null_mut(), flags) } != 0;
@@ -219,7 +232,8 @@ fn copy_now(from: &[PathBuf], to: &Path, then_delete: bool, p: &Progress) -> Res
     for src in from {
         let name = src.file_name().ok_or_else(|| format!("{}: no name", src.display()))?.to_string_lossy();
         let top = free_name(to, &name, src.is_dir());
-        walk(src, PathBuf::from(top.file_name().unwrap()), &mut entries).map_err(|e| format!("{}: {e}", src.display()))?;
+        let top_name = top.file_name().ok_or_else(|| format!("{}: no name", src.display()))?;
+        walk(src, PathBuf::from(top_name), &mut entries).map_err(|e| format!("{}: {e}", src.display()))?;
     }
     let (mut tf, mut tb) = (0u64, 0u64);
     let mut files: Vec<&Entry> = Vec::with_capacity(entries.len());
@@ -248,7 +262,8 @@ fn copy_now(from: &[PathBuf], to: &Path, then_delete: bool, p: &Progress) -> Res
                     dst.clear();
                     dst.push(to);
                     dst.push(&e.1);
-                    match copy_file(&e.0, &dst, e.2.unwrap(), p, &mut ws, &mut wd) {
+                    let Some(sz) = e.2 else { continue };
+                    match copy_file(&e.0, &dst, sz, p, &mut ws, &mut wd) {
                         Ok(()) => _ = p.files.fetch_add(1, Relaxed),
                         Err(err) if !p.cancelled() => errors.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{}: {err}", e.0.display())),
                         Err(_) => {}
@@ -260,7 +275,7 @@ fn copy_now(from: &[PathBuf], to: &Path, then_delete: bool, p: &Progress) -> Res
     if p.cancelled() {
         return Err("Cancelled".to_string());
     }
-    let errors = errors.into_inner().unwrap();
+    let errors = errors.into_inner().unwrap_or_else(|e| e.into_inner());
     if !errors.is_empty() {
         let more = if errors.len() > 5 { format!("\n... and {} more", errors.len() - 5) } else { String::new() };
         let kept = if then_delete { "\nNothing was deleted from the source." } else { "" };

@@ -155,20 +155,11 @@ unsafe fn copy_or_extract_icon(raw_icon: HICON, hwnd: HWND, exe: &str) -> HICON 
         ExtractIconExW(wide(exe).as_ptr(), 0, null_mut(), &mut ic, 1);
     }
     if ic.is_null() && !hwnd.is_null() {
-        let mut res = 0usize;
-        for kind in [2usize, 0usize, 1usize] {
-            if SendMessageTimeoutW(hwnd, WM_GETICON, kind, 0, SMTO_ABORTIFHUNG, 100, &mut res) != 0 && res != 0 {
-                ic = CopyIcon(res as HICON);
+        for idx in [-34i32, -14i32] {
+            let h = GetClassLongPtrW(hwnd, idx);
+            if h != 0 {
+                ic = CopyIcon(h as HICON);
                 if !ic.is_null() { break; }
-            }
-        }
-        if ic.is_null() {
-            for idx in [-34i32, -14i32] {
-                let h = GetClassLongPtrW(hwnd, idx);
-                if h != 0 {
-                    ic = CopyIcon(h as HICON);
-                    if !ic.is_null() { break; }
-                }
             }
         }
     }
@@ -430,7 +421,7 @@ pub(crate) unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM,
         let other = find_other("Shell_TrayWnd");
         if !other.is_null() {
             let mut r = 0usize;
-            SendMessageTimeoutW(other, msg, wp, lp, SMTO_ABORTIFHUNG, 2000, &mut r);
+            SendMessageTimeoutW(other, msg, wp, lp, SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &mut r);
             return r as LRESULT;
         }
         return 0;

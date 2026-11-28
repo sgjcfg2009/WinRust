@@ -350,19 +350,19 @@ fn start_apps_watcher(dirs: &[PathBuf]) {
                 let h = FindFirstChangeNotificationW(wide(&d.to_string_lossy()).as_ptr(), 1, mask);
                 (h != INVALID_HANDLE_VALUE && !h.is_null()).then_some(h)
             })
+            .take(64)
             .collect();
         if handles.is_empty() {
             return;
         }
         loop {
             let r = WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, u32::MAX);
-            if (r as usize) >= handles.len() {
+            let idx = r as usize;
+            if idx >= handles.len() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
-            for &h in &handles {
-                let _ = FindNextChangeNotification(h);
-            }
+            let _ = FindNextChangeNotification(handles[idx]);
             load_apps();
         }
         for h in handles {
@@ -449,7 +449,7 @@ pub fn load_apps() {
             v.push((name.to_string(), wide(&target)));
         }
     }
-    v.sort_by_key(|a| a.0.to_lowercase());
+    v.sort_by_cached_key(|a| a.0.to_lowercase());
     v.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
     *APPS.lock().unwrap_or_else(|e| e.into_inner()) = v;
     let hw = START_HWND.load(Relaxed);
@@ -671,21 +671,76 @@ fn read_brightness() {
     });
 }
 
-static BRIGHT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BRIGHT_REQ: (Mutex<Option<i32>>, std::sync::Condvar) = (Mutex::new(None), std::sync::Condvar::new());
+static BRIGHT_WORKER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn set_monitor_brightness_dxva2(b: u32) -> bool {
+    use windows_sys::Win32::{
+        Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint},
+        System::LibraryLoader::{GetProcAddress, LoadLibraryW},
+    };
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct PhysMon {
+        h: HANDLE,
+        desc: [u16; 128],
+    }
+    unsafe {
+        let lib = LoadLibraryW(wide("dxva2.dll").as_ptr());
+        if lib.is_null() {
+            return false;
+        }
+        let get_n = GetProcAddress(lib, b"GetNumberOfPhysicalMonitorsFromHMONITOR\0".as_ptr());
+        let get_m = GetProcAddress(lib, b"GetPhysicalMonitorsFromHMONITOR\0".as_ptr());
+        let set_b = GetProcAddress(lib, b"SetMonitorBrightness\0".as_ptr());
+        let dst_m = GetProcAddress(lib, b"DestroyPhysicalMonitors\0".as_ptr());
+        let mut ok = false;
+        if let (Some(gn), Some(gm), Some(sb), Some(dm)) = (get_n, get_m, set_b, dst_m) {
+            let gn: unsafe extern "system" fn(HMONITOR, *mut u32) -> i32 = std::mem::transmute(gn);
+            let gm: unsafe extern "system" fn(HMONITOR, u32, *mut PhysMon) -> i32 = std::mem::transmute(gm);
+            let sb: unsafe extern "system" fn(HANDLE, u32) -> i32 = std::mem::transmute(sb);
+            let dm: unsafe extern "system" fn(u32, *const PhysMon) -> i32 = std::mem::transmute(dm);
+            let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+            let mut cnt = 0u32;
+            if gn(mon, &mut cnt) != 0 && cnt > 0 {
+                let mut mons = vec![PhysMon { h: null_mut(), desc: [0; 128] }; cnt as usize];
+                if gm(mon, cnt, mons.as_mut_ptr()) != 0 {
+                    for pm in &mons {
+                        if sb(pm.h, b) != 0 {
+                            ok = true;
+                        }
+                    }
+                    dm(cnt, mons.as_ptr());
+                }
+            }
+        }
+        FreeLibrary(lib);
+        ok
+    }
+}
 
 fn set_brightness(v: i32) {
-    let seq = BRIGHT_SEQ.fetch_add(1, Relaxed) + 1;
-    std::thread::spawn(move || {
-        let b = v.clamp(0, 100) as u8;
-        if lcd_io(0x23_049C, Some([3, b, b])).is_none() {
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            if BRIGHT_SEQ.load(Relaxed) != seq {
-                return;
+    BRIGHT_WORKER.get_or_init(|| {
+        std::thread::spawn(|| {
+            let (lock, cv) = &BRIGHT_REQ;
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                let Some(val) = g.take() else {
+                    g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                };
+                drop(g);
+                let b = val.clamp(0, 100) as u8;
+                if lcd_io(0x23_049C, Some([3, b, b])).is_none() && !set_monitor_brightness_dxva2(b as u32) {
+                    let c = format!("Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{Timeout=1;Brightness={val}}}");
+                    let _ = Command::new("powershell").args(["-NoProfile", "-Command", &c]).creation_flags(NO_WINDOW).output();
+                }
+                g = lock.lock().unwrap_or_else(|e| e.into_inner());
             }
-            let c = format!("Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{Timeout=1;Brightness={v}}}");
-            let _ = Command::new("powershell").args(["-NoProfile", "-Command", &c]).creation_flags(NO_WINDOW).output();
-        }
+        });
     });
+    *BRIGHT_REQ.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+    BRIGHT_REQ.1.notify_one();
 }
 
 unsafe fn for_each_wlan(mut f: impl FnMut(HANDLE, &windows_sys::core::GUID)) {
@@ -2019,7 +2074,9 @@ unsafe fn paint_layer(hw: HWND, k: Kind, wdc: HDC) {
             if b >= 0 {
                 SelectObject(dc, f_glyph);
                 text(dc, icons::BRIGHTNESS, qr(14, y, 48, y + 40, qs), mix(pal().dim, pal().text, 0.5), DT_CENTER);
-                track(dc, rs.iter().find(|(_, a)| *a == Act::BrightSlide).unwrap().0, b as f32 / 100.0, ulw);
+                if let Some((rc, _)) = rs.iter().find(|(_, a)| *a == Act::BrightSlide) {
+                    track(dc, *rc, b as f32 / 100.0, ulw);
+                }
                 y += 44;
             }
             if ulw {
@@ -2031,26 +2088,29 @@ unsafe fn paint_layer(hw: HWND, k: Kind, wdc: HDC) {
             }
             let mrc = qr(14, y, 48, y + 40, qs);
             volume_glyph(dc, (mrc.left + mrc.right) / 2, (mrc.top + mrc.bottom) / 2, qsc(16, qs), vol, muted, if muted { BAD } else { pal().text });
-            track(dc, rs.iter().find(|(_, a)| *a == Act::VolSlide).unwrap().0, if muted || vol < 0 { 0.0 } else { vol as f32 / 100.0 }, ulw);
-            let out_rc = rs.iter().find(|(_, a)| *a == Act::AudioOut).unwrap().0;
-            if ulw {
-                if hot(Act::AudioOut) {
-                    fill_a(out_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
-                }
-            } else {
-                g(Act::AudioOut, out_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
+            if let Some((rc, _)) = rs.iter().find(|(_, a)| *a == Act::VolSlide) {
+                track(dc, *rc, if muted || vol < 0 { 0.0 } else { vol as f32 / 100.0 }, ulw);
             }
-            let dev_glyph = AUDIO_DEVS.with_borrow(|devs| {
-                let is_hp = devs.iter().find(|d| d.default).is_some_and(|d| {
-                    let l = d.name.to_lowercase();
-                    l.contains("headphone") || l.contains("headset") || l.contains("tai nghe")
+            if let Some(&(out_rc, _)) = rs.iter().find(|(_, a)| *a == Act::AudioOut) {
+                if ulw {
+                    if hot(Act::AudioOut) {
+                        fill_a(out_rc, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
+                    }
+                } else {
+                    g(Act::AudioOut, out_rc, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
+                }
+                let dev_glyph = AUDIO_DEVS.with_borrow(|devs| {
+                    let is_hp = devs.iter().find(|d| d.default).is_some_and(|d| {
+                        let l = d.name.to_lowercase();
+                        l.contains("headphone") || l.contains("headset") || l.contains("tai nghe")
+                    });
+                    if is_hp { icons::HEADPHONES } else { icons::SPEAKER }
                 });
-                if is_hp { icons::HEADPHONES } else { icons::SPEAKER }
-            });
-            SelectObject(dc, f_glyph);
-            text(dc, dev_glyph, RECT { left: out_rc.left + qsc(2, qs), right: out_rc.right - qsc(12, qs), ..out_rc }, pal().text, DT_CENTER);
-            SelectObject(dc, f_gs);
-            text(dc, icons::CHEVRON_RIGHT, RECT { left: out_rc.right - qsc(16, qs), right: out_rc.right - qsc(2, qs), ..out_rc }, pal().dim, DT_CENTER);
+                SelectObject(dc, f_glyph);
+                text(dc, dev_glyph, RECT { left: out_rc.left + qsc(2, qs), right: out_rc.right - qsc(12, qs), ..out_rc }, pal().text, DT_CENTER);
+                SelectObject(dc, f_gs);
+                text(dc, icons::CHEVRON_RIGHT, RECT { left: out_rc.right - qsc(16, qs), right: out_rc.right - qsc(2, qs), ..out_rc }, pal().dim, DT_CENTER);
+            }
             let sl_h = if n == 2 { 86 } else { 42 };
             let foot_top = 188 + sl_h + 10;
             let (pct, ac) = BAT.get();
@@ -2063,16 +2123,17 @@ unsafe fn paint_layer(hw: HWND, k: Kind, wdc: HDC) {
                 SelectObject(dc, f_small);
                 text(dc, &if muted { "0%".into() } else if vol < 0 { String::new() } else { format!("{vol}%") }, qr(18, foot_top + 5, 76, foot_top + 39, qs), pal().dim, DT_LEFT);
             }
-            let gear = rs.iter().find(|(_, a)| matches!(a, Act::Settings(_))).unwrap().0;
-            if ulw {
-                if hot(Act::Settings("ms-settings:")) {
-                    fill_a(gear, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
+            if let Some(&(gear, _)) = rs.iter().find(|(_, a)| matches!(a, Act::Settings(_))) {
+                if ulw {
+                    if hot(Act::Settings("ms-settings:")) {
+                        fill_a(gear, mix(pal().bg, pal().text, 0.12), hov_a, qsc(6, qs));
+                    }
+                } else {
+                    g(Act::Settings("ms-settings:"), gear, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
                 }
-            } else {
-                g(Act::Settings("ms-settings:"), gear, pal().bg, mix(pal().bg, pal().text, 0.08), qsc(6, qs));
+                SelectObject(dc, f_glyph);
+                text(dc, icons::SETTINGS, gear, pal().text, DT_CENTER);
             }
-            SelectObject(dc, f_glyph);
-            text(dc, icons::SETTINGS, gear, pal().text, DT_CENTER);
         }
         Kind::Cal => {
             let (y, m) = CAL.get();
@@ -2664,6 +2725,17 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
     let (x, y) = ((lp & 0xffff) as i16 as i32, (lp >> 16 & 0xffff) as i16 as i32);
     match msg {
         WM_PAINT => paint(hw, k),
+        0x02E0 => {
+            let dpi = ((wp >> 16) & 0xFFFF) as f32;
+            if dpi > 0.0 {
+                SCALE.set(dpi / 96.0);
+                let (w, h) = (sc(size(k).0), sc(size(k).1));
+                let r = &*(lp as *const RECT);
+                FIN.set((r.left, r.top));
+                SetWindowPos(hw, null_mut(), r.left, r.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+                InvalidateRect(hw, null(), 0);
+            }
+        }
         WM_ERASEBKGND => return 1,
         WM_ACTIVATE if wp & 0xffff == 0 && !PREVIEW.load(Relaxed) => {
             if OPENING.get() {

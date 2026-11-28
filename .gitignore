@@ -4,7 +4,6 @@
 /out/
 /payload/
 /tools/
-/test-apps/
 
 # Binaries & debug artifacts
 *.exe

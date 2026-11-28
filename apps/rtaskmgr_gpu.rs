@@ -171,7 +171,7 @@ pub fn adapters() -> Vec<Adapter> {
             let get_desc1: unsafe extern "system" fn(*mut c_void, *mut u8) -> i32 = vtbl(ad, 10);
             if get_desc1(ad, d.as_mut_ptr()) == 0 {
                 let name = utf16_from_le(&d[..256]);
-                let u64_at = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+                let u64_at = |o: usize| d.get(o..o + 8).and_then(|s| s.try_into().ok()).map_or(0, u64::from_le_bytes);
                 let flags = u32::from_le_bytes([d[304], d[305], d[306], d[307]]);
                 let dup = out.iter().any(|a: &Adapter| a.name == name && a.dedicated == u64_at(272) && a.shared == u64_at(288));
                 if flags & 2 == 0 && !dup && !name.to_lowercase().contains("basic render") {

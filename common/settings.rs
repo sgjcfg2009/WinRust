@@ -183,23 +183,41 @@ fn run(uri: &str) {
         kill_hung();
     }
     if started {
-        let (mut bad, mut shown, mut waited) = (0, false, 0);
+        let mut shown = false;
+        let mut waited = 0;
         loop {
             let enrolling = !proc::pids(ENROLL).is_empty();
-            if !enrolling && (bad >= 5 || proc::pids(SETTINGS).is_empty() || (!shown && waited >= 30)) {
+            let pids = proc::pids(SETTINGS);
+            if !enrolling && (pids.is_empty() || (!shown && waited >= 30)) {
                 break;
             }
-            sleep(Duration::from_secs(2));
-            waited += 1;
-            let on_screen = proc::pids(SETTINGS).into_iter().any(showing);
+            let on_screen = pids.iter().any(|&p| showing(p));
             shown |= on_screen;
-            bad = if !enrolling && (any_hung() || (shown && !on_screen)) { bad + 1 } else { 0 };
+            if !enrolling && (any_hung() || (shown && !on_screen)) {
+                break;
+            }
+            if let Some(&pid) = pids.first() {
+                unsafe {
+                    let h = windows_sys::Win32::System::Threading::OpenProcess(0x0010_0000, 0, pid);
+                    if !h.is_null() {
+                        windows_sys::Win32::System::Threading::WaitForSingleObject(h, 2000);
+                        windows_sys::Win32::Foundation::CloseHandle(h);
+                    } else {
+                        sleep(Duration::from_secs(2));
+                    }
+                }
+            } else {
+                sleep(Duration::from_secs(2));
+            }
+            waited += 1;
         }
         kill_stale();
         proc::kill_shell_explorers();
-        let rx = std::path::PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_default()).join(r"rust-explorer\rust-explorer.exe");
-        if rx.is_file() && !proc::pids("rust-explorer.exe").into_iter().any(has_desktop) {
-            let _ = Command::new(rx).arg("--desktop").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        if let Some(pf) = std::env::var_os("ProgramFiles").filter(|s| !s.is_empty()) {
+            let rx = std::path::PathBuf::from(pf).join(r"rust-explorer\rust-explorer.exe");
+            if rx.is_file() && !proc::pids("rust-explorer.exe").into_iter().any(has_desktop) {
+                let _ = Command::new(rx).arg("--desktop").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+            }
         }
     }
     if !lent.is_null() {
@@ -236,14 +254,23 @@ fn own_exe() -> Option<std::path::PathBuf> {
     exe.is_file().then_some(exe)
 }
 
+static OPENING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn open(uri: &str) {
     if let (Some(page), Some(exe)) = (own_page(uri), own_exe()) {
         if Command::new(exe).arg(page).stdin(Stdio::null()).creation_flags(0x0800_0000).spawn().is_ok() {
             return;
         }
     }
+    if OPENING.compare_exchange(false, true, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed).is_err() {
+        raise();
+        return;
+    }
     let uri = uri.to_string();
-    std::thread::spawn(move || run(&uri));
+    std::thread::spawn(move || {
+        run(&uri);
+        OPENING.store(false, std::sync::atomic::Ordering::Release);
+    });
 }
 
 #[cfg(test)]

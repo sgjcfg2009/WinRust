@@ -15,6 +15,12 @@ pub fn com_init() {
     }
 }
 
+pub fn com_uninit() {
+    unsafe {
+        CoUninitialize();
+    }
+}
+
 pub fn create_factory() -> Result<IWICImagingFactory> {
     unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
 }
@@ -44,6 +50,14 @@ pub fn decode_with(f: &IWICImagingFactory, path: &str, bg: [u8; 3]) -> Result<Im
                 u16::try_from(&v)
             })
             .unwrap_or(1);
+        let fmt = frame.GetPixelFormat().ok();
+        let opaque = fmt.is_some_and(|g| {
+            g == GUID_WICPixelFormat24bppBGR
+                || g == GUID_WICPixelFormat24bppRGB
+                || g == GUID_WICPixelFormat32bppBGR
+                || g == GUID_WICPixelFormat8bppGray
+                || g == GUID_WICPixelFormat16bppGray
+        });
         let conv = f.CreateFormatConverter()?;
         conv.Initialize(&frame, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
         let mut src: IWICBitmapSource = conv.cast()?;
@@ -55,16 +69,35 @@ pub fn decode_with(f: &IWICImagingFactory, path: &str, bg: [u8; 3]) -> Result<Im
         }
         let (mut w, mut h) = (0u32, 0u32);
         src.GetSize(&mut w, &mut h)?;
-        let mut bgra = vec![0u8; w as usize * h as usize * 4];
+        const MAX_DIM: u32 = 4096;
+        if w > MAX_DIM || h > MAX_DIM {
+            let (nw, nh) = if w >= h {
+                (MAX_DIM, ((h as u64 * MAX_DIM as u64) / w as u64).max(1) as u32)
+            } else {
+                (((w as u64 * MAX_DIM as u64) / h as u64).max(1) as u32, MAX_DIM)
+            };
+            let scaler = f.CreateBitmapScaler()?;
+            scaler.Initialize(&src, nw, nh, WICBitmapInterpolationModeFant)?;
+            src = scaler.cast()?;
+            w = nw;
+            h = nh;
+        }
+        let byte_len = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| Error::from(windows::Win32::Foundation::E_OUTOFMEMORY))?;
+        let mut bgra = vec![0u8; byte_len];
         src.CopyPixels(std::ptr::null(), w * 4, &mut bgra)?;
-        for p in bgra.chunks_exact_mut(4) {
-            let a = p[3];
-            if a < 255 {
-                let inv = 255 - a as u32;
-                p[0] = (p[0] as u32 + bg[0] as u32 * inv / 255).min(255) as u8;
-                p[1] = (p[1] as u32 + bg[1] as u32 * inv / 255).min(255) as u8;
-                p[2] = (p[2] as u32 + bg[2] as u32 * inv / 255).min(255) as u8;
-                p[3] = 255;
+        if !opaque {
+            for p in bgra.chunks_exact_mut(4) {
+                let a = p[3];
+                if a < 255 {
+                    let inv = 255 - a as u32;
+                    p[0] = (p[0] as u32 + bg[0] as u32 * inv / 255).min(255) as u8;
+                    p[1] = (p[1] as u32 + bg[1] as u32 * inv / 255).min(255) as u8;
+                    p[2] = (p[2] as u32 + bg[2] as u32 * inv / 255).min(255) as u8;
+                    p[3] = 255;
+                }
             }
         }
         Ok(Img { w: w as i32, h: h as i32, bgra })

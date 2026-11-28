@@ -111,6 +111,16 @@ thread_local! {
     static GLYPH_FONTS: RefCell<Vec<(i32, HFONT)>> = const { RefCell::new(Vec::new()) };
 }
 
+pub(crate) unsafe fn reset_glyph_fonts() {
+    GLYPH_FONTS.with_borrow_mut(|cache| {
+        for (_, f) in cache.drain(..) {
+            if !f.is_null() {
+                DeleteObject(f);
+            }
+        }
+    });
+}
+
 unsafe fn glyph_font(px: i32) -> HFONT {
     let px = px.max(8);
     GLYPH_FONTS.with_borrow_mut(|cache| {

@@ -1,6 +1,6 @@
 use std::sync::{
     OnceLock,
-    atomic::{AtomicIsize, AtomicU32, AtomicUsize, Ordering::Relaxed},
+    atomic::{AtomicIsize, AtomicU32, AtomicUsize, Ordering::{Acquire, Relaxed, Release}},
     mpsc::{Sender, channel},
 };
 use windows_sys::Win32::{Foundation::*, System::{LibraryLoader::GetModuleHandleW, Registry::*}, UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*}};
@@ -85,10 +85,13 @@ fn send(keys: &[INPUT]) {
 
 fn open_files() {
     use std::{path::PathBuf, process::{Command, Stdio}};
-    let mine = std::env::var_os("LOCALAPPDATA").map(|b| PathBuf::from(b).join(r"plugin-launcher\bin\rust-explorer.exe"));
-    let beside = std::env::current_exe().ok().map(|e| e.with_file_name("rust-explorer.exe"));
-    let installed = std::env::var_os("ProgramFiles").map(|b| PathBuf::from(b).join(r"rust-explorer\rust-explorer.exe"));
-    let exe = [installed, mine, beside].into_iter().flatten().filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p))).max().map(|(_, p)| p).unwrap_or_else(|| "explorer.exe".into());
+    static EXE: OnceLock<PathBuf> = OnceLock::new();
+    let exe = EXE.get_or_init(|| {
+        let mine = std::env::var_os("LOCALAPPDATA").map(|b| PathBuf::from(b).join(r"plugin-launcher\bin\rust-explorer.exe"));
+        let beside = std::env::current_exe().ok().map(|e| e.with_file_name("rust-explorer.exe"));
+        let installed = std::env::var_os("ProgramFiles").map(|b| PathBuf::from(b).join(r"rust-explorer\rust-explorer.exe"));
+        [installed, mine, beside].into_iter().flatten().filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p))).max().map(|(_, p)| p).unwrap_or_else(|| "explorer.exe".into())
+    });
     let _ = Command::new(exe).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
@@ -152,15 +155,16 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             }
         }
     }
-    unsafe { CallNextHookEx(HOOK.load(Relaxed) as _, n, w, l) }
+    unsafe { CallNextHookEx(HOOK.load(Acquire) as _, n, w, l) }
 }
 
 pub fn run() -> i32 {
     let h = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), GetModuleHandleW(std::ptr::null()), 0) };
     if h.is_null() { eprintln!("hook failed"); return 1 }
-    HOOK.store(h as isize, Relaxed);
+    HOOK.store(h as isize, Release);
     let mut m: MSG = unsafe { std::mem::zeroed() };
     while unsafe { GetMessageW(&mut m, std::ptr::null_mut(), 0, 0) } > 0 {}
+    unsafe { UnhookWindowsHookEx(h) };
     0
 }
 

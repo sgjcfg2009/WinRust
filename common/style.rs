@@ -121,7 +121,7 @@ pub fn style() -> Style {
     }
 }
 
-pub fn set_style(s: Style) {
+pub(crate) fn set_style(s: Style) {
     store(s);
     write_cfg("style.txt", s.name());
     broadcast();
@@ -274,7 +274,7 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
 
-pub const PALS: [Pal; 8] = [
+const PALS: [Pal; 8] = [
     Pal { bg: rgb(0, 0, 0), line: rgb(32, 32, 34), hover: rgb(20, 20, 22), active: rgb(28, 28, 30), accent: rgb(96, 205, 255), text: rgb(255, 255, 255), dim: rgb(166, 166, 170) },
     Pal { bg: rgb(8, 11, 9), line: rgb(30, 48, 35), hover: rgb(16, 28, 20), active: rgb(22, 38, 27), accent: rgb(74, 222, 128), text: rgb(204, 232, 212), dim: rgb(98, 132, 108) },
     Pal { bg: rgb(17, 18, 25), line: rgb(40, 42, 56), hover: rgb(29, 31, 42), active: rgb(37, 40, 54), accent: rgb(124, 134, 255), text: rgb(240, 241, 246), dim: rgb(138, 142, 160) },
@@ -330,7 +330,7 @@ fn custom_pal(base: &Pal, o: [u32; 7]) -> Pal {
     }
 }
 
-pub const COLOR_NAMES: [&str; 7] = ["bg", "line", "hover", "active", "accent", "text", "dim"];
+const COLOR_NAMES: [&str; 7] = ["bg", "line", "hover", "active", "accent", "text", "dim"];
 
 static COLORS: Mutex<[u32; 7]> = Mutex::new([u32::MAX; 7]);
 static COLORS_LOADED: AtomicBool = AtomicBool::new(false);
@@ -443,7 +443,8 @@ fn themes_file() -> Option<PathBuf> {
     std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("WinRust").join("themes.txt"))
 }
 
-pub fn themes() -> Vec<Theme> {
+#[allow(dead_code)]
+fn themes() -> Vec<Theme> {
     themes_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default().lines().filter_map(Theme::parse).collect()
 }
 

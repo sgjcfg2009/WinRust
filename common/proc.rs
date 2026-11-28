@@ -9,10 +9,7 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
     Security::{AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES},
     System::{
-        Diagnostics::{
-            Debug::ReadProcessMemory,
-            ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
-        },
+        Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
         Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject},
     },
 };
@@ -87,35 +84,31 @@ pub fn pids(name: &str) -> Vec<u32> {
 }
 
 pub fn cmdline(pid: u32) -> Option<String> {
+    use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
     unsafe {
-        let h = OpenProcess(0x0410, 0, pid);
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
             return None;
         }
-        let read = |addr: usize, buf: *mut c_void, n: usize| ReadProcessMemory(h, addr as *const c_void, buf, n, null_mut()) != 0;
-        let r = (|| {
-            let mut pbi = [0usize; 6];
-            if NtQueryInformationProcess(h, 0, pbi.as_mut_ptr().cast(), 48, null_mut()) != 0 {
-                return None;
-            }
-            let mut params = 0usize;
-            if !read(pbi[1] + 0x20, (&mut params as *mut usize).cast(), 8) {
-                return None;
-            }
-            let mut us = [0u8; 16];
-            if !read(params + 0x70, us.as_mut_ptr().cast(), 16) {
-                return None;
-            }
-            let len = u16::from_le_bytes([us[0], us[1]]) as usize;
-            let buf = usize::from_le_bytes(us[8..16].try_into().ok()?);
-            let mut w = vec![0u16; len / 2];
-            if !read(buf, w.as_mut_ptr().cast(), len) {
-                return None;
-            }
-            Some(String::from_utf16_lossy(&w))
-        })();
+        let mut need = 0u32;
+        NtQueryInformationProcess(h, 60, null_mut(), 0, &mut need);
+        let cap = (need as usize).max(512);
+        let mut buf = vec![0u8; cap];
+        let mut got = 0u32;
+        let st = NtQueryInformationProcess(h, 60, buf.as_mut_ptr().cast(), buf.len() as u32, &mut got);
         CloseHandle(h);
-        r
+        if st < 0 || buf.len() < 16 {
+            return None;
+        }
+        let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+        let ptr = usize::from_le_bytes(buf[8..16].try_into().ok()?);
+        let base = buf.as_ptr() as usize;
+        if ptr >= base && ptr + len <= base + buf.len() {
+            let off = ptr - base;
+            let w: Vec<u16> = buf[off..off + len].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            return Some(String::from_utf16_lossy(&w));
+        }
+        None
     }
 }
 
@@ -243,56 +236,103 @@ pub fn kill_shell_explorers() {
 }
 
 pub fn elevated() -> bool {
-    use windows_sys::Win32::{
-        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenElevationType, TokenIntegrityLevel},
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
-    };
-    #[link(name = "shell32")]
-    unsafe extern "system" {
-        fn IsUserAnAdmin() -> i32;
-    }
-    let (mut t, mut e, mut n) = (null_mut(), TOKEN_ELEVATION { TokenIsElevated: 0 }, 0u32);
-    unsafe {
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut t) == 0 || t.is_null() {
-            return IsUserAnAdmin() != 0;
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ELEVATED.get_or_init(|| {
+        use windows_sys::Win32::{
+            Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenElevationType, TokenIntegrityLevel},
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn IsUserAnAdmin() -> i32;
         }
-        let ok = GetTokenInformation(t, TokenElevation, &mut e as *mut _ as _, size_of::<TOKEN_ELEVATION>() as u32, &mut n);
-        let (mut et, mut etn) = (0u32, 0u32);
-        let default_admin = GetTokenInformation(t, TokenElevationType, &mut et as *mut _ as _, 4, &mut etn) != 0 && et == 1 && IsUserAnAdmin() != 0;
-        if default_admin {
-            CloseHandle(t);
-            return true;
-        }
-        if ok == 0 || e.TokenIsElevated == 0 {
-            CloseHandle(t);
-            return false;
-        }
-        let mut need = 0u32;
-        GetTokenInformation(t, TokenIntegrityLevel, null_mut(), 0, &mut need);
-        let mut high = true;
-        if need >= size_of::<*const u8>() as u32 {
-            let mut stack = [0u8; 128];
-            let mut heap = Vec::new();
-            let buf: &mut [u8] = if (need as usize) <= stack.len() {
-                &mut stack[..need as usize]
-            } else {
-                heap.resize(need as usize, 0);
-                &mut heap
-            };
-            if GetTokenInformation(t, TokenIntegrityLevel, buf.as_mut_ptr().cast(), need, &mut need) != 0 {
-                let sid = *(buf.as_ptr() as *const *const u8);
-                if !sid.is_null() {
-                    let count = *sid.add(1) as usize;
-                    if count >= 1 {
-                        let o = 8 + (count - 1) * 4;
-                        let rid = u32::from_le_bytes([*sid.add(o), *sid.add(o + 1), *sid.add(o + 2), *sid.add(o + 3)]);
-                        high = rid >= 0x3000;
+        let (mut t, mut e, mut n) = (null_mut(), TOKEN_ELEVATION { TokenIsElevated: 0 }, 0u32);
+        unsafe {
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut t) == 0 || t.is_null() {
+                return IsUserAnAdmin() != 0;
+            }
+            let ok = GetTokenInformation(t, TokenElevation, &mut e as *mut _ as _, size_of::<TOKEN_ELEVATION>() as u32, &mut n);
+            let (mut et, mut etn) = (0u32, 0u32);
+            let default_admin = GetTokenInformation(t, TokenElevationType, &mut et as *mut _ as _, 4, &mut etn) != 0 && et == 1 && IsUserAnAdmin() != 0;
+            if default_admin {
+                CloseHandle(t);
+                return true;
+            }
+            if ok == 0 || e.TokenIsElevated == 0 {
+                CloseHandle(t);
+                return false;
+            }
+            let mut need = 0u32;
+            GetTokenInformation(t, TokenIntegrityLevel, null_mut(), 0, &mut need);
+            let mut high = true;
+            if need >= size_of::<*const u8>() as u32 {
+                let mut stack = [0u8; 128];
+                let mut heap = Vec::new();
+                let buf: &mut [u8] = if (need as usize) <= stack.len() {
+                    &mut stack[..need as usize]
+                } else {
+                    heap.resize(need as usize, 0);
+                    &mut heap
+                };
+                if GetTokenInformation(t, TokenIntegrityLevel, buf.as_mut_ptr().cast(), need, &mut need) != 0 {
+                    let sid = *(buf.as_ptr() as *const *const u8);
+                    if !sid.is_null() {
+                        let count = *sid.add(1) as usize;
+                        if count >= 1 {
+                            let o = 8 + (count - 1) * 4;
+                            let rid = u32::from_le_bytes([*sid.add(o), *sid.add(o + 1), *sid.add(o + 2), *sid.add(o + 3)]);
+                            high = rid >= 0x3000;
+                        }
                     }
                 }
             }
+            CloseHandle(t);
+            high
         }
-        CloseHandle(t);
-        high
+    })
+}
+
+pub fn spawn_medium(exe: &str) -> bool {
+    use windows_sys::Win32::{
+        Security::{DuplicateTokenEx, SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary},
+        System::Threading::{CreateProcessWithTokenW, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW},
+        UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId},
+    };
+    unsafe {
+        let shell = GetShellWindow();
+        if shell.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(shell, &mut pid);
+        if pid == 0 {
+            return false;
+        }
+        let hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if hp.is_null() {
+            return false;
+        }
+        let mut tok = null_mut();
+        let ok_tok = OpenProcessToken(hp, TOKEN_DUPLICATE | TOKEN_QUERY, &mut tok) != 0;
+        CloseHandle(hp);
+        if !ok_tok || tok.is_null() {
+            return false;
+        }
+        let mut dup = null_mut();
+        let ok_dup = DuplicateTokenEx(tok, 0x0200_0000, null(), SecurityImpersonation, TokenPrimary, &mut dup) != 0;
+        CloseHandle(tok);
+        if !ok_dup || dup.is_null() {
+            return false;
+        }
+        let si = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, ..std::mem::zeroed() };
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let ok = crate::with_wide(exe, |w| CreateProcessWithTokenW(dup, 0, w, null_mut(), 0, null(), null(), &si, &mut pi) != 0);
+        CloseHandle(dup);
+        if ok {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        ok
     }
 }
 
@@ -300,6 +340,9 @@ pub fn start_shell_explorer() -> std::io::Result<()> {
     use std::{os::windows::process::CommandExt, process::Command};
     let uac_on = crate::reg::get_dword(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "EnableLUA") != Some(0);
     if elevated() && uac_on {
+        if spawn_medium(r"C:\Windows\explorer.exe") {
+            return Ok(());
+        }
         Command::new("runas.exe").args(["/trustlevel:0x20000", r"C:\Windows\explorer.exe"]).creation_flags(0x0800_0000).status().map(|_| ())
     } else {
         Command::new(r"C:\Windows\explorer.exe").spawn().map(|_| ())

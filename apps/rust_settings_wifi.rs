@@ -272,7 +272,10 @@ pub fn add_and_connect(ssid: &str, raw: &[u8], sec: Sec, key: &str, hidden: bool
     let mut xml = wide(&profile_xml(ssid, raw, sec, key, kt, hidden));
     let mut reason = 0u32;
     let rc = unsafe { WlanSetProfile(c.0, &guid, 0, xml.as_ptr(), null(), 1, null(), &mut reason) };
-    xml.iter_mut().for_each(|w| *w = 0);
+    for w in &mut xml {
+        unsafe { std::ptr::write_volatile(w, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     if rc != 0 {
         return Err(if rc == ERROR_ACCESS_DENIED { "Windows refused to save networks (policy)".into() } else { format!("Profile rejected: {}", reason_text(reason)) });
     }

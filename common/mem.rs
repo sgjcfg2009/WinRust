@@ -98,15 +98,63 @@ fn auto_on() -> bool {
 }
 
 pub fn auto_loop() {
+    use windows_sys::Win32::{
+        Storage::FileSystem::{FindFirstChangeNotificationW, FindNextChangeNotification, FILE_NOTIFY_CHANGE_FILE_NAME},
+        System::{
+            Memory::{CreateMemoryResourceNotification, LowMemoryResourceNotification, QueryMemoryResourceNotification},
+            Threading::{INFINITE, WaitForMultipleObjects, WaitForSingleObject},
+        },
+    };
     let total = total_ram();
     let mut last: Option<std::time::Instant> = None;
+    let mem_ev = unsafe { CreateMemoryResourceNotification(LowMemoryResourceNotification) };
+    let dir_ev = auto_file()
+        .and_then(|f| f.parent().map(|p| p.to_path_buf()))
+        .map(|d| {
+            let _ = std::fs::create_dir_all(&d);
+            crate::with_wide(&d.to_string_lossy(), |w| unsafe { FindFirstChangeNotificationW(w, 0, FILE_NOTIFY_CHANGE_FILE_NAME) })
+        })
+        .unwrap_or(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+    if mem_ev.is_null() {
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            if last.is_some_and(|t| t.elapsed() < Duration::from_secs(180)) || !auto_on() {
+                continue;
+            }
+            if lists().is_some_and(|l| should_purge(l, total)) && purge_standby().is_ok() {
+                last = Some(std::time::Instant::now());
+            }
+        }
+    }
     loop {
-        thread::sleep(Duration::from_secs(30));
-        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(180)) || !auto_on() {
+        if !auto_on() {
+            if dir_ev != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                unsafe {
+                    WaitForSingleObject(dir_ev, INFINITE);
+                    FindNextChangeNotification(dir_ev);
+                }
+            } else {
+                thread::sleep(Duration::from_secs(60));
+            }
             continue;
         }
-        if lists().is_some_and(|l| should_purge(l, total)) && purge_standby().is_ok() {
-            last = Some(std::time::Instant::now());
+        let mut low = 0;
+        let signaled = unsafe { QueryMemoryResourceNotification(mem_ev, &mut low) != 0 && low != 0 };
+        if signaled && last.is_none_or(|t| t.elapsed() >= Duration::from_secs(180)) {
+            if lists().is_some_and(|l| should_purge(l, total)) && purge_standby().is_ok() {
+                last = Some(std::time::Instant::now());
+            }
+            thread::sleep(Duration::from_secs(180));
+            continue;
+        }
+        if dir_ev != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            let handles = [mem_ev, dir_ev];
+            let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+            if r == 1 {
+                unsafe { FindNextChangeNotification(dir_ev) };
+            }
+        } else {
+            unsafe { WaitForSingleObject(mem_ev, INFINITE) };
         }
     }
 }

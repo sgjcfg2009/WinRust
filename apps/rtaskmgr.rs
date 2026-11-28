@@ -48,7 +48,7 @@ fn net_selftest(out: &str) {
         let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         let addr = l.local_addr().map_err(|e| e.to_string())?;
         let srv = std::thread::spawn(move || {
-            let (mut c, _) = l.accept().unwrap();
+            let Ok((mut c, _)) = l.accept() else { return };
             let mut buf = vec![0u8; 100_000];
             let mut got = 0;
             while got < 200_000 {
@@ -97,6 +97,7 @@ fn focus_existing_taskmgr() {
 }
 
 fn main() {
+    winrust_common::install_panic_hook("rtaskmgr");
     if let Some(i) = std::env::args().position(|a| a == "--net-selftest")
         && let Some(out) = std::env::args().nth(i + 1) {
             return net_selftest(&out);
@@ -142,18 +143,23 @@ fn main() {
     });
     let ifeo = sys::taskmgr_args(&args);
     let fallback_args = ifeo.clone().unwrap_or_default();
+    let panic_args = fallback_args.clone();
     std::panic::set_hook(Box::new(move |info| {
         winrust_common::log("rtaskmgr", &format!("PANIC: {info}\n{}", std::backtrace::Backtrace::force_capture()));
-        sys::start_real_taskmgr(&fallback_args, true);
+        sys::start_real_taskmgr(&panic_args, true);
     }));
     let hidden = args.iter().any(|a| a == "--tray") || (sys::is_admin() && std::fs::remove_file(&tray_flag).is_ok());
     nwg::enable_visual_styles();
-    nwg::init().expect("не удалось инициализировать Win32");
+    if nwg::init().is_err() {
+        sys::start_real_taskmgr(&fallback_args, true);
+        return;
+    }
     winrust_common::ui::ensure_fluent_icons();
     let scale = nwg::scale_factor();
     let mut font = nwg::Font::default();
-    nwg::Font::builder().family("Segoe UI").size(17).build(&mut font).unwrap();
-    nwg::Font::set_global_default(Some(font));
+    if nwg::Font::builder().family("Segoe UI").size(17).build(&mut font).is_ok() {
+        nwg::Font::set_global_default(Some(font));
+    }
 
     store::trim_history(10_080);
     let cfg = store::load();
@@ -164,7 +170,7 @@ fn main() {
     let load_icon = |out: &mut nwg::Icon, size: (u32, u32)| {
         let ok = embed.as_ref().is_some_and(|e| nwg::Icon::builder().source_embed(Some(e)).source_embed_id(1).size(Some(size)).build(out).is_ok());
         if !ok {
-            nwg::Icon::builder().source_system(Some(nwg::OemIcon::Information)).build(out).unwrap();
+            let _ = nwg::Icon::builder().source_system(Some(nwg::OemIcon::Information)).build(out);
         }
     };
     let (mut icon_big, mut tray_icon) = (nwg::Icon::default(), nwg::Icon::default());
@@ -178,27 +184,30 @@ fn main() {
     let win_h = (cfg.size.1 as i32).clamp(((400.0 * scale) as i32).min(wh), (wh - 40).max(400));
     let win_x = cfg.pos.0.clamp(wa.left, (wa.right - win_w).max(wa.left));
     let win_y = cfg.pos.1.clamp(wa.top, (wa.bottom - win_h).max(wa.top));
-    nwg::Window::builder()
+    if nwg::Window::builder()
         .flags(if hidden { nwg::WindowFlags::MAIN_WINDOW } else { nwg::WindowFlags::MAIN_WINDOW | nwg::WindowFlags::VISIBLE })
         .icon(Some(&icon_big))
         .size((win_w, win_h))
         .position((win_x, win_y))
         .title("Task Manager")
         .build(&mut win)
-        .unwrap();
+        .is_err()
+    {
+        sys::start_real_taskmgr(&fallback_args, true);
+        return;
+    }
     let mut search = nwg::TextInput::default();
-    nwg::TextInput::builder()
+    let _ = nwg::TextInput::builder()
         .parent(&win)
         .placeholder_text(Some("Type a name, publisher or PID to search"))
         .flags(nwg::TextInputFlags::VISIBLE | nwg::TextInputFlags::TAB_STOP)
         .position((0, 0))
         .size((300, 20))
-        .build(&mut search)
-        .unwrap();
+        .build(&mut search);
     #[allow(deprecated)]
     let mut timer = nwg::Timer::default();
     #[allow(deprecated)]
-    nwg::Timer::builder().parent(&win).interval(1000).stopped(false).build(&mut timer).unwrap();
+    let _ = nwg::Timer::builder().parent(&win).interval(1000).stopped(false).build(&mut timer);
     let mut tray = nwg::TrayNotification::default();
     let _ = nwg::TrayNotification::builder().parent(&win).icon(Some(&tray_icon)).tip(Some("Task Manager (Rust)")).build(&mut tray);
 
@@ -252,7 +261,7 @@ fn main() {
     }
     app.tick();
 
-    let hwnd = app.win.handle.hwnd().unwrap();
+    let Some(hwnd) = app.win.handle.hwnd() else { return };
     unsafe { RegisterHotKey(hwnd, 1, (MOD_CONTROL | MOD_ALT) as u32, b'T' as u32) };
 
     let a = app.clone();
@@ -329,6 +338,15 @@ fn main() {
             WM_HOTKEY if w == 1 => {
                 a.show_window();
                 Some(0)
+            }
+            WM_QUERYENDSESSION => Some(1),
+            WM_ENDSESSION if w != 0 => {
+                a.quit();
+                Some(0)
+            }
+            WM_DESTROY => {
+                unsafe { UnregisterHotKey(hwnd, 1) };
+                None
             }
             _ => None,
         }

@@ -305,28 +305,83 @@ fn apply_ramp(r: &[[u16; 256]; 3]) {
 }
 
 pub fn night_helper() {
-    use windows_sys::Win32::System::Threading::CreateMutexW;
-    unsafe {
-        let m = CreateMutexW(null(), 0, wide("WinRustNightLight").as_ptr());
-        if m.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
-            return;
-        }
+    use windows_sys::Win32::{
+        System::{
+            Registry::{KEY_NOTIFY, REG_NOTIFY_CHANGE_LAST_SET, RegCloseKey, RegCreateKeyExW, RegNotifyChangeKeyValue},
+            Threading::{CreateEventW, CreateMutexW, INFINITE, ResetEvent},
+        },
+        UI::WindowsAndMessaging::*,
+    };
+    let mtx = unsafe { CreateMutexW(null(), 0, wide("WinRustNightLight").as_ptr()) };
+    if mtx.is_null() {
+        return;
     }
-    let mut cached: Option<(u32, [[u16; 256]; 3])> = None;
-    loop {
-        let k = night_kelvin();
-        let r = match cached {
-            Some((ck, ref cr)) if ck == k => cr,
-            _ => {
-                cached = Some((k, ramp(k)));
-                &cached.as_ref().unwrap().1
-            }
-        };
-        apply_ramp(r);
-        if k == 0 {
-            return;
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(mtx) };
+        return;
+    }
+    unsafe extern "system" fn night_wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if m == WM_DISPLAYCHANGE || (m == WM_POWERBROADCAST && (wp == 7 || wp == 18)) {
+            unsafe { PostThreadMessageW(0, WM_APP, 0, 0) };
         }
-        std::thread::sleep(Duration::from_secs(3));
+        unsafe { DefWindowProcW(h, m, wp, lp) }
+    }
+    let cls = wide("WinRustNightHelperWnd");
+    unsafe {
+        let wc = WNDCLASSW { lpfnWndProc: Some(night_wndproc), lpszClassName: cls.as_ptr(), ..std::mem::zeroed() };
+        RegisterClassW(&wc);
+        let hw = CreateWindowExW(0, cls.as_ptr(), null(), WS_POPUP, 0, 0, 0, 0, null_mut(), null_mut(), null_mut(), null());
+        let mut hk: windows_sys::Win32::System::Registry::HKEY = null_mut();
+        let _ = RegCreateKeyExW(HKEY_CURRENT_USER, wide(NIGHT).as_ptr(), 0, null(), 0, KEY_NOTIFY, null(), &mut hk, null_mut());
+        let ev = CreateEventW(null(), 1, 0, null());
+        if !hk.is_null() && !ev.is_null() {
+            let _ = RegNotifyChangeKeyValue(hk, 0, REG_NOTIFY_CHANGE_LAST_SET, ev, 1);
+        }
+        let mut cached: Option<(u32, [[u16; 256]; 3])> = None;
+        loop {
+            let k = night_kelvin();
+            let r = match cached {
+                Some((ck, ref cr)) if ck == k => cr,
+                _ => {
+                    cached = Some((k, ramp(k)));
+                    match cached.as_ref() {
+                        Some((_, cr)) => cr,
+                        None => break,
+                    }
+                }
+            };
+            apply_ramp(r);
+            if k == 0 {
+                break;
+            }
+            let wait_res = if !ev.is_null() {
+                MsgWaitForMultipleObjects(1, &ev, 0, INFINITE, QS_ALLINPUT)
+            } else {
+                MsgWaitForMultipleObjects(0, null(), 0, 15_000, QS_ALLINPUT)
+            };
+            if wait_res == 0 && !ev.is_null() {
+                ResetEvent(ev);
+                if !hk.is_null() {
+                    let _ = RegNotifyChangeKeyValue(hk, 0, REG_NOTIFY_CHANGE_LAST_SET, ev, 1);
+                }
+            } else {
+                let mut msg: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+        if !hw.is_null() {
+            DestroyWindow(hw);
+        }
+        if !ev.is_null() {
+            CloseHandle(ev);
+        }
+        if !hk.is_null() {
+            RegCloseKey(hk);
+        }
+        CloseHandle(mtx);
     }
 }
 

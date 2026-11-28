@@ -43,13 +43,18 @@ pub fn program(target: &str) -> bool {
     if uac_on
         && crate::proc::elevated()
         && (ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("com") || ext.eq_ignore_ascii_case("scr"))
-        && Command::new("runas")
+    {
+        if crate::proc::spawn_medium(target) {
+            return true;
+        }
+        if Command::new("runas")
             .args(["/trustlevel:0x20000", target])
             .creation_flags(NO_WINDOW)
             .output()
             .is_ok_and(|o| o.status.success())
-    {
-        return true;
+        {
+            return true;
+        }
     }
     shell_execute(target)
 }

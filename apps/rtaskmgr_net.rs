@@ -88,14 +88,18 @@ pub fn start() -> Option<Session> {
     Some(Session { handle: session_handle })
 }
 
-pub fn stop(s: Session) {
-    let name = wide(SESSION);
-    let mut props = props_buffer(&name);
-    unsafe { ControlTraceW(ctl(s.handle), null(), props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES, EVENT_TRACE_CONTROL_STOP) };
-    if let Ok(mut g) = TOTALS.lock() {
-        *g = None;
+impl Drop for Session {
+    fn drop(&mut self) {
+        let name = wide(SESSION);
+        let mut props = props_buffer(&name);
+        unsafe { ControlTraceW(ctl(self.handle), null(), props.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES, EVENT_TRACE_CONTROL_STOP) };
+        if let Ok(mut g) = TOTALS.lock() {
+            *g = None;
+        }
     }
 }
+
+pub fn stop(_s: Session) {}
 
 pub fn drain() -> HashMap<u32, (u64, u64)> {
     TOTALS.lock().ok().and_then(|mut g| g.take()).unwrap_or_default()

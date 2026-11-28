@@ -61,10 +61,7 @@ pub fn run(on: bool) -> i32 {
         if !hz_path.exists() { let _ = fs::write(&hz_path, cur.to_string()); }
         if !set_hz(60) { eprintln!("60 Hz not supported on this display"); }
     }
-    let mut kill = Command::new("taskkill");
-    kill.arg("/F").creation_flags(NO_WINDOW);
-    for n in LAUNCHERS { kill.args(["/IM", n]); }
-    let _ = kill.output();
+    let _ = winrust_common::proc::kill_and_wait(LAUNCHERS, 2000);
 
     let g = match existing.or_else(|| guid_in(&powercfg(&["/duplicatescheme", SAVER]))) {
         Some(g) => g,

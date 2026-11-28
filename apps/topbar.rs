@@ -388,6 +388,9 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         let i = (y / sc(FCELL)) * cols as i32 + x / sc(FCELL);
         if i < n { i } else { -1 }
     };
+    thread_local! {
+        static TRACK_FLY: Cell<bool> = const { Cell::new(false) };
+    }
     match msg {
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = zeroed();
@@ -399,8 +402,10 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_MOUSEMOVE => {
-            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
-            TrackMouseEvent(&mut tme);
+            if !TRACK_FLY.replace(true) {
+                let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                TrackMouseEvent(&mut tme);
+            }
             let hit = cell_at(lp);
             if FHOT.replace(hit) != hit {
                 InvalidateRect(hwnd, null(), 0);
@@ -422,6 +427,7 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_MOUSELEAVE => {
+            TRACK_FLY.set(false);
             FHOT.set(-1);
             hide_tip(BAR.load(Relaxed) as HWND);
             InvalidateRect(hwnd, null(), 0);
@@ -855,7 +861,7 @@ unsafe extern "system" fn fit_maximized(h: HWND, lp: isize) -> i32 {
     let f =GetSystemMetrics(SM_CXFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
     let n = RECT { left: r.left.max(want.left - f), top: r.top.max(want.top - f), right: r.right.min(want.right + f), bottom: r.bottom.min(want.bottom + f) };
     if (n.left, n.top, n.right, n.bottom) != (r.left, r.top, r.right, r.bottom) && n.right > n.left && n.bottom > n.top {
-        SetWindowPos(h, null_mut(), n.left, n.top, n.right - n.left, n.bottom - n.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(h, null_mut(), n.left, n.top, n.right - n.left, n.bottom - n.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
     1
 }
@@ -899,7 +905,9 @@ unsafe extern "system" fn collect(h: HWND, lp: LPARAM) -> i32 {
         || eq_ascii(&cls[..n], "WorkerW")
         || eq_ascii(&cls[..n], "Shell_TrayWnd")
         || eq_ascii(&cls[..n], "Shell_SecondaryTrayWnd");
-    if IsWindowVisible(h) != 0 && GetWindow(h, GW_OWNER).is_null() && cloaked == 0 && !ours && GetWindowTextLengthW(h) > 0 && (ex & WS_EX_TOOLWINDOW == 0 || ex & WS_EX_APPWINDOW != 0) {
+    let app_win = ex & WS_EX_APPWINDOW != 0;
+    let normal_win = GetWindow(h, GW_OWNER).is_null() && (ex & WS_EX_TOOLWINDOW == 0);
+    if IsWindowVisible(h) != 0 && cloaked == 0 && !ours && (app_win || normal_win) {
         (*(lp as *mut Vec<HWND>)).push(h);
     }
     1
@@ -1044,7 +1052,7 @@ pub(crate) unsafe fn safe_window_text(w: HWND, buf: &mut [u16]) -> usize {
 pub(crate) unsafe fn window_own_icon(h: HWND) -> HICON {
     for which in [1usize, 2, 0] {
         let mut r = 0usize;
-        SendMessageTimeoutW(h, WM_GETICON, which, 0, SMTO_ABORTIFHUNG, 40, &mut r);
+        SendMessageTimeoutW(h, WM_GETICON, which, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 40, &mut r);
         if r != 0 {
             return r as HICON;
         }
@@ -1309,8 +1317,16 @@ unsafe fn load_pins() {
     }
     let at: HashMap<PathBuf, usize> = files.iter().cloned().zip(&keys).map(|(f, k)| (f, fav.iter().position(|(fk, _)| fk == k).unwrap_or(usize::MAX))).collect();
     files.sort_by_key(|f| at[f]);
-    let order: Vec<String> = std::fs::read_to_string(pin_order_file()).unwrap_or_default().lines().map(|l| l.to_lowercase()).collect();
-    files.sort_by_key(|f| order.iter().position(|n| *n == f.file_name().unwrap_or_default().to_string_lossy().to_lowercase()).unwrap_or(usize::MAX));
+    let order_map: HashMap<String, usize> = std::fs::read_to_string(pin_order_file())
+        .unwrap_or_default()
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (l.to_lowercase(), i))
+        .collect();
+    files.sort_by_cached_key(|f| {
+        let name = f.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        order_map.get(&name).copied().unwrap_or(usize::MAX)
+    });
     for f in files {
         let lnk = wide(&f.to_string_lossy());
         let target = lnk_target(&lnk);
@@ -1398,7 +1414,7 @@ unsafe fn win_meta(w: HWND) -> (String, HICON) {
 unsafe fn hide_stub(w: HWND) {
     let mut r: RECT = zeroed();
     if IsIconic(w) != 0 && GetWindowRect(w, &mut r) != 0 && r.left > -30000 {
-        SetWindowPos(w, null_mut(), -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(w, null_mut(), -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
 }
 
@@ -1469,10 +1485,37 @@ fn slot_x(l: &Layout, i: i32) -> i32 {
     l.x0 + i * (l.bw + l.gap)
 }
 
+unsafe fn clock_width(small: bool) -> i32 {
+    thread_local! {
+        static CW_CACHE: Cell<(usize, usize, bool, u32, i32)> = const { Cell::new((0, 0, false, 0, 0)) };
+    }
+    let (tm, dt) = clock_texts();
+    let key = (tm.len(), dt.len(), small, SCALE.get().to_bits());
+    let cached = CW_CACHE.get();
+    if (cached.0, cached.1, cached.2, cached.3) == key && cached.4 > 0 {
+        return cached.4;
+    }
+    let dc = GetDC(null_mut());
+    let fonts = bar_fonts();
+    let of = SelectObject(dc, fonts[1]);
+    let mut r1 = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut r2 = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    with_wide(&tm, |w| DrawTextW(dc, w, -1, &mut r1, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX));
+    with_wide(&dt, |w| DrawTextW(dc, w, -1, &mut r2, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX));
+    SelectObject(dc, of);
+    ReleaseDC(null_mut(), dc);
+    let w = r1.right.max(r2.right) + sc(if small { 10 } else { 14 });
+    let w = w.max(sc(if small { 56 } else { 64 }));
+    CW_CACHE.set((key.0, key.1, key.2, key.3, w));
+    w
+}
+
 fn layout(w: i32) -> Layout {
     let small = small_bar();
     let gap = sc(if small { 2 } else { 4 });
-    let clock = (w - sc(if small { 74 } else { 82 }), w - sc(if small { 6 } else { 8 }));
+    let cw = unsafe { clock_width(small) };
+    let cr_r = w - sc(if small { 4 } else { 6 });
+    let clock = (cr_r - cw, cr_r);
     let bat_w = if BAT.get().0 >= 0 { if small { 26 } else { 30 } } else { 0 };
     let sys_w = if small { 48 + bat_w } else { 54 + bat_w };
     let sys = (clock.0 - sc(2) - sc(sys_w), clock.0 - sc(2));
@@ -2114,7 +2157,7 @@ unsafe fn icon_of(h: HWND) -> HICON {
             return ic;
         }
     }
-    null_mut()
+    LoadIconW(null_mut(), IDI_APPLICATION)
 }
 
 unsafe fn app_window() -> HWND {
@@ -2131,6 +2174,18 @@ unsafe fn app_window() -> HWND {
 
 thread_local! {
     static WIN_DIRTY: Cell<bool> = const { Cell::new(false) };
+    static TRACK_BAR: Cell<bool> = const { Cell::new(false) };
+    static WIN_HOOKS: RefCell<Vec<windows_sys::Win32::UI::Accessibility::HWINEVENTHOOK>> = const { RefCell::new(Vec::new()) };
+}
+
+unsafe fn unhook_win_events() {
+    WIN_HOOKS.with_borrow_mut(|hooks| {
+        for h in hooks.drain(..) {
+            if !h.is_null() {
+                windows_sys::Win32::UI::Accessibility::UnhookWinEvent(h);
+            }
+        }
+    });
 }
 
 unsafe fn repaint_if_changed(hwnd: HWND) {
@@ -2158,7 +2213,7 @@ unsafe extern "system" fn win_event(_: windows_sys::Win32::UI::Accessibility::HW
             true
         }
         0x8001 => known(),
-        0x800C => !known() && top(),
+        0x800C => !known() && GetAncestor(w, GA_ROOT) == w,
         _ => top() || known(),
     };
     if relevant && !WIN_DIRTY.replace(true) {
@@ -2647,8 +2702,8 @@ unsafe fn paint(hwnd: HWND) {
     let (tm, dt) = clock_texts();
     let ch = sc(if small { 13 } else { 15 });
     SelectObject(dc, fonts[1]);
-    text(dc, &tm, RECT { left: cb.left + sc(4), top: mid - ch, right: cb.right - sc(6), bottom: mid }, pal().text, DT_RIGHT);
-    text(dc, &dt, RECT { left: cb.left + sc(4), top: mid, right: cb.right - sc(6), bottom: mid + ch }, mix(pal().dim, pal().text, 0.7), DT_RIGHT);
+    text_box(dc, &tm, RECT { left: cb.left + sc(2), top: mid - ch, right: cb.right - sc(4), bottom: mid }, pal().text, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    text_box(dc, &dt, RECT { left: cb.left + sc(2), top: mid, right: cb.right - sc(4), bottom: mid + ch }, mix(pal().dim, pal().text, 0.7), DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     }
 
     if ulw && !bits.is_null() {
@@ -3193,11 +3248,11 @@ unsafe extern "system" fn snap_proc(_: windows_sys::Win32::UI::Accessibility::HW
     let (m, a) = (mi.rcMonitor, mi.rcWork);
     let half = (a.right - a.left) / 2;
     if pt.y <= m.top + 1 {
-        ShowWindow(w, SW_MAXIMIZE);
+        ShowWindowAsync(w, SW_MAXIMIZE);
     } else if pt.x <= m.left + 1 {
-        SetWindowPos(w, null_mut(), a.left, a.top, half, a.bottom - a.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(w, null_mut(), a.left, a.top, half, a.bottom - a.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     } else if pt.x >= m.right - 2 {
-        SetWindowPos(w, null_mut(), a.left + half, a.top, half, a.bottom - a.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(w, null_mut(), a.left + half, a.top, half, a.bottom - a.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
 }
 
@@ -3370,6 +3425,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let dpi = ((wp >> 16) & 0xFFFF) as f32;
             if dpi > 0.0 {
                 SCALE.set(dpi / 96.0);
+                reset_glyph_fonts();
                 place(hwnd);
                 InvalidateRect(hwnd, null(), 0);
             }
@@ -3452,7 +3508,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if !tb.is_null() && IsWindowVisible(tb) != 0 {
                 hide_taskbar();
             }
-            refresh_status();
+            refresh();
             let now_exp = EXPLORER_UP.load(Relaxed);
             if was_exp && !now_exp {
                 let host = HOST.get();
@@ -3466,8 +3522,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEMOVE => {
             let h = hit(hwnd, (lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
-            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
-            TrackMouseEvent(&mut tme);
+            if !TRACK_BAR.replace(true) {
+                let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                TrackMouseEvent(&mut tme);
+            }
             if HOT.replace(h) != h {
                 hide_tip(hwnd);
                 if h != NONE {
@@ -3477,6 +3535,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_MOUSELEAVE => {
+            TRACK_BAR.set(false);
             hide_tip(hwnd);
             HOT.set(-1);
             InvalidateRect(hwnd, null(), 0);
@@ -3490,33 +3549,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             InvalidateRect(hwnd, null(), 0);
         }
-        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+        WM_LBUTTONDOWN | WM_MBUTTONDOWN => {
+            let h = hit(hwnd, (lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
+            hide_tip(hwnd);
+            thumbs::hide_preview();
+            UI_GUARD.set(true);
+            click(h, msg == WM_LBUTTONDOWN, msg == WM_MBUTTONDOWN);
+            UI_GUARD.set(false);
+            fs_update(hwnd);
+            InvalidateRect(hwnd, null(), 0);
+        }
+        WM_RBUTTONUP => {
             let x = (lp & 0xffff) as i16 as i32;
             let h = hit(hwnd, x, (lp >> 16) as i16 as i32);
             let x = if vert() { (lp >> 16) as i16 as i32 } else { x };
             hide_tip(hwnd);
             thumbs::hide_preview();
             UI_GUARD.set(true);
-            if h == NONE && msg == WM_RBUTTONDOWN {
+            if h == NONE {
+                fly::close();
                 fly::context_menu(x);
-            } else if h >= 1 && msg == WM_RBUTTONDOWN {
+            } else if h >= 1 {
+                fly::close();
+                SetForegroundWindow(hwnd);
                 app_menu(hwnd, h);
-            } else if !(msg == WM_RBUTTONDOWN && (TAPP..=-900).contains(&h)) {
-                click(h, msg == WM_LBUTTONDOWN, msg == WM_MBUTTONDOWN);
+            } else {
+                click(h, false, false);
             }
             UI_GUARD.set(false);
             fs_update(hwnd);
             InvalidateRect(hwnd, null(), 0);
-        }
-        WM_RBUTTONUP => {
-            let h = hit(hwnd, (lp & 0xffff) as i16 as i32, (lp >> 16) as i16 as i32);
-            if (TAPP..=-900).contains(&h) {
-                UI_GUARD.set(true);
-                click(h, false, false);
-                UI_GUARD.set(false);
-                fs_update(hwnd);
-                InvalidateRect(hwnd, null(), 0);
-            }
         }
         CALLBACK => {
             if wp == ABN_FULLSCREENAPP as usize {
@@ -3526,7 +3588,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_DISPLAYCHANGE => place(hwnd),
+        WM_QUERYENDSESSION => return 1,
+        WM_ENDSESSION => {
+            if wp != 0 {
+                unhook_win_events();
+                vdesk_restore_all();
+                let mut ab: APPBARDATA = zeroed();
+                ab.cbSize = size_of::<APPBARDATA>() as u32;
+                ab.hWnd = hwnd;
+                SHAppBarMessage(ABM_REMOVE, &mut ab);
+                set_work_area(RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) });
+                show_taskbar(OLD_STATE.get());
+                forget_taskbar_state();
+                DestroyWindow(HOST.replace(null_mut()));
+                announce();
+            }
+        }
         WM_DESTROY => {
+            unhook_win_events();
+            UnregisterHotKey(hwnd, 99);
+            reset_glyph_fonts();
             vdesk_restore_all();
             let mut ab: APPBARDATA = zeroed();
             ab.cbSize = size_of::<APPBARDATA>() as u32;
@@ -3680,24 +3761,23 @@ fn main() {
         RegisterHotKey(hwnd, 99, (MOD_WIN | MOD_NOREPEAT) as u32, 0x57);
         bar_step(hwnd);
         fs_update(hwnd);
-        windows_sys::Win32::UI::Accessibility::SetWinEventHook(0x000B, 0x000B, null_mut(), Some(snap_proc), 0, 0, 0);
-        for (a, b) in [(0x0003, 0x0003), (0x0016, 0x0017), (0x8000, 0x8003), (0x800C, 0x800C), (0x8017, 0x8018)] {
-            windows_sys::Win32::UI::Accessibility::SetWinEventHook(a, b, null_mut(), Some(win_event), 0, 0, 2);
-        }
+        let h1 = windows_sys::Win32::UI::Accessibility::SetWinEventHook(0x000B, 0x000B, null_mut(), Some(snap_proc), 0, 0, 0);
+        WIN_HOOKS.with_borrow_mut(|hooks| {
+            if !h1.is_null() { hooks.push(h1); }
+            for (a, b) in [(0x0003, 0x0003), (0x0016, 0x0017), (0x8000, 0x8003), (0x800C, 0x800C), (0x8017, 0x8018)] {
+                let hk = windows_sys::Win32::UI::Accessibility::SetWinEventHook(a, b, null_mut(), Some(win_event), 0, 0, 2);
+                if !hk.is_null() { hooks.push(hk); }
+            }
+        });
         thread::spawn(|| {
-            let mut hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook), GetModuleHandleW(null()), 0);
-            SetTimer(null_mut(), 0, 30_000, None);
+            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook), GetModuleHandleW(null()), 0);
             let mut m: MSG = zeroed();
             while GetMessageW(&mut m, null_mut(), 0, 0) > 0 {
-                if m.message == WM_TIMER {
-                    let new = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook), GetModuleHandleW(null()), 0);
-                    if !new.is_null() {
-                        if !hook.is_null() {
-                            UnhookWindowsHookEx(hook);
-                        }
-                        hook = new;
-                    }
-                }
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+            if !hook.is_null() {
+                UnhookWindowsHookEx(hook);
             }
         });
         let mut m: MSG = zeroed();
@@ -3705,6 +3785,7 @@ fn main() {
             TranslateMessage(&m);
             DispatchMessageW(&m);
         }
+        windows::Win32::System::Com::CoUninitialize();
     }
 }
 

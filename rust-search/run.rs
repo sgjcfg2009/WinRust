@@ -225,7 +225,7 @@ pub fn suggest(text: &str, history: &[String], programs: &[String]) -> Vec<(Stri
                     n.to_lowercase().starts_with(&pl).then(|| (!d, format!("{dir}\\{n}{}", if d { "\\" } else { "" })))
                 })
                 .collect();
-            v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+            v.sort_by_cached_key(|a| (a.0, a.1.to_lowercase()));
             for (_, s) in v {
                 add(&s, Src::Folder, &mut out);
             }

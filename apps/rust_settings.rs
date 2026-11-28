@@ -354,7 +354,11 @@ fn pick_item(a: &App, cw: i32, ch: i32, x: i32, y: i32) -> Option<usize> {
     let (r, n, _) = pick_geom(a, cw, ch)?;
     let row = a.dpi * PICK_ROW / 96;
     let pad = a.dpi * 6 / 96;
-    (x >= r.left && x < r.right && y >= r.top + pad && y < r.top + pad + row * n as i32).then(|| a.pick.as_ref().unwrap().top + ((y - r.top - pad) / row) as usize)
+    if x >= r.left && x < r.right && y >= r.top + pad && y < r.top + pad + row * n as i32 {
+        a.pick.as_ref().map(|pk| pk.top + ((y - r.top - pad) / row) as usize)
+    } else {
+        None
+    }
 }
 
 fn night_labels() -> Vec<String> {
@@ -1403,34 +1407,37 @@ fn sync_clock() {
             .status()
             .is_ok_and(|s| s.success())
     };
-    let _ = run("net.exe", &["start", "w32time"]);
-    let ok = if run("w32tm.exe", &["/resync", "/force"]) {
-        true
-    } else {
-        let (verb, file, params) = (wide("runas"), wide("cmd.exe"), wide("/c net start w32time >nul 2>&1 & w32tm /resync /force"));
-        let mut ei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-        ei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
-        ei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
-        ei.lpVerb = verb.as_ptr();
-        ei.lpFile = file.as_ptr();
-        ei.lpParameters = params.as_ptr();
-        ei.nShow = SW_HIDE;
-        if unsafe { ShellExecuteExW(&mut ei) } != 0 && !ei.hProcess.is_null() {
-            let mut code = 1u32;
-            unsafe {
-                WaitForSingleObject(ei.hProcess, INFINITE);
-                GetExitCodeProcess(ei.hProcess, &mut code);
-                CloseHandle(ei.hProcess);
-            }
-            code == 0
+    note("Syncing clock…".into());
+    std::thread::spawn(move || {
+        let _ = run("net.exe", &["start", "w32time"]);
+        let ok = if run("w32tm.exe", &["/resync", "/force"]) {
+            true
         } else {
-            false
-        }
-    };
-    note(if ok {
-        "Clock synchronized".into()
-    } else {
-        "Could not sync clock (needs administrator rights)".into()
+            let (verb, file, params) = (wide("runas"), wide("cmd.exe"), wide("/c net start w32time >nul 2>&1 & w32tm /resync /force"));
+            let mut ei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+            ei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+            ei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+            ei.lpVerb = verb.as_ptr();
+            ei.lpFile = file.as_ptr();
+            ei.lpParameters = params.as_ptr();
+            ei.nShow = SW_HIDE;
+            if unsafe { ShellExecuteExW(&mut ei) } != 0 && !ei.hProcess.is_null() {
+                let mut code = 1u32;
+                unsafe {
+                    WaitForSingleObject(ei.hProcess, INFINITE);
+                    GetExitCodeProcess(ei.hProcess, &mut code);
+                    CloseHandle(ei.hProcess);
+                }
+                code == 0
+            } else {
+                false
+            }
+        };
+        note(if ok {
+            "Clock synchronized".into()
+        } else {
+            "Could not sync clock (needs administrator rights)".into()
+        });
     });
 }
 

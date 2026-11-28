@@ -119,6 +119,7 @@ fn worker() -> &'static Sender<(isize, u32, PathBuf)> {
                     unsafe { drop(Box::from_raw(msg)) };
                 }
             }
+            decode::com_uninit();
         });
         tx
     })

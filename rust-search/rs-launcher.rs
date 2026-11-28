@@ -207,7 +207,7 @@ fn spawn_programs_load(h: isize) {
     if should {
         std::thread::spawn(move || {
             let p = run::programs();
-            *PROGRAMS_DATA.lock().unwrap() = Some(p);
+            *PROGRAMS_DATA.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
             unsafe { PostMessageW(h as HWND, WM_PROGRAMS, 0, 0) };
         });
     }
@@ -294,7 +294,7 @@ unsafe fn refresh(h: HWND) {
     std::thread::spawn(move || {
         let res = ask(&q);
         if QUERY_SEQ.load(SeqCst) == seq {
-            *ANSWER.lock().unwrap() = Some((seq, res));
+            *ANSWER.lock().unwrap_or_else(|e| e.into_inner()) = Some((seq, res));
             unsafe { PostMessageW(hw as HWND, WM_RESULTS, 0, 0) };
         }
     });
@@ -720,7 +720,7 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
             0
         }
         WM_RESULTS => {
-            let a = ANSWER.lock().unwrap().take();
+            let a = ANSWER.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some((seq, res)) = a {
                 if seq == QUERY_SEQ.load(std::sync::atomic::Ordering::SeqCst) && st(|s| s.ta > 0.0 && s.rename.is_none()) {
                     apply_results(h, res);
@@ -729,7 +729,7 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LR
             0
         }
         WM_PROGRAMS => {
-            if let Some(p) = PROGRAMS_DATA.lock().unwrap().take() {
+            if let Some(p) = PROGRAMS_DATA.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 st(|s| {
                     s.programs = p;
                     s.programs_loading = false;
@@ -1661,7 +1661,7 @@ fn search_host_guard() {
     }
     kill_search_host();
     unsafe {
-        SetWinEventHook(0x8000, 0x8000, null_mut(), Some(created), 0, 0, 0x0002);
+        SetWinEventHook(0x0003, 0x0003, null_mut(), Some(created), 0, 0, 0x0002);
         let mut m: MSG = zeroed();
         while GetMessageW(&mut m, null_mut(), 0, 0) > 0 {}
     }

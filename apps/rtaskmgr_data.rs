@@ -127,8 +127,15 @@ impl Data {
     }
 
     fn new_inner(cfg: store::Settings, is_admin: bool) -> Data {
+        let sys = match System::new() {
+            Ok(s) => s,
+            Err(_) => {
+                sys::start_real_taskmgr("", true);
+                std::process::exit(1);
+            }
+        };
         Data {
-            sys: System::new().expect("sysinfo"),
+            sys,
             procs: vec![],
             cur: HashMap::new(),
             titles: HashMap::new(),

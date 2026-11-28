@@ -80,10 +80,13 @@ fn desk_bottom() -> i32 {
 }
 const THUMB: i32 = 96;
 const WM_THUMB: u32 = WM_APP + 2;
+const WM_SEARCH_DONE: u32 = WM_APP + 22;
 static GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static SEARCH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TX: std::sync::OnceLock<std::sync::mpsc::Sender<(u32, usize, PathBuf)>> = std::sync::OnceLock::new();
 const WM_GO: u32 = WM_APP + 1;
 static EDIT_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static DESK_FONT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 struct Row { name: String, dir: bool, size: u64, time: u64, icon: i32, thumb: i32, hdr: bool }
 
@@ -1140,29 +1143,11 @@ fn ask(d: char, q: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out).into_owned())
 }
 
-fn search(h: HWND, q: &str) {
-    let mut rows = vec![];
-    let mut more = String::new();
-    let mut indexed = false;
-    for d in 'A'..='Z' {
-        let Some(reply) = ask(d, q) else { continue };
-        indexed = true;
-        for line in reply.lines() {
-            if line.starts_with("... ") { more = format!(", {}", line.trim_start_matches("... ")); continue; }
-            let m = fs::metadata(line).ok();
-            rows.push(row(line.to_string(), m.as_ref()));
-        }
-    }
-    if !indexed {
-        let (local, cut, flipped) = local_search(&cur_dir(), q);
-        if flipped { more = format!(" for \u{201C}{}\u{201D}", flip_layout(q)); }
-        rows = local;
-        if cut { more += ", stopped early: narrow the search"; }
-    }
+fn search_apply(h: HWND, q: &str, rows: Vec<Row>, more: &str, indexed: bool) {
     let n = rows.len();
     let where_ = if indexed { "" } else { " in this folder" };
     let title = if n == 0 {
-        format!("search: {} - nothing{}{}", q, where_, "")
+        format!("search: {} - nothing{}", q, where_)
     } else {
         format!("search: {} - {} hits{}{}", q, n, where_, more)
     };
@@ -1175,36 +1160,91 @@ fn search(h: HWND, q: &str) {
     unsafe { ui::fit_columns(list) };
 }
 
-fn flip_layout(q: &str) -> String {
-    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~";
-    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюёЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ";
-    q.chars()
-        .map(|c| {
-            EN.chars().position(|x| x == c).and_then(|i| RU.chars().nth(i))
-                .or_else(|| RU.chars().position(|x| x == c).and_then(|i| EN.chars().nth(i)))
-                .unwrap_or(c)
-        })
-        .collect()
+fn search(h: HWND, q: &str) {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    let dir = cur_dir();
+    let mut rows = vec![];
+    let mut more = String::new();
+    let mut indexed = false;
+    let is_pc = dir == Path::new(THIS_PC_KEY);
+    let drives: Vec<char> = if is_pc {
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26u32)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| (b'A' + i as u8) as char)
+            .filter(|&d| {
+                let root = [d as u16, b':' as u16, b'\\' as u16, 0];
+                unsafe { GetDriveTypeW(root.as_ptr()) == 3 }
+            })
+            .collect()
+    } else {
+        dir.to_string_lossy()
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|c| vec![c.to_ascii_uppercase()])
+            .unwrap_or_default()
+    };
+    let query_str = if is_pc || dir.parent().is_none() {
+        q.to_string()
+    } else {
+        format!("scope:{}\n{q}", dir.to_string_lossy())
+    };
+    for d in drives {
+        let Some(reply) = ask(d, &query_str) else { continue };
+        indexed = true;
+        for line in reply.lines() {
+            if line.starts_with("... ") { more = format!(", {}", line.trim_start_matches("... ")); continue; }
+            let m = fs::metadata(line).ok();
+            rows.push(row(line.to_string(), m.as_ref()));
+        }
+    }
+    if indexed {
+        SEARCH_GEN.fetch_add(1, Relaxed);
+        search_apply(h, q, rows, &more, true);
+        return;
+    }
+    let sg = SEARCH_GEN.fetch_add(1, Relaxed) + 1;
+    let q_owned = q.to_string();
+    let hw = h as isize;
+    ui::set_search(Some(q_owned.clone()));
+    unsafe { SetWindowTextW(h, w(&format!("searching: {q_owned}...")).as_ptr()) };
+    std::thread::spawn(move || {
+        let (local, cut) = local_search(&dir, &q_owned, sg);
+        if SEARCH_GEN.load(Relaxed) != sg {
+            return;
+        }
+        let more = if cut { ", stopped early: narrow the search".to_string() } else { String::new() };
+        let payload = Box::into_raw(Box::new((sg, q_owned, local, more)));
+        unsafe {
+            if PostMessageW(hw as HWND, WM_SEARCH_DONE, payload as usize, 0) == 0 {
+                drop(Box::from_raw(payload));
+            }
+        }
+    });
 }
 
-fn local_search(dir: &Path, q: &str) -> (Vec<Row>, bool, bool) {
+fn local_search(dir: &Path, q: &str, sg: u64) -> (Vec<Row>, bool) {
     const LOCAL_MAX: usize = 500;
     const LOCAL_MS: u128 = 1500;
     let (q, t0) = (q.to_lowercase(), std::time::Instant::now());
-    let alt = flip_layout(&q);
-    let (mut out, mut other, mut queue) = (vec![], vec![], std::collections::VecDeque::from([dir.to_path_buf()]));
+    let (mut out, mut queue) = (vec![], std::collections::VecDeque::from([dir.to_path_buf()]));
     let mut cut = false;
     'walk: while let Some(d) = queue.pop_front() {
         for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+            if SEARCH_GEN.load(Relaxed) != sg {
+                return (Vec::new(), false);
+            }
             if out.len() >= LOCAL_MAX || t0.elapsed().as_millis() > LOCAL_MS { cut = true; break 'walk; }
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() && !ft.is_symlink() { queue.push_back(e.path()); }
             let name = e.file_name().to_string_lossy().to_lowercase();
-            let hit = |v: &mut Vec<Row>| v.push(row(e.path().to_string_lossy().into_owned(), e.metadata().ok().as_ref()));
-            if name.contains(&q) { hit(&mut out); } else if alt != q && other.len() < LOCAL_MAX && name.contains(&alt) { hit(&mut other); }
+            if name.contains(&q) {
+                out.push(row(e.path().to_string_lossy().into_owned(), e.metadata().ok().as_ref()));
+            }
         }
     }
-    if out.is_empty() && !other.is_empty() { (other, cut, true) } else { (out, cut, false) }
+    (out, cut)
 }
 
 fn reset_thumbs() {
@@ -1545,16 +1585,63 @@ mod sh {
     }
 
     pub fn clip_set(h: *mut c_void, paths: &[PathBuf], cut: bool) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::System::{
+            DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard, SetClipboardData},
+            Memory::GHND,
+        };
+        if paths.is_empty() {
+            return Ok(());
+        }
         unsafe {
-            let data: IDataObject = ui(HWND(h), paths)?;
-            let fmt = FORMATETC { cfFormat: RegisterClipboardFormatW(w!("Preferred DropEffect")) as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0 as u32, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
-            let hg = GlobalAlloc(GMEM_MOVEABLE, 4)?;
-            *(GlobalLock(hg) as *mut u32) = if cut { DROPEFFECT_MOVE.0 } else { DROPEFFECT_COPY.0 };
-            let _ = GlobalUnlock(hg);
-            let med = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: hg }, pUnkForRelease: std::mem::ManuallyDrop::new(None) };
-            data.SetData(&fmt, &med, true)?;
-            OleSetClipboard(&data)?;
-            let seq = windows::Win32::System::DataExchange::GetClipboardSequenceNumber();
+            let mut wide_paths: Vec<u16> = Vec::new();
+            for p in paths {
+                wide_paths.extend(p.as_os_str().encode_wide());
+                wide_paths.push(0);
+            }
+            wide_paths.push(0);
+            let hdr_sz = size_of::<DROPFILES>();
+            let total_sz = hdr_sz + wide_paths.len() * 2;
+            let h_drop = GlobalAlloc(GHND, total_sz)?;
+            let p_drop = GlobalLock(h_drop) as *mut u8;
+            if p_drop.is_null() {
+                let _ = GlobalFree(Some(h_drop));
+                return Err(Error::from_thread());
+            }
+            std::ptr::write(p_drop as *mut DROPFILES, DROPFILES { pFiles: hdr_sz as u32, pt: POINT::default(), fNC: BOOL(0), fWide: BOOL(1) });
+            std::ptr::copy_nonoverlapping(wide_paths.as_ptr() as *const u8, p_drop.add(hdr_sz), wide_paths.len() * 2);
+            let _ = GlobalUnlock(h_drop);
+
+            let h_eff = GlobalAlloc(GMEM_MOVEABLE, 4)?;
+            let p_eff = GlobalLock(h_eff) as *mut u32;
+            if p_eff.is_null() {
+                let _ = GlobalFree(Some(h_drop));
+                let _ = GlobalFree(Some(h_eff));
+                return Err(Error::from_thread());
+            }
+            *p_eff = if cut { DROPEFFECT_MOVE.0 } else { DROPEFFECT_COPY.0 };
+            let _ = GlobalUnlock(h_eff);
+
+            if let Err(e) = OpenClipboard(Some(HWND(h))) {
+                let _ = GlobalFree(Some(h_drop));
+                let _ = GlobalFree(Some(h_eff));
+                return Err(e);
+            }
+            if let Err(e) = EmptyClipboard() {
+                let _ = CloseClipboard();
+                let _ = GlobalFree(Some(h_drop));
+                let _ = GlobalFree(Some(h_eff));
+                return Err(e);
+            }
+            let cf_eff = RegisterClipboardFormatW(w!("Preferred DropEffect"));
+            if SetClipboardData(15, Some(HANDLE(h_drop.0))).is_err() {
+                let _ = GlobalFree(Some(h_drop));
+            }
+            if SetClipboardData(cf_eff, Some(HANDLE(h_eff.0))).is_err() {
+                let _ = GlobalFree(Some(h_eff));
+            }
+            let _ = CloseClipboard();
+            let seq = GetClipboardSequenceNumber();
             CUT_STATE.with_borrow_mut(|c| {
                 c.0 = seq;
                 c.1 = if cut { paths.iter().map(|p| p.to_string_lossy().to_lowercase()).collect() } else { Vec::new() };
@@ -1564,7 +1651,37 @@ mod sh {
     }
 
     pub fn clip_get() -> Option<(Vec<PathBuf>, bool)> {
+        use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
         unsafe {
+            if OpenClipboard(None).is_ok() {
+                let mut out_paths = Vec::new();
+                if let Ok(hd) = GetClipboardData(15) {
+                    let hdrop = HDROP(hd.0);
+                    let n = DragQueryFileW(hdrop, u32::MAX, None);
+                    for i in 0..n {
+                        let len = DragQueryFileW(hdrop, i, None) as usize;
+                        if len > 0 {
+                            let mut b = vec![0u16; len + 1];
+                            DragQueryFileW(hdrop, i, Some(&mut b));
+                            out_paths.push(PathBuf::from(String::from_utf16_lossy(&b[..len])));
+                        }
+                    }
+                }
+                let cf_eff = RegisterClipboardFormatW(w!("Preferred DropEffect"));
+                let cut = if let Ok(he) = GetClipboardData(cf_eff) {
+                    let hg = HGLOBAL(he.0);
+                    let p = GlobalLock(hg) as *const u32;
+                    let v = if p.is_null() { 0 } else { *p };
+                    let _ = GlobalUnlock(hg);
+                    v & DROPEFFECT_MOVE.0 != 0
+                } else {
+                    false
+                };
+                let _ = CloseClipboard();
+                if !out_paths.is_empty() {
+                    return Some((out_paths, cut));
+                }
+            }
             let o = OleGetClipboard().ok()?;
             let paths = hdrop_paths(&o).ok().filter(|p| !p.is_empty())?;
             let fmt = FORMATETC { cfFormat: RegisterClipboardFormatW(w!("Preferred DropEffect")) as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0 as u32, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
@@ -1582,6 +1699,10 @@ mod sh {
     pub fn clip_clear() {
         unsafe { let _ = OleSetClipboard(None); }
         CUT_STATE.with_borrow_mut(|c| c.1.clear());
+    }
+
+    pub fn clip_flush() {
+        unsafe { let _ = OleFlushClipboard(); }
     }
 
     pub fn has_cut() -> bool {
@@ -2721,7 +2842,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     put(list, LVM_SETTEXTCOLOR, 0, 0x00FF_FFFF);
                     reload_wall();
                     desk::hook_list(list);
-                    put(list, WM_SETFONT, windows_sys::Win32::Graphics::Gdi::CreateFontW(-ui::sc(13), 0, 0, 0, 500, 0, 0, 0, 1, 0, 0, 4, 0, w(ui::ui_face()).as_ptr()) as usize, 1);
+                    let df = windows_sys::Win32::Graphics::Gdi::CreateFontW(-ui::sc(13), 0, 0, 0, 500, 0, 0, 0, 1, 0, 0, 4, 0, w(ui::ui_face()).as_ptr());
+                    let old_df = DESK_FONT.swap(df as isize, Relaxed);
+                    if old_df != 0 { windows_sys::Win32::Graphics::Gdi::DeleteObject(old_df as _); }
+                    put(list, WM_SETFONT, df as usize, 1);
                     CreateWindowExW(0, w("SHELLDLL_DefView").as_ptr(), ptr::null(), WS_CHILD, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
                     SetTimer(h, 7, 2000, None);
                 } else {
@@ -2937,16 +3061,18 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             if name == THIS_PC_KEY {
                                 if let Ok(me) = env::current_exe() { spawn_gui(&mut std::process::Command::new(me)); }
                             } else if name == RECYCLE_BIN_KEY {
-                                ShellExecuteW(h, w("explore").as_ptr(), w("shell:RecycleBinFolder").as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL);
+                                ShellExecuteW(h, w("open").as_ptr(), w("explorer.exe").as_ptr(), w("shell:RecycleBinFolder").as_ptr(), ptr::null(), SW_SHOWNORMAL);
                             } else {
                                 activate(h, p, is_dir);
                             }
                         }
                     }
                     NM_RCLICK if nm.hwndFrom == list => {
+                        MENU_DONE.with(|t| t.set(Some(std::time::Instant::now())));
                         let (_, dir, paths) = selected();
                         if !paths.is_empty() { item_menu(h, &dir, &paths); } else { bg_menu(h); }
                         MENU_DONE.with(|t| t.set(Some(std::time::Instant::now())));
+                        return 1;
                     }
                     LVN_COLUMNCLICK => {
                         let c = (*(lp as *const NMLISTVIEW)).iSubItem as usize;
@@ -3045,6 +3171,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             }
             WM_SETFOCUS => { SetFocus(ST.with_borrow(|st| st.list)); 0 }
             WM_APP => { WATCH_PENDING.store(false, Relaxed); reload_select_new(h); 0 }
+            WM_SEARCH_DONE => {
+                let (sg, q, rows, more) = *Box::from_raw(wp as *mut (u64, String, Vec<Row>, String));
+                if SEARCH_GEN.load(Relaxed) == sg {
+                    search_apply(h, &q, rows, &more, false);
+                }
+                0
+            }
             shellwin::WM_SHELL_SELECT => { shell_select(h as isize, *Box::from_raw(lp as *mut PathBuf)); 0 }
             WM_JOB => {
                 let err = *Box::from_raw(wp as *mut Option<String>);
@@ -3112,7 +3245,16 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_TIMER if desk() && wp == 7 => { desk::check_live(ST.with_borrow(|st| st.list)); 0 }
             WM_CLOSE if desk() => { PostMessageW(h, WM_SHUTDOWN_DLG, 0, 0); 0 }
             WM_SHUTDOWN_DLG if desk() => { show_shutdown_dialog(h); 0 }
-            WM_DESTROY => { if !desk() { save_place(h); } shellwin::revoke(); PostQuitMessage(0); 0 }
+            WM_QUERYENDSESSION => 1,
+            WM_ENDSESSION => {
+                if wp != 0 {
+                    if !desk() { save_place(h); }
+                    sh::clip_flush();
+                    shellwin::revoke();
+                }
+                0
+            }
+            WM_DESTROY => { if !desk() { save_place(h); } else { let df = DESK_FONT.swap(0, Relaxed); if df != 0 { windows_sys::Win32::Graphics::Gdi::DeleteObject(df as _); } } sh::clip_flush(); shellwin::revoke(); PostQuitMessage(0); 0 }
             _ => DefWindowProcW(h, m, wp, lp),
         }
     }
@@ -3155,7 +3297,7 @@ fn main() {
         let desktop = env::args().nth(1).as_deref() == Some("--desktop");
         let bg = if desktop { windows_sys::Win32::Graphics::Gdi::GetSysColorBrush(1) as _ } else { windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(ui::pal().bg) };
         RegisterClassW(&WNDCLASSW { style: 0x0008, lpfnWndProc: Some(ui::proc), hInstance: inst, lpszClassName: w("RxChrome").as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(ui::nav_proc), hInstance: inst, lpszClassName: w("RxNav").as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
+        RegisterClassW(&WNDCLASSW { style: 0x0003, lpfnWndProc: Some(ui::nav_proc), hInstance: inst, lpszClassName: w("RxNav").as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(proc), hInstance: inst, lpszClassName: cls.as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), hIcon: LoadIconW(inst, 1 as _), hbrBackground: bg, ..std::mem::zeroed() });
         if desktop {
             DESKTOP.store(true, Relaxed);
